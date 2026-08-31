@@ -1893,6 +1893,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_UBATCH"));
     add_opt(common_arg(
+        {"-nom", "--n-outputs-max"}, "N",
+        string_format("maximum number of outputs in a batch (default: %d, 0 = n_batch)\n"
+            "caps the worst-case total output count used to reserve the graph and logits\n"
+            "buffers, independent of -np/--parallel which still controls KV slot capacity and\n"
+            "RAM prompt-cache slots", params.n_outputs_max),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: n-outputs-max must be non-negative\n");
+            }
+            params.n_outputs_max = value;
+        }
+    ).set_env("LLAMA_ARG_N_OUTPUTS_MAX").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PERPLEXITY}));
+    add_opt(common_arg(
         {"--keep"}, "N",
         string_format("number of tokens to keep from the initial prompt (default: %d, -1 = all)", params.n_keep),
         [](common_params & params, int value) {

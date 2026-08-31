@@ -174,6 +174,22 @@ Completion timing JSON includes `cache_lcp_n`, `cache_planned_n`,
 tail metric is actionable rather than silently counted as a hit. Accounted
 bytes are serialized payload accounting, not exact process-resident memory.
 
+## Worst-case output reservation
+
+The number of sequences (`-np`, `--parallel`) controls KV slot capacity and RAM
+prompt-cache slots. Independently, the *worst-case total number of outputs in a
+batch* sizes the reserved graph and logits buffers (`out_ids`, the sampling
+buffers, and the graph's output rows). With `--kv-unified` the KV body uses a
+single shared stream, so increasing `-np` no longer grows the KV body; it still
+grows the reserved output/graph buffers because each slot can emit one output
+per speculative step (MTP/DFlash streams emit `1 + n_draft` rows each). A
+deployment that only ever runs fewer concurrent streams than slots can cap that
+reservation without giving up KV slot capacity or prompt-cache slots.
+
+| Argument | Env var | Default | Behavior |
+|---|---|---|---|
+| `-nom N`, `--n-outputs-max N` | `LLAMA_ARG_N_OUTPUTS_MAX` | `0` (= `n_batch`) | Caps the worst-case total number of outputs in a batch used to reserve the graph and logits buffers. It is applied to both the target and any draft/MTP context. The server clamps the value to the auto `-np`-derived limit (and the per-sequence speculative expansion), so a value of `0` keeps the auto behavior. Reducing this below the auto total is only safe when you never actually batch more concurrent output streams than the cap allows, otherwise a transient over-cap batch must re-reserve. |
+
 ## DFlash and adaptive draft depth
 
 The first five rows are upstream speculative controls with Bee-specific DFlash

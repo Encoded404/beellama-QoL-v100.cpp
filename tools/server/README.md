@@ -51,6 +51,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-n, --predict, --n-predict N` | number of tokens to predict (default: -1, -1 = infinity)<br/>(env: LLAMA_ARG_N_PREDICT) |
 | `-b, --batch-size N` | logical maximum batch size (default: 2048)<br/>(env: LLAMA_ARG_BATCH) |
 | `-ub, --ubatch-size N` | physical maximum batch size (default: 512)<br/>(env: LLAMA_ARG_UBATCH) |
+| `-nom, --n-outputs-max N` | caps the worst-case total number of outputs in a batch used to reserve the graph and logits buffers, independent of `-np`/`--parallel` (default: 0, 0 = n_batch). With `--kv-unified` the KV body is a single shared stream, so this reclaims the `-np`-scaled graph/logits reservation without reducing KV slot capacity or RAM prompt-cache slots. The server clamps the value to the auto `-np`-derived total (including the per-sequence speculative expansion). Only reduce it below the auto total when you never batch more concurrent output streams than the cap allows.<br/>(env: LLAMA_ARG_N_OUTPUTS_MAX) |
 | `--keep N` | number of tokens to keep from the initial prompt (default: 0, -1 = all) |
 | `--swa-full` | use full-size SWA cache (default: false)<br/>[(more info)](https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)<br/>(env: LLAMA_ARG_SWA_FULL) |
 | `-fa, --flash-attn [on\|off\|auto]` | set Flash Attention use ('on', 'off', or 'auto', default: 'auto')<br/>(env: LLAMA_ARG_FLASH_ATTN) |
