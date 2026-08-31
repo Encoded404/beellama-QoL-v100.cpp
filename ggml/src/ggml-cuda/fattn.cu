@@ -537,6 +537,17 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
             return BEST_FATTN_KERNEL_VEC;
         }
+        // Quantized KV caches already have native VEC instances (q8_0..q2_0S,
+        // see fattn-vec-dispatch.cuh) that dot against q8_1-quantized Q in
+        // place. Below SM80 the TILE/MMA kernels would otherwise materialize
+        // the whole KV slice into fp16 on every decode step (~5x the KV
+        // traffic on HBM2); mirror the Turing quantized-KV default here so
+        // GQA decode reads the cache natively on Volta as well.
+        if (can_use_vector_kernel &&
+                ggml_is_quantized(K->type) && ggml_is_quantized(V->type) &&
+                Q->ne[1] == 1 && Q->ne[3] == 1) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
         if (Q->ne[1] * gqa_ratio_eff <= 16) {
             return BEST_FATTN_KERNEL_TILE; // On Volta tensor cores are only faster for sufficiently large matrices.
         }

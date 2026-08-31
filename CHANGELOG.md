@@ -6,6 +6,7 @@ Fork-scoped entries on top of the BeeLlama base. Each item is tagged with its
 topic so entries inherited from upstream Bee stay easy to tell apart.
 
 - **(fork: speculative)** Fixed auxiliary (draft/MTP) context KV sharing when the target context stores its KV in a KVarN store: sharing now requires a plain per-layer cache on the target side, and otherwise falls back to a private cache for the auxiliary context instead of reading shared cells at the wrong offset.
+- **(fork: Volta)** On Volta (sm_70) the CUDA FlashAttention kernel selection now reads quantized KV caches in place with the vector kernel during GQA decode instead of materializing the KV slice to fp16 every step, mirroring the Turing quantized-KV default and cutting HBM2 KV traffic roughly fivefold.
 
 ## v0.4.4
 
