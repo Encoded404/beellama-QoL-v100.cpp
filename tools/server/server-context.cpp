@@ -359,6 +359,11 @@ struct server_slot {
         prompt_cache_source = "none";
         prompt_cache_reason = "memory_cleared";
         spec_ckpt.clear();
+        // the KV/memory is gone, so any in-flight per-request timing is stale;
+        // a re-armed slot must start from a clean slate or update_prompt_start()
+        // will trip its GGML_ASSERT(t_start == 0) on re-entry
+        stats = {};
+        n_accepted_per_pos.clear();
     }
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
