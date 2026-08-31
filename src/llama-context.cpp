@@ -331,6 +331,11 @@ llama_context::llama_context(
             params.kv_tail_type != GGML_TYPE_Q8_0) {
         throw std::invalid_argument("KV tail type must be F16, BF16, Q8_0, or the cache-family default");
     }
+    if (params.kv_tail_type == GGML_TYPE_Q8_0 &&
+            params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
+        throw std::invalid_argument(
+            "KV tail type q8_0 is only valid for standard caches; KVarN caches use f16 or bf16 precision tails");
+    }
     cparams.kv_tail_type = params.kv_tail_type;
     bool tail_request_resolved = false;
     if (params.kv_tail_request && params.kv_tail_config) {

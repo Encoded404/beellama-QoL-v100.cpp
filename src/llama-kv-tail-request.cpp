@@ -103,6 +103,10 @@ llama_kv_tail_request_resolution llama_kv_tail_request_resolve(
         result.error = request.error;
         return result;
     }
+    if (request.exact_type == GGML_TYPE_Q8_0 && kvarn) {
+        result.error = "KV tail type q8_0 is only valid for standard caches; KVarN caches use f16 or bf16 precision tails";
+        return result;
+    }
     std::vector<uint32_t> raw(groups.size(), 0);
     switch (request.mode) {
         case LLAMA_KV_TAIL_REQUEST_DISABLED:

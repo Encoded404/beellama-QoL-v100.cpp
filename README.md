@@ -25,7 +25,7 @@ For the full Bee feature and public-repo comparison, read [docs/beellama-feature
 ## Fork Features
 
 - **Variance-normalized KV-cache quantization (KVarN)**: provides higher precision at similar memory costs. Independent K and V bit widths at `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, and `kvarn8`, set with `--cache-type-k` and `--cache-type-v`.
-- **KV cache precision tail**: keep most of the KV cache quantized while storing recent tokens in F16/BF16, or in `q8_0` at half that memory, enabled with `--kv-tail-tokens` and `--kv-tail-type`. A single global softmax merges the quantized body and the precision tail under FlashAttention, without materializing the whole cache.
+- **KV cache precision tail**: keep most of the KV cache quantized while storing recent tokens in F16/BF16, or in `q8_0` at half that memory for standard caches, enabled with `--kv-tail-tokens` and `--kv-tail-type`. A single global softmax merges the quantized body and the precision tail under FlashAttention, without materializing the whole cache.
 - **Standard low-bit KV cache types**: `q2_0`, `q2_1`, `q3_0`, `q3_1`, `q6_0`, and `q6_1`, usable for either target or draft caches alongside the upstream `q4`/`q5`/`q8` types.
 - **Adaptive draft-max for DFlash**: adjusts the active DFlash draft horizon at runtime instead of using a fixed `--spec-draft-n-max`, comparing speculative throughput against a no-spec baseline.
 - **Reasoning-loop protection**: the server detects repeated hidden reasoning output and intervenes.

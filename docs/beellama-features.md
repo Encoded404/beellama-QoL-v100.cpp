@@ -283,7 +283,10 @@ practical middle ground between a full F16/BF16 tail and no tail at all for
 VRAM-constrained Gemma 4 deployments on Volta, where the stored rows save memory
 and decode still reads them natively. On backends without a complete quantized-tail
 route (Metal, SYCL, Vulkan), the explicit `q8_0` request fails closed instead of
-silently downgrading.
+silently downgrading. `q8_0` is limited to standard caches: a KVarN tail lives
+in the rotated WHT domain and must stay F16/BF16, so requesting `q8_0` with a
+KVarN cache is rejected during context creation rather than failing later in
+the graph.
 
 Route selection also records whether each model layer supplies an explicit
 self-attention bias. That capability is derived from loaded layer tensors, not
