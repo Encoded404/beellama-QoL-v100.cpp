@@ -1913,7 +1913,14 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
-    cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
+    // --n-outputs-max caps the worst-case total outputs used to reserve the
+    // graph/logits buffers, but it can never go below one output per sequence:
+    // output_reserve() hard-floors at n_seq_max and asserts the reserve fits
+    // cparams.n_outputs_max, so a smaller value would abort context creation
+    // (including the memory-fit probes). 0 keeps the upstream auto behavior.
+    cparams.n_outputs_max     = params.n_outputs_max > 0
+            ? std::max<int32_t>(params.n_outputs_max, params.n_parallel)
+            : 0;
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;

@@ -1183,18 +1183,20 @@ private:
             return false;
         }
         const auto output_limits = server_output_limits(params_base);
-        // An explicit --n-outputs-max caps the worst-case total number of
-        // outputs in a batch used to reserve the graph and logits buffers. The
-        // auto path derives it from -np/--parallel (each slot emits one output
-        // per speculative step, so the total is n_parallel * per-seq), but a
-        // user who only ever runs fewer concurrent streams than slots can
-        // reclaim that reservation without reducing KV slot capacity or RAM
-        // prompt-cache slots. The per-seq limit is always the full speculative
-        // expansion (each MTP/DFlash stream emits 1 + n_draft rows), since
-        // --n-outputs-max caps the total, not the per-stream layout.
-        params_base.n_outputs_max = params_base.n_outputs_max > 0
-                ? std::min<int32_t>(params_base.n_outputs_max, output_limits.total)
-                : output_limits.total;
+        // --n-outputs-max caps the worst-case number of concurrently output
+        // STREAMS used to reserve the graph and logits buffers. The auto path
+        // derives it from -np/--parallel, but a user who only ever runs fewer
+        // concurrent streams than slots can reclaim that reservation without
+        // reducing KV slot capacity or RAM prompt-cache slots. The reserved
+        // total is the capped stream count times the per-sequence speculative
+        // expansion (each MTP/DFlash stream emits 1 + n_draft rows), floored at
+        // n_seq_max because output_reserve() requires at least one output per
+        // sequence. A value of 0 keeps the auto behavior.
+        const int32_t n_streams_reserve = params_base.n_outputs_max > 0
+                ? std::max<int32_t>(1, std::min<int32_t>(params_base.n_outputs_max, params_base.n_parallel))
+                : params_base.n_parallel;
+        params_base.n_outputs_max = std::max<int32_t>(params_base.n_parallel,
+                n_streams_reserve * output_limits.per_seq);
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
 
         const bool has_mmproj = !params.mmproj.path.empty();

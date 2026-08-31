@@ -211,9 +211,11 @@ llama-server -m model.gguf --kv-unified -np 8 \
 ```
 
 `--n-outputs-max` is a general argument (also usable from `llama-cli`, bench,
-and perplexity) that caps the worst-case total output count used to reserve the
-graph and logits buffers, applied to both the target and any draft/MTP context.
-It is only safe to set below the auto `-np`-derived total when you never batch
+and perplexity) that caps the worst-case number of concurrently-output streams
+used to reserve the graph and logits buffers, applied to both the target and
+any draft/MTP context. The reserved total is the capped stream count times the
+per-sequence speculative expansion, floored at one output per sequence (a hard
+structural minimum). It is only safe to set below `-np` when you never batch
 more concurrent output streams than the cap allows.
 
 ### DFlash Speculative Decoding
