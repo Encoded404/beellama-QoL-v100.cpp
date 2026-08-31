@@ -326,7 +326,11 @@ bool llama_batch_allocr::init(
                 if (seq_cpl[s0][s1]) {
                     if (memory->seq_pos_min(s0) != memory->seq_pos_min(s1) ||
                         memory->seq_pos_max(s0) != memory->seq_pos_max(s1)) {
-                        LLAMA_LOG_ERROR("%s: sequence %d is coupled to %d in the input batch, but have divereged\n", __func__, s0, s1);
+                        LLAMA_LOG_ERROR("%s: sequence %d is coupled to %d in the input batch, but have divereged (min %d/%d, max %d/%d, seqs_in_batch %d/%d)\n",
+                                __func__, s0, s1,
+                                memory->seq_pos_min(s0), memory->seq_pos_min(s1),
+                                memory->seq_pos_max(s0), memory->seq_pos_max(s1),
+                                (int) seq_pos[s0].size(), (int) seq_pos[s1].size());
                         return false;
                     }
                 }

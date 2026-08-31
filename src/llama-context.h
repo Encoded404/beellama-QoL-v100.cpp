@@ -81,6 +81,7 @@ struct llama_context {
 
     float * get_logits();
     float * get_logits_ith(int32_t i);
+    float * get_mars_stats_ith(int32_t i);
 
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
@@ -315,10 +316,12 @@ private:
         buffer_view<llama_token> sampled    = {nullptr, 0};
         buffer_view<float>       probs      = {nullptr, 0};
         buffer_view<llama_token> candidates = {nullptr, 0};
+        buffer_view<float>       mars_stats = {nullptr, 0}; // [2] per output row (z_top1, z_kth)
 
         std::vector<uint32_t> logits_count;
         std::vector<uint32_t> probs_count;
         std::vector<uint32_t> candidates_count;
+        std::vector<uint32_t> mars_stats_count;
 
         // optimization
         std::vector<llama_token> token_ids_full_vocab;

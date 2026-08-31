@@ -1616,6 +1616,76 @@ void ggml_compute_forward_argmax(
     }
 }
 
+// ggml_compute_forward_mars_stats
+//
+// Per-row reduction: dst[0] = largest value, dst[1] = k-th largest value
+// (k clamped to [1, 8] at op creation). The logits row is contiguous F32.
+
+static void ggml_compute_forward_mars_stats_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    if (params->ith != 0) {
+        return;
+    }
+
+    assert(src0->nb[0] == sizeof(float));
+    assert(dst->nb[0] == sizeof(float));
+
+    const int32_t k = std::max(1, std::min((int32_t) dst->op_params[0], 8));
+
+    const int64_t ne00 = src0->ne[0];
+    const int64_t ne01 = src0->ne[1];
+
+    const size_t nb01 = src0->nb[1];
+
+    for (int64_t i1 = 0; i1 < ne01; i1++) {
+        const float * src = (const float *) ((const char *) src0->data + i1*nb01);
+
+        float topk[8];
+        for (int32_t j = 0; j < k; ++j) {
+            topk[j] = -INFINITY;
+        }
+
+        // insertion sort of the k largest values
+        for (int64_t i0 = 0; i0 < ne00; ++i0) {
+            const float val = src[i0];
+            if (val > topk[k - 1]) {
+                int32_t j = k - 1;
+                while (j > 0 && val > topk[j - 1]) {
+                    topk[j] = topk[j - 1];
+                    --j;
+                }
+                topk[j] = val;
+            }
+        }
+
+        float * dst_ = (float *) ((char *) dst->data + i1*dst->nb[0]);
+        dst_[0] = topk[0];
+        dst_[1] = topk[k - 1];
+    }
+}
+
+void ggml_compute_forward_mars_stats(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_mars_stats_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_count_equal
 
 static void ggml_compute_forward_count_equal_i32(

@@ -1326,6 +1326,25 @@ float * llama_context::get_logits_ith(int32_t i) {
     }
 }
 
+float * llama_context::get_mars_stats_ith(int32_t i) {
+    output_reorder();
+
+    try {
+        if (!sampling.mars_stats.has_data()) {
+            return nullptr; // backend MARS path not active
+        }
+
+        const int64_t j = output_resolve_row(i);
+        if ((size_t) j >= sampling.mars_stats_count.size() || sampling.mars_stats_count[j] < 2) {
+            return nullptr;
+        }
+        return sampling.mars_stats.data + 2*j;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: invalid mars stats id %d, reason: %s\n", __func__, i, err.what());
+        return nullptr;
+    }
+}
+
 float * llama_context::get_embeddings() {
     output_reorder();
 
@@ -2412,6 +2431,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
             copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
+            copy_tensor_async_rows(res->t_mars_stats,     sampling.mars_stats, 2,      n_outputs_prev, sched.get(), &sampling.mars_stats_count);
         }
 
         n_outputs_prev += n_outputs;
@@ -2615,16 +2635,21 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         sampling.candidates = {(llama_token *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
         offset += sampling.candidates.size * sizeof(llama_token);
 
+        sampling.mars_stats = {(float *) (base + offset), (size_t)(2*n_outputs_max)};
+        offset += sampling.mars_stats.size * sizeof(float);
+
         // The count vectors keep track of the actual number of logits/probs/candidates
         // copied from the backend for each output row.
 
         sampling.logits_count.resize(n_outputs_max);
         sampling.probs_count.resize(n_outputs_max);
         sampling.candidates_count.resize(n_outputs_max);
+        sampling.mars_stats_count.resize(n_outputs_max);
 
         std::fill(sampling.logits_count.begin(),     sampling.logits_count.end(),     0);
         std::fill(sampling.probs_count.begin(),      sampling.probs_count.end(),      0);
         std::fill(sampling.candidates_count.begin(), sampling.candidates_count.end(), 0);
+        std::fill(sampling.mars_stats_count.begin(), sampling.mars_stats_count.end(), 0);
 
         std::fill_n(sampling.sampled.data, sampling.sampled.size, LLAMA_TOKEN_NULL);
     } else {
@@ -2632,10 +2657,12 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         sampling.probs      = {nullptr, 0};
         sampling.sampled    = {nullptr, 0};
         sampling.candidates = {nullptr, 0};
+        sampling.mars_stats = {nullptr, 0};
 
         sampling.logits_count.clear();
         sampling.probs_count.clear();
         sampling.candidates_count.clear();
+        sampling.mars_stats_count.clear();
     }
 
     // set all ids as invalid (negative)
@@ -4591,6 +4618,12 @@ float * llama_get_embeddings(llama_context * ctx) {
     ctx->synchronize();
 
     return ctx->get_embeddings();
+}
+
+float * llama_get_mars_stats_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+
+    return ctx->get_mars_stats_ith(i);
 }
 
 float * llama_get_embeddings_ith(llama_context * ctx, int32_t i) {

@@ -4506,12 +4506,24 @@ private:
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto on_accept = make_loop_guard_accept_callback(slot);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
-                auto accepted = synth_probs.empty()
-                    ? common_sampler_sample_and_accept_n(
-                            slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, false, on_accept)
-                    : server_sample_and_accept_synth(
+
+                const common_sampler_mars_config mars_cfg = {
+                    /* .enabled = */ params_base.speculative.verify_mars,
+                    /* .theta   = */ params_base.speculative.verify_mars_theta,
+                    /* .topk    = */ params_base.speculative.verify_mars_topk,
+                };
+
+                std::vector<int32_t> spec_path;
+                auto accepted = [&]() -> std::vector<llama_token> {
+                    if (!synth_probs.empty()) {
+                        return server_sample_and_accept_synth(
+                                slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
+                                synth_probs, slot.spec_synth_rng, slot.spec_is_replay, on_accept);
+                    }
+                    return common_sampler_sample_and_accept_n(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
-                            synth_probs, slot.spec_synth_rng, slot.spec_is_replay, on_accept);
+                            false, mars_cfg, on_accept, spec_path);
+                }();
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);

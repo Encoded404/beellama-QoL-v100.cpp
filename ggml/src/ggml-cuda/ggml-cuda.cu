@@ -8,6 +8,7 @@
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
 #include "ggml-cuda/argmax.cuh"
+#include "ggml-cuda/mars_stats.cuh"
 #include "ggml-cuda/argsort.cuh"
 #include "ggml-cuda/binbcast.cuh"
 #include "ggml-cuda/clamp.cuh"
@@ -2094,6 +2095,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
+            break;
+        case GGML_OP_MARS_STATS:
+            ggml_cuda_mars_stats(ctx, dst);
             break;
         case GGML_OP_COUNT_EQUAL:
             ggml_cuda_count_equal(ctx, dst);
@@ -5368,6 +5372,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_COUNT_EQUAL:
             {
                 return true;
+            } break;
+        case GGML_OP_MARS_STATS:
+            {
+                return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                    ggml_is_contiguous_1(op->src[0]);
             } break;
         case GGML_OP_REPEAT:
             {

@@ -1152,7 +1152,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1175,6 +1175,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "cumsum(x)",
     "Σx/n",
     "argmax(x)",
+    "mars_stats(x)",
     "count_equal(x)",
     "repeat(x)",
     "repeat_back(x)",
@@ -1269,9 +1270,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+    "mars_stats(x)",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -2599,6 +2601,24 @@ struct ggml_tensor * ggml_argmax(
 
     result->op     = GGML_OP_ARGMAX;
     result->src[0] = a;
+
+    return result;
+}
+
+// ggml_mars_stats
+
+struct ggml_tensor * ggml_mars_stats(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int32_t               k) {
+    GGML_ASSERT(ggml_is_contiguous_1(a));
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2);
+
+    result->op       = GGML_OP_MARS_STATS;
+    result->src[0]   = a;
+    result->op_params[0] = k < 1 ? 1 : (k > 8 ? 8 : k);
 
     return result;
 }

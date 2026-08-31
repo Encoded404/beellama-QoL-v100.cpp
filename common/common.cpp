@@ -1501,6 +1501,18 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         pimpl->samplers_seq_config[i] = { i, common_sampler_get(pimpl->samplers[i].get()) };
     }
 
+    if (params.speculative.verify_mars && params.sampling.backend_sampling) {
+        // MARS stats sampler: first in the chain so it sees the raw model
+        // logits; the backend graph reduces each output row to (z_top1, z_kth).
+        // On backends without the GGML_OP_MARS_STATS support the chain falls
+        // back to host execution and the check uses llama_get_logits_ith.
+        for (int i = 0; i < (int) cparams.n_seq_max; ++i) {
+            llama_sampler_chain_add_front(
+                    common_sampler_get(pimpl->samplers[i].get()),
+                    llama_sampler_init_mars(params.speculative.verify_mars_topk));
+        }
+    }
+
     if (params.sampling.backend_sampling) {
         cparams.samplers   = pimpl->samplers_seq_config.data();
         cparams.n_samplers = pimpl->samplers_seq_config.size();

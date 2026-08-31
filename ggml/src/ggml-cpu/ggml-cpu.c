@@ -1829,6 +1829,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_argmax(params, tensor);
             } break;
+        case GGML_OP_MARS_STATS:
+            {
+                ggml_compute_forward_mars_stats(params, tensor);
+            } break;
         case GGML_OP_COUNT_EQUAL:
             {
                 ggml_compute_forward_count_equal(params, tensor);

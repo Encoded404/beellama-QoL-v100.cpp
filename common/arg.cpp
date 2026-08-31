@@ -4618,6 +4618,39 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING"));
     add_opt(common_arg(
+        {"--spec-verify-mars"},
+        {"--no-spec-verify-mars"},
+        string_format("enable MARS (margin-aware relaxed) verification: a draft token that is not the target's "
+                      "sampled pick is accepted anyway when it ranks within the raw target top-k and its logit "
+                      "ratio vs the raw top-1 is >= the theta threshold. Lossy - the output distribution "
+                      "deviates from the target. With target backend sampling (-bs) the top-k stats are "
+                      "computed on the device, otherwise the raw logits are scanned on the host "
+                      "(default: %s)",
+                      params.speculative.verify_mars ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.verify_mars = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_VERIFY_MARS"));
+    add_opt(common_arg(
+        {"--spec-verify-mars-theta"}, "P",
+        string_format("MARS acceptance threshold: accept a draft token ranked within --spec-verify-mars-topk of "
+                      "the raw target logits when (raw logit of draft token) / (raw top-1 logit) >= theta "
+                      "(default: %.2f)",
+                      (double) params.speculative.verify_mars_theta),
+        [](common_params & params, const std::string & value) {
+            params.speculative.verify_mars_theta = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_VERIFY_MARS_THETA"));
+    add_opt(common_arg(
+        {"--spec-verify-mars-topk"}, "N",
+        string_format("MARS acceptance rank: how far down the raw target logit ranking a draft token may sit "
+                      "to be eligible for relaxed acceptance (ranks are internally capped at 8; default: %d)",
+                      params.speculative.verify_mars_topk),
+        [](common_params & params, int value) {
+            params.speculative.verify_mars_topk = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_VERIFY_MARS_TOPK"));
+    add_opt(common_arg(
         {"--spec-draft-device", "-devd", "--device-draft"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading the draft model (none = don't offload)\n"
         "use --list-devices to see a list of available devices",

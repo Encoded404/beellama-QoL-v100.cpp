@@ -621,6 +621,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_MARS_STATS, // per-row top-1 and k-th largest logit (MARS relaxed verification)
+
         GGML_OP_COUNT,
     };
 
@@ -1092,6 +1094,13 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_argmax(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
+
+    // top-1 and k-th largest value along a row (MARS relaxed verification);
+    // the top-k cap is clamped to [1, 8] internally
+    GGML_API struct ggml_tensor * ggml_mars_stats(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int32_t               k);
 
     // count number of equal elements in a and b
     GGML_API struct ggml_tensor * ggml_count_equal(

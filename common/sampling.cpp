@@ -810,6 +810,202 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
     return result;
 }
 
+// MARS margin check on the raw target logits of `idx`:
+//   * `token` must rank within raw top-k,
+//   * softmax-probability ratio exp(z_token - z_top1) >= theta
+//     (temperature-invariant: logits are scaled by 1/T on both sides).
+// Returns true when the draft token passes the relaxed rule.
+//
+// Per-row raw-logit information: computed once per row (O(vocab)), then
+// queried for each candidate child. When the target context exposes the
+// backend-computed MARS stats (llama_get_mars_stats_ith), the top-1/k-th
+// values come from the device reduction instead of a host-side vocab scan.
+struct common_sampler_mars_row {
+    float z_top1 = -INFINITY;      // highest raw logit of the row
+    float z_kth  = -INFINITY;      // k-th highest raw logit of the row (k = topk)
+    bool  valid  = false;
+};
+
+static bool common_sampler_mars_prepare(
+        struct llama_context * ctx,
+        int                    idx,
+        const common_sampler_mars_config & mars,
+        common_sampler_mars_row & info) {
+    info = common_sampler_mars_row{};
+
+    if (!mars.enabled) {
+        return false;
+    }
+
+    // backend-computed stats: device reduction over the raw logits
+    const float * stats = llama_get_mars_stats_ith(ctx, idx);
+    if (stats != nullptr) {
+        info.z_top1 = stats[0];
+        info.z_kth  = stats[1];
+        info.valid  = info.z_top1 != -INFINITY;
+        return info.valid;
+    }
+
+    const float * logits = llama_get_logits_ith(ctx, idx);
+    if (logits == nullptr) {
+        return false;
+    }
+
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+    // internal rank cap: the insertion sort below is O(vocab * k); ranks
+    // beyond 8 have no practical meaning for the margin rule (the paper uses
+    // top-2) and would make the scan quadratic
+    const int k = std::max(1, std::min(mars.topk, 8));
+
+    // k highest logits of the row
+    std::vector<float> topk_logits((size_t) k, -INFINITY);
+    for (int v = 0; v < n_vocab; ++v) {
+        const float z = logits[v];
+        if (z > topk_logits.back()) {
+            // insertion-sort position of z within the top-k list
+            int j = k - 1;
+            while (j > 0 && z > topk_logits[j - 1]) {
+                topk_logits[j] = topk_logits[j - 1];
+                --j;
+            }
+            topk_logits[j] = z;
+        }
+    }
+
+    info.z_top1 = topk_logits[0];
+    info.z_kth  = topk_logits[k - 1];
+    info.valid  = info.z_top1 != -INFINITY;
+    return info.valid;
+}
+
+static bool common_sampler_mars_check(
+        struct common_sampler * gsmpl,
+        struct llama_context  * ctx,
+        int                     idx,
+        llama_token             token,
+        const common_sampler_mars_config & mars) {
+    if (!mars.enabled || token < 0) {
+        return false;
+    }
+
+    common_sampler_mars_row info;
+    if (!common_sampler_mars_prepare(ctx, idx, mars, info)) {
+        return false;
+    }
+
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+    if (token >= n_vocab) {
+        return false;
+    }
+
+    // the draft token's raw logit: from the host logits buffer (always
+    // available for output rows) or from the device stats path when the
+    // host buffer is not populated
+    float z_tok = -INFINITY;
+    const float * logits = llama_get_logits_ith(ctx, idx);
+    if (logits != nullptr) {
+        z_tok = logits[token];
+    } else {
+        const float * stats = llama_get_mars_stats_ith(ctx, idx);
+        if (stats == nullptr) {
+            return false;
+        }
+        // z_tok is not part of the device stats; a row with a host logits
+        // buffer is required for the token logit
+        GGML_UNUSED(stats);
+        return false;
+    }
+
+    // rank within the raw logits (0 = top-1)
+    if (z_tok < info.z_kth) {
+        return false;
+    }
+
+    // softmax probability ratio: p_token / p_top1 = exp(z_token - z_top1)
+    if (z_tok - info.z_top1 < logf(std::max(mars.theta, 1e-6f))) {
+        return false;
+    }
+
+    // when grammar is active, only relax if the token is grammar-valid
+    if (gsmpl->grmr && grammar_should_apply(gsmpl)) {
+        llama_token_data single_token_data = { token, 1.0f, 0.0f };
+        llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
+
+        llama_sampler_apply(gsmpl->grmr, &single_token_data_array);
+
+        if (single_token_data_array.data[0].logit == -INFINITY) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// verify a flat draft with optional MARS relaxation
+std::vector<llama_token> common_sampler_sample_and_accept_n(
+        struct common_sampler * gsmpl,
+        struct llama_context  * ctx,
+        const std::vector<int> & idxs,
+        const llama_tokens    & draft,
+        bool                    grammar_first,
+        const common_sampler_mars_config & mars,
+        const common_sampler_accept_callback & on_accept,
+        std::vector<int32_t> & accepted_path) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+
+    accepted_path.clear();
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    auto accept = [&](llama_token id) {
+        if (on_accept) {
+            const auto info = common_sampler_accept_with_info(gsmpl, id, true);
+            result.push_back(id);
+            return on_accept(info);
+        }
+
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+        return true;
+    };
+
+    size_t i = 0;
+    for (; i < draft.size(); i++) {
+        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+
+        if (draft[i] == id) {
+            if (!accept(id)) {
+                break;
+            }
+            accepted_path.push_back((int32_t) i);
+            continue;
+        }
+
+        // MARS relaxation: commit the draft token instead of the sampled one
+        // when the target is indecisive (the sampled token is discarded).
+        if (common_sampler_mars_check(gsmpl, ctx, idxs[i], draft[i], mars)) {
+            if (!accept(draft[i])) {
+                break;
+            }
+            accepted_path.push_back((int32_t) i);
+            continue;
+        }
+
+        // rejection: `id` is the correction token
+        (void) accept(id);
+        break;
+    }
+
+    if (i == draft.size()) {
+        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+
+        (void) accept(id);
+    }
+
+    return result;
+}
+
 std::vector<llama_token> common_sampler_sample_and_accept_n(
         struct common_sampler * gsmpl,
         struct llama_context  * ctx,

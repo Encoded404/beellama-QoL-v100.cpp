@@ -604,6 +604,7 @@ static llama_sampler_backend_probe llama_sampler_backend_probe_graph(
         /*.probs        =*/ nullptr,
         /*.sampled      =*/ nullptr,
         /*.candidates   =*/ with_candidates ? ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_candidates) : nullptr,
+        /*.stats        =*/ nullptr,
     };
 
     if (sampler->iface->backend_reset) {
@@ -966,6 +967,14 @@ llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_conte
 void llama_sampler_chain_add(struct llama_sampler * chain, struct llama_sampler * smpl) {
     auto * p = (llama_sampler_chain *) chain->ctx;
     p->samplers.push_back({
+        /* .is_backend = */ false,
+        /* .ptr        = */ smpl,
+    });
+}
+
+void llama_sampler_chain_add_front(struct llama_sampler * chain, struct llama_sampler * smpl) {
+    auto * p = (llama_sampler_chain *) chain->ctx;
+    p->samplers.insert(p->samplers.begin(), {
         /* .is_backend = */ false,
         /* .ptr        = */ smpl,
     });
@@ -1528,6 +1537,98 @@ struct llama_sampler * llama_sampler_init_top_k(int32_t k) {
         /* .ctx   = */ new llama_sampler_top_k {
             ("top-k"),
             /* .k = */ k,
+        }
+    );
+}
+
+// mars (MARS relaxed-verification stats)
+//
+// Host-side the sampler is a no-op: it only serves the backend sampling graph,
+// where it reduces the raw logits of every output row to (z_top1, z_kth) via
+// GGML_OP_MARS_STATS. The host reads the per-row stats with
+// llama_get_mars_stats_ith() after the decode; when the op is unsupported by
+// the backend the sampler stays out of the backend set (the chain falls back
+// to host execution and the MARS check falls back to llama_get_logits_ith).
+
+struct llama_sampler_mars : public llama_sampler_backend {
+    llama_sampler_mars(int32_t k) : llama_sampler_backend("mars"), k(k) {}
+
+    const int32_t k;
+};
+
+static const char * llama_sampler_mars_name(const struct llama_sampler * smpl) {
+    auto * sctx = (llama_sampler_mars *) smpl->ctx;
+    return sctx->get_name();
+}
+
+static void llama_sampler_mars_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+    // host-side no-op (the backend graph path computes the stats)
+    GGML_UNUSED(smpl);
+    GGML_UNUSED(cur_p);
+}
+
+static struct llama_sampler * llama_sampler_mars_clone(const struct llama_sampler * smpl) {
+    const auto * ctx = (const llama_sampler_mars *) smpl->ctx;
+    return llama_sampler_init_mars(ctx->k);
+}
+
+static void llama_sampler_mars_free(struct llama_sampler * smpl) {
+    delete (llama_sampler_mars *) smpl->ctx;
+}
+
+static bool llama_sampler_mars_backend_init(
+        struct llama_sampler       * smpl,
+        ggml_backend_buffer_type_t   buft,
+        uint32_t                     n_outputs_max_per_seq) {
+    auto * sctx = (llama_sampler_mars *) smpl->ctx;
+    GGML_UNUSED(n_outputs_max_per_seq);
+
+    const bool res = llama_sampler_backend_support(smpl, buft);
+
+    sctx->init(res);
+
+    return res;
+}
+
+static void llama_sampler_mars_backend_apply(
+        struct llama_sampler      * smpl,
+        struct ggml_context       * ctx,
+        struct ggml_cgraph        * gf,
+        struct llama_sampler_data * data) {
+    auto * sctx = (llama_sampler_mars *) smpl->ctx;
+
+    struct ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
+
+    data->stats = ggml_mars_stats(ctx, logits, sctx->k);
+    ggml_set_name(data->stats, "mars_stats");
+
+    GGML_UNUSED(gf);
+}
+
+static struct llama_sampler_i llama_sampler_mars_i = {
+    /* .name              = */ llama_sampler_mars_name,
+    /* .accept            = */ nullptr,
+    /* .apply             = */ llama_sampler_mars_apply,
+    /* .reset             = */ nullptr,
+    /* .clone             = */ llama_sampler_mars_clone,
+    /* .free              = */ llama_sampler_mars_free,
+    /* .backend_init      = */ llama_sampler_mars_backend_init,
+    /* .backend_accept    = */ nullptr,
+    /* .backend_apply     = */ llama_sampler_mars_backend_apply,
+    /* .backend_set_input = */ nullptr,
+    /* .backend_reset     = */ nullptr,
+    /* .copy_state        = */ llama_sampler_backend_copy_state<llama_sampler_mars>,
+};
+
+struct llama_sampler * llama_sampler_init_mars(int32_t k) {
+    if (k <= 0) {
+        return llama_sampler_init_empty("?mars");
+    }
+
+    return llama_sampler_init(
+        /* .iface = */ &llama_sampler_mars_i,
+        /* .ctx   = */ new llama_sampler_mars {
+            k,
         }
     );
 }

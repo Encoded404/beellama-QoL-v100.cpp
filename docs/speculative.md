@@ -249,6 +249,27 @@ Use exactly one of these options:
 --spec-draft-p-min, --draft-p-min       P
                                         minimum speculative decoding probability (greedy) (default: 0.00)
                                         (env: LLAMA_ARG_SPEC_DRAFT_P_MIN)
+--spec-verify-mars, --no-spec-verify-mars
+                                        enable MARS (margin-aware relaxed) verification: a draft token that
+                                        is not the target's sampled pick is accepted anyway when it ranks
+                                        within `--spec-verify-mars-topk` of the raw target logits and its
+                                        softmax-probability ratio vs the raw top-1 is >= theta. Lossy: the
+                                        output distribution deviates from the target. Works with every draft
+                                        type. With target backend sampling (`-bs`) the top-k stats are
+                                        computed on the device by a backend sampler; otherwise the raw
+                                        logits are scanned on the host. (default: disabled)
+                                        (env: LLAMA_ARG_SPEC_VERIFY_MARS)
+--spec-verify-mars-theta                 P
+                                        MARS acceptance threshold: accept a draft token ranked within
+                                        `--spec-verify-mars-topk` of the raw target logits when
+                                        exp(z_draft - z_top1) >= theta (temperature-invariant)
+                                        (default: 0.90)
+                                        (env: LLAMA_ARG_SPEC_VERIFY_MARS_THETA)
+--spec-verify-mars-topk                  N
+                                        MARS acceptance rank: how far down the raw target logit ranking a
+                                        draft token may sit to be eligible for relaxed acceptance
+                                        (default: 2)
+                                        (env: LLAMA_ARG_SPEC_VERIFY_MARS_TOPK)
 --spec-draft-ngl, -ngld, --gpu-layers-draft, --n-gpu-layers-draft  N
                                         max. number of draft model layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)
                                         (env: LLAMA_ARG_N_GPU_LAYERS_DRAFT)

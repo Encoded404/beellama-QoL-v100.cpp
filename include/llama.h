@@ -1251,6 +1251,11 @@ extern "C" {
     // Negative indices can be used to access logits in reverse order, -1 is the last logit.
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
+    // MARS relaxed-verification stats of output row `i`: (z_top1, z_kth) computed
+    // on the backend sampling graph. Returns nullptr when the backend MARS path
+    // is not active (e.g. backend sampling disabled or the op unsupported) - the
+    // caller falls back to scanning llama_get_logits_ith.
+    LLAMA_API float * llama_get_mars_stats_ith(struct llama_context * ctx, int32_t i);
 
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
@@ -1485,6 +1490,7 @@ extern "C" {
         struct ggml_tensor * probs;
         struct ggml_tensor * sampled;
         struct ggml_tensor * candidates;
+        struct ggml_tensor * stats; // optional MARS stats output [2] per row
     };
 
     // user code can implement the interface below in order to create custom llama_sampler
@@ -1560,6 +1566,7 @@ extern "C" {
 
     // important: takes ownership of the sampler object and will free it when llama_sampler_free is called
     LLAMA_API void                   llama_sampler_chain_add(      struct llama_sampler * chain, struct llama_sampler * smpl);
+    LLAMA_API void                   llama_sampler_chain_add_front(struct llama_sampler * chain, struct llama_sampler * smpl);
 
     // return NULL if:
     //   - the sampler is NULL
@@ -1584,6 +1591,7 @@ extern "C" {
     /// @details Top-K sampling described in academic paper "The Curious Case of Neural Text Degeneration" https://arxiv.org/abs/1904.09751
     /// Setting k <= 0 makes this a noop
     LLAMA_API struct llama_sampler * llama_sampler_init_top_k      (int32_t k);
+    LLAMA_API struct llama_sampler * llama_sampler_init_mars       (int32_t k);
 
     /// @details Nucleus sampling described in academic paper "The Curious Case of Neural Text Degeneration" https://arxiv.org/abs/1904.09751
     LLAMA_API struct llama_sampler * llama_sampler_init_top_p      (float   p, size_t min_keep);

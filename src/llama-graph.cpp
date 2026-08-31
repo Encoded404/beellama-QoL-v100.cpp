@@ -1789,6 +1789,11 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
             ggml_set_output(tensor);
         }
     }
+    for (auto * tensor : t_mars_stats) {
+        if (tensor != nullptr) {
+            ggml_set_output(tensor);
+        }
+    }
 }
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
@@ -4821,6 +4826,7 @@ void llm_graph_context::build_sampling() const {
     res->t_sampled_probs.resize(n_rows, nullptr);
     res->t_sampled_logits.resize(n_rows, nullptr);
     res->t_candidates.resize(n_rows, nullptr);
+    res->t_mars_stats.resize(n_rows, nullptr);
 
     // res->t_logits will contain logits for all tokens that want the logits calculated (logits=1 or output=1)
     GGML_ASSERT(res->t_logits != nullptr && "missing t_logits tensor");
@@ -4854,6 +4860,7 @@ void llm_graph_context::build_sampling() const {
                 /*.probs        =*/ nullptr,
                 /*.sampled      =*/ nullptr,
                 /*.candidates   =*/ nullptr,
+                /*.stats        =*/ nullptr,
             };
 
             assert(sampler->iface->backend_apply);
@@ -4889,6 +4896,13 @@ void llm_graph_context::build_sampling() const {
                 }
                 outs[1] = data.candidates;
                 ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
+            }
+
+            if (data.stats != nullptr) {
+                if (active) {
+                    res->t_mars_stats[rows[i]] = data.stats;
+                }
+                ggml_build_forward_expand(gf, data.stats);
             }
         }
     }

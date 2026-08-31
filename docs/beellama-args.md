@@ -195,6 +195,23 @@ behavior. The `--spec-dm-*` rows are Bee server additions.
 | `--spec-dm-profit-warmup N` | `LLAMA_ARG_SPEC_DM_PROFIT_WARMUP` | `0` | Sets measured samples for each initial positive-depth probe. `0` uses `--spec-dm-profit-min-samples`; range: `0` to `64`. |
 | `--spec-dm-profit-baseline-interval N` | `LLAMA_ARG_SPEC_DM_PROFIT_BASELINE_INTERVAL` | `1024` | Sets active controller cycles between no-spec baseline probes. `0` disables periodic probes; range: `0` to `4096`. |
 
+## MARS relaxed verification
+
+MARS (margin-aware relaxed) verification is a lossy speculative acceptance
+rule: when the draft token is not the target's sampled pick, it is accepted
+anyway if it ranks within `--spec-verify-mars-topk` of the raw target logits
+and its softmax-probability ratio vs the raw top-1 is at least
+`--spec-verify-mars-theta`. Because the accepted token deviates from the
+target's own distribution, use it when higher draft acceptance is worth a
+measurable output-distribution change. It is temperature-invariant and works
+with every draft type.
+
+| Argument | Env var | Default | Behavior |
+|---|---|---|---|
+| `--spec-verify-mars`, `--no-spec-verify-mars` | `LLAMA_ARG_SPEC_VERIFY_MARS` | Disabled | Enables MARS relaxed verification. With target backend sampling (`-bs`) the per-row top-k stats are computed on the device by a `GGML_OP_MARS_STATS` backend sampler; otherwise the raw logits are scanned on the host. |
+| `--spec-verify-mars-theta P` | `LLAMA_ARG_SPEC_VERIFY_MARS_THETA` | `0.9` | Accepts a draft token ranked within `--spec-verify-mars-topk` when `exp(z_draft - z_top1) >= theta` (temperature-invariant). Range: positive. |
+| `--spec-verify-mars-topk N` | `LLAMA_ARG_SPEC_VERIFY_MARS_TOPK` | `2` | How far down the raw target logit ranking a draft token may sit to be eligible for relaxed acceptance. Ranks are internally capped at 8. Range: positive. |
+
 ## Reasoning loop guard
 
 | Argument | Env var | Default | Behavior |

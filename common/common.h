@@ -410,6 +410,14 @@ struct common_params_speculative {
         return !draft.mparams.empty();
     }
 
+    // MARS: margin-aware relaxed verification. When the draft token is not the
+    // target's sampled pick but ranks within `verify_mars_topk` of the raw
+    // target logits and its logit ratio vs the raw top-1 is >= theta, the
+    // draft token is accepted anyway (lossy - changes the output distribution).
+    bool    verify_mars         = false;
+    float   verify_mars_theta   = 0.9f;
+    int32_t verify_mars_topk    = 2;
+
     bool has_synth() const {
         return synth_len != -1.0 || !synth_rates.empty();
     }
