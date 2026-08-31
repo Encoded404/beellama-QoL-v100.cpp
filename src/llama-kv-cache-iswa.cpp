@@ -196,13 +196,30 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     LLAMA_LOG_INFO("%s: creating non-SWA KV cache, size = %u cells\n", __func__, size_base);
 
     llama_memory_t mem_other_base = nullptr;
+    llama_memory_t mem_other_swa  = nullptr;
     if (mem_other) {
-        mem_other_base = static_cast<llama_kv_cache_iswa *>(mem_other)->get_base();
-    }
-
-    llama_memory_t mem_other_swa = nullptr;
-    if (mem_other) {
-        mem_other_swa = static_cast<llama_kv_cache_iswa *>(mem_other)->get_swa();
+        // The auxiliary (draft/MTP) context borrows the target context's KV
+        // body through ctx_other. Sharing requires a plain per-layer
+        // llama_kv_cache body; the target can instead store KVarN records, a
+        // DSV4 state, or another structured cache type which is NOT a
+        // llama_kv_cache instance (both merely derive from llama_memory_i).
+        // Casting it to llama_kv_cache would read shared cells at the wrong
+        // offset and crash at construction, so fall back to a private cache
+        // for the auxiliary context in that case.
+        if (dynamic_cast<llama_kv_cache_iswa *>(mem_other) != nullptr) {
+            llama_memory_i * other_base = static_cast<llama_kv_cache_iswa *>(mem_other)->get_base();
+            llama_memory_i * other_swa  = static_cast<llama_kv_cache_iswa *>(mem_other)->get_swa ();
+            if (dynamic_cast<llama_kv_cache *>(other_base) != nullptr) {
+                mem_other_base = other_base;
+            }
+            if (dynamic_cast<llama_kv_cache *>(other_swa) != nullptr) {
+                mem_other_swa = other_swa;
+            }
+        }
+        if (mem_other_base == nullptr && mem_other_swa == nullptr) {
+            LLAMA_LOG_WARN("%s: target context uses a non-shareable KV cache; " \
+                    "using a private KV cache for this auxiliary context\n", __func__);
+        }
     }
 
     kv_base = make_cache(size_base, 0, LLAMA_SWA_TYPE_NONE, filter_base, mem_other_base, kvarn);

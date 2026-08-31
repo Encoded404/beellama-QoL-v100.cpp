@@ -1,5 +1,12 @@
 # Changelog
 
+## Fork-specific changes (QoL branch)
+
+Fork-scoped entries on top of the BeeLlama base. Each item is tagged with its
+topic so entries inherited from upstream Bee stay easy to tell apart.
+
+- **(fork: speculative)** Fixed auxiliary (draft/MTP) context KV sharing when the target context stores its KV in a KVarN store: sharing now requires a plain per-layer cache on the target side, and otherwise falls back to a private cache for the auxiliary context instead of reading shared cells at the wrong offset.
+
 ## v0.4.4
 
 - Updated the llama.cpp base from `74ce15741` to `6fdd0ac89` and ggml from 0.19.0 to 0.22.0. Notable inherited changes include Qwen3.8 DFlash2 with local convolution, candidate selection, M-RoPE, converter/GGUF support, speculative `p_min`/`n_min`, and wide-row CUDA top-k; Granite Switch/SWA, Muse Glimmer, Kimi K3, MiniMax Text, BailingMoE3, Nanbeige4.2-3B, Pocket TTS, expanded MTP, DFlash, and DSpark coverage, and multi-output backend sampling; media-aware server state, Web UI tools and navigation, stronger tool isolation, automatic iGPU-safe loading, Metal kernel splitting, Vulkan TQ2_0 and Lightning Indexer support, asynchronous RPC APIs, and Apple RDMA transport. Bee keeps adaptive draft-max on DFlash1 while DFlash2 uses its fixed trained block and selector confidence.
