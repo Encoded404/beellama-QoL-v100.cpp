@@ -261,6 +261,31 @@ build host cannot detect it. Pre-Turing support remains runtime-unqualified
 until matching real devices pass the KVarN parity, memory, and model-smoke
 tests.
 
+## Volta (sm_70) CUDA decode tuning
+
+On Volta, GQA decode keeps more HBM2 load streams in flight with two optional
+behaviors, both off by default where the default is performance-neutral:
+
+- `GGML_CUDA_FATTN_VEC_GQA_HEADS` — `1` (auto, default) lets the FlashAttention
+  vector kernel process two Q heads that share one K/V pair per block, halving
+  K reads and reusing every dequantized V row. The auto mode enables this only
+  for contexts above 128K tokens, where the K/V re-read amortization outweighs
+  the two-column block overhead; `0` forces it off and any value `>= 2` forces
+  it on.
+- `GGML_CUDA_FATTN_VEC_NTHREADS` — `128` or `256`. The default is 256 (8 warps)
+  so the streaming quantized K/V loads have enough warps in flight on the
+  4-scheduler SMs; `128` restores the legacy 4-warp behavior. D=512 f16/bf16 V
+  instances keep 4 warps regardless to fit the shared staging buffer.
+- `GGML_CUDA_FATTN_VEC_PREFETCH` — `1` (default) prefetches the next iteration's
+  K/V rows into L2 from inside the vector kernel (Volta has no `cp.async`);
+  `0` disables the `prefetch.global.L2` hints.
+- `GGML_CUDA_MMVQ_GENERIC` — `1` reverts Volta's `mul_mat_vec_q` decode to the
+  generic (Pascal-style) parameter table. The default Volta table uses 8-warp
+  blocks via the `halve_iters` mechanism for the trivial vec-dot types
+  (`q4_0`/`q4_1`/`q5_0`/`q5_1`/`q6_0`/`q6_1`/`q8_0`/`iq4_nl`) so more decode
+  streams stay in flight; complex K/IQ vec-dots stay at 4 warps to limit
+  register pressure.
+
 ## Migration from earlier versions
 
 | Earlier spelling or surface | v0.4.0 behavior | Replacement |
