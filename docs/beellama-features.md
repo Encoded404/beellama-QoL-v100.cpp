@@ -576,6 +576,47 @@ names. Other DFlash GGUF schemas are unsupported. The profit controls apply only
 to DFlash1; DFlash2, upstream simple, EAGLE3, MTP, and n-gram modes keep their
 own draft-depth behavior.
 
+## KVarN borrow for auxiliary contexts
+
+### What it is
+
+A Gemma-4 assistant auxiliary (draft/MTP) context can borrow the target
+context's KVarN store instead of allocating its own cache. The auxiliary reads
+the shared store through its own logical cursor (the target's verified frontier
+plus the draft rows) and writes its speculative rows at the frontier, but it
+never seals record groups: the stream's committed fill moves only through the
+target's own eager stores at verification. Rejected draft rows are discarded
+with a positional `seq_rm`; no physical cleanup is required because every
+position the auxiliary writes is re-written by the target at verification.
+
+### When to use it
+
+Use KVarN borrow when the target context uses a KVarN store (directly or inside
+an ISWA wrapper) and a Gemma-4 assistant is active. It removes the auxiliary
+context's separate cache allocation and lets the draft read the target's
+records directly. Borrow is skipped automatically when the target store is not
+borrowable (a non-unified multi-stream store, a stage too small for the draft
+window, or a DSA/DSV4/hybrid target), or when `GGML_KVARN_BORROW=0` is set.
+
+### Key arguments and env
+
+- `GGML_KVARN_BORROW` (env) — `0` disables borrowing; the auxiliary context
+  falls back to a private cache.
+
+### Measurement and validation
+
+Compare a run with and without `GGML_KVARN_BORROW=0` using the same target and
+draft files, cache types, and sampling settings. The borrowed path should show
+no quality difference from a private aux cache while using less KV memory.
+
+### Known limitations
+
+Borrow is v1-scoped: a unified single-stream target store, non-SWA or SWA KVarN
+stores, and up to `LLAMA_MAX_SEQ` auxiliary sequences. It does not apply to
+DSA/DSV4/hybrid targets, and KVarN caches refuse context shifting. The draft
+window must fit inside the lossless F16 staging region (`stage_groups * 128`
+tokens).
+
 ## Reasoning loop guard and realtime control
 
 ### What they are

@@ -28,6 +28,7 @@ add_library(llama
             llama-kv-tail-request.cpp
             llama-kv-cache-placement.cpp
             llama-kv-cache-kvarn.cpp
+            llama-kv-cache-kvarn-borrow.cpp
             llama-kv-cache-iswa.cpp
             llama-kv-cache-dsa.cpp
             llama-kv-cache-dsa-iswa.cpp

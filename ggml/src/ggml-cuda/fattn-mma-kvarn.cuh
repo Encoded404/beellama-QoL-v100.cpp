@@ -18,6 +18,9 @@ enum {
     GGML_CUDA_FATTN_KVARN_OP_PARAM_STAGE_GROUPS      = 7,
     GGML_CUDA_FATTN_KVARN_OP_PARAM_TAIL_GROUPS       = 8,
     GGML_CUDA_FATTN_KVARN_OP_PARAM_EAGER_RECORDS     = 9,
+    // Borrowed-context record-domain clamp: the last fully VERIFIED record
+    // group (target frontier / 128). 0 = no clamp (target contexts).
+    GGML_CUDA_FATTN_KVARN_OP_PARAM_SEAL_CLAMP       = 11,
 };
 
 struct ggml_cuda_fattn_kvarn_desc {
@@ -39,6 +42,7 @@ struct ggml_cuda_fattn_kvarn_desc {
     int head_slices;
     int eager_records;
     int read_indirect;
+    int seal_clamp_groups;
     // Large prefill can reconstruct one side in the original domain in the MMA tile loader.
     // Decode-width paths keep rotated-domain K/V and rotate Q/output in the graph.
     int original_domain;
@@ -74,6 +78,12 @@ static __device__ __forceinline__ int ggml_cuda_fattn_kvarn_stage_pos(
 static __device__ __forceinline__ bool ggml_cuda_fattn_kvarn_group_from_stage(
         const ggml_cuda_fattn_kvarn_desc & desc,
         const int group) {
+    // Borrowed-context clamp: record groups at/after the target's verified
+    // frontier are never sealed; their rows still live in the F16 staging
+    // region and must be read from there, never through record gathers.
+    if (desc.seal_clamp_groups > 0 && group >= desc.seal_clamp_groups) {
+        return true;
+    }
     if (desc.eager_records) {
         if (!desc.swa && group == 0) {
             return true;
@@ -135,6 +145,7 @@ struct ggml_cuda_fattn_kvarn_plan_side {
     bool swa          = false;
     bool eager_records = false;
     bool read_indirect = false;
+    int seal_clamp_groups = 0;
 };
 
 struct ggml_cuda_fattn_kvarn_plan {
@@ -227,6 +238,8 @@ static inline bool ggml_cuda_fattn_kvarn_unwrap_view(
     side.swa = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_VIEW_SWA) != 0;
     side.eager_records = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_EAGER_RECORDS) != 0;
     side.read_indirect = ggml_get_op_params_i32(cur, 10) != 0;
+    const int seal_clamp_param = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_SEAL_CLAMP);
+    side.seal_clamp_groups = seal_clamp_param > 0 ? seal_clamp_param : 0;
     const int head_slices_param = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_HEAD_SLICES);
     side.head_slices = head_slices_param > 0 ? head_slices_param : 1;
     side.stage_groups = ggml_get_op_params_i32(cur, GGML_CUDA_FATTN_KVARN_OP_PARAM_STAGE_GROUPS);

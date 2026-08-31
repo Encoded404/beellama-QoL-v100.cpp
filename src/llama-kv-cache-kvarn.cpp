@@ -638,11 +638,13 @@ uint32_t kvarn_record_groups_per_stream(uint32_t kv_size, uint32_t n_ubatch, uin
 llama_kv_cache_kvarn_context::llama_kv_cache_kvarn_context(
         llama_kv_cache_kvarn * cache,
         llama_memory_context_ptr base,
-        llama_context * update_lctx) :
+        llama_context * update_lctx,
+        const llama_kvarn_borrow_config * borrow_cfg) :
     llama_kv_cache_context(base ? base->get_status() : LLAMA_MEMORY_STATUS_FAILED_PREPARE),
     cache(cache),
     base_ctx(std::move(base)),
-    update_lctx(update_lctx) {
+    update_lctx(update_lctx),
+    borrow_cfg(borrow_cfg != nullptr ? *borrow_cfg : llama_kvarn_borrow_config()) {
 }
 
 llama_kv_cache_context * llama_kv_cache_kvarn_context::base() const {
@@ -753,7 +755,7 @@ ggml_tensor * llama_kv_cache_kvarn_context::get_k_for_attention(
     const auto it = stored_k.find(cache->mapped_layer_id(il));
     GGML_ASSERT(it != stored_k.end());
     return native_attention ? get_k_native(ctx, il) :
-        cache->materialize(ctx, it->second, il, get_n_kv(), current_sinfo(), false, mat_idxs);
+        cache->materialize(ctx, it->second, il, get_n_kv(), current_sinfo(), false, mat_idxs, &borrow_cfg);
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_v(ggml_context * ctx, int32_t il) const {
@@ -765,7 +767,7 @@ ggml_tensor * llama_kv_cache_kvarn_context::get_v_for_attention(
     const auto it = stored_v.find(cache->mapped_layer_id(il));
     GGML_ASSERT(it != stored_v.end());
     return native_attention ? get_v_native(ctx, il) :
-        cache->materialize(ctx, it->second, il, get_n_kv(), current_sinfo(), true, mat_idxs);
+        cache->materialize(ctx, it->second, il, get_n_kv(), current_sinfo(), true, mat_idxs, &borrow_cfg);
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_k_tail(ggml_context * ctx, int32_t il) const {
@@ -854,13 +856,13 @@ bool llama_kv_cache_kvarn_context::can_pack_tail_body(const llama_ubatch & ubatc
 ggml_tensor * llama_kv_cache_kvarn_context::get_k_native(ggml_context * ctx, int32_t il) const {
     const auto it = stored_k.find(cache->mapped_layer_id(il));
     GGML_ASSERT(it != stored_k.end());
-    return cache->view(ctx, it->second, il, get_n_kv(), current_sinfo(), false, mat_idxs);
+    return cache->view(ctx, it->second, il, get_n_kv(), current_sinfo(), false, mat_idxs, &borrow_cfg);
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_v_native(ggml_context * ctx, int32_t il) const {
     const auto it = stored_v.find(cache->mapped_layer_id(il));
     GGML_ASSERT(it != stored_v.end());
-    return cache->view(ctx, it->second, il, get_n_kv(), current_sinfo(), true, mat_idxs);
+    return cache->view(ctx, it->second, il, get_n_kv(), current_sinfo(), true, mat_idxs, &borrow_cfg);
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::build_input_kvarn_rot(ggml_context * ctx, int n_rot) const {
@@ -876,7 +878,7 @@ ggml_tensor * llama_kv_cache_kvarn_context::cpy_k(
         ggml_tensor * k_cur,
         ggml_tensor * k_idxs,
         int32_t il) const {
-    auto * result = cache->store(ctx, k_cur, k_idxs, il, current_sinfo(), false);
+    auto * result = cache->store(ctx, k_cur, k_idxs, il, current_sinfo(), false, &borrow_cfg);
     stored_k[cache->mapped_layer_id(il)] = result;
     return result;
 }
@@ -886,7 +888,7 @@ ggml_tensor * llama_kv_cache_kvarn_context::cpy_v(
         ggml_tensor * v_cur,
         ggml_tensor * v_idxs,
         int32_t il) const {
-    auto * result = cache->store(ctx, v_cur, v_idxs, il, current_sinfo(), true);
+    auto * result = cache->store(ctx, v_cur, v_idxs, il, current_sinfo(), true, &borrow_cfg);
     stored_v[cache->mapped_layer_id(il)] = result;
     return result;
 }
@@ -2895,7 +2897,8 @@ ggml_tensor * llama_kv_cache_kvarn::store(
         ggml_tensor * indices,
         int32_t il,
         const llama_kv_cache::slot_info & sinfo,
-        bool value) const {
+        bool value,
+        const llama_kvarn_borrow_config * borrow_cfg) const {
     const auto & layer = layer_for(il);
     if (!ggml_is_contiguous(current)) {
         current = ggml_cont(ctx, current);
@@ -2923,7 +2926,14 @@ ggml_tensor * llama_kv_cache_kvarn::store(
     result->op_params[4] = swa ? 1 : 0; // SWA sliding-window ring store
     result->op_params[5] = (int32_t) slices; // KVarN head-wide Hadamard slice count
     result->op_params[8] = int32_t(tail_groups);
-    result->op_params[9] = 1; // commit every completed record before it leaves the live workspace
+    // Borrowing auxiliary contexts append speculative rows at the target's
+    // frontier but must never seal record groups: rows leave the F16 staging
+    // region only through the target's own eager stores. See
+    // llama_kvarn_borrow_config.
+    const bool eager_records = borrow_cfg == nullptr || borrow_cfg->eager_records;
+    const bool advance_fill  = borrow_cfg == nullptr || borrow_cfg->advance_fill;
+    result->op_params[9]  = eager_records ? 1 : 0; // commit every completed record before it leaves the live workspace
+    result->op_params[10] = advance_fill  ? 1 : 0; // move the stream's committed (sealable) fill
     return result;
 }
 
@@ -2934,7 +2944,8 @@ ggml_tensor * llama_kv_cache_kvarn::view(
         uint32_t n_kv,
         const llama_kv_cache::slot_info & sinfo,
         bool value,
-        ggml_tensor * mat_idxs) const {
+        ggml_tensor * mat_idxs,
+        const llama_kvarn_borrow_config * borrow_cfg) const {
     const auto & layer = layer_for(il);
     const uint32_t stream_start = sinfo.s0;
     const uint32_t stream_count = sinfo.s1 - sinfo.s0 + 1;
@@ -2955,6 +2966,13 @@ ggml_tensor * llama_kv_cache_kvarn::view(
     result->op_params[8] = int32_t(tail_groups);
     result->op_params[9] = 1;
     result->op_params[10] = !swa && mat_idxs ? 1 : 0;
+    // Borrowing auxiliary contexts cannot read record groups that the target
+    // has not fully verified and sealed yet: their speculative rows live in
+    // the F16 staging region, not in records. The device clamp bounds the
+    // record domain at the target's verified frontier (seal_clamp_groups
+    // == verified frontier / 128; 0 = no clamp).
+    result->op_params[11] =
+        borrow_cfg != nullptr ? int32_t(borrow_cfg->seal_clamp_groups) : 0;
     const uint32_t slices = value ? layer.v_slices : layer.k_slices;
     if (slices > 1) {
         result = ggml_reshape_4d(
@@ -2976,7 +2994,8 @@ ggml_tensor * llama_kv_cache_kvarn::materialize(
         uint32_t n_kv,
         const llama_kv_cache::slot_info & sinfo,
         bool value,
-        ggml_tensor * mat_idxs) const {
+        ggml_tensor * mat_idxs,
+        const llama_kvarn_borrow_config * borrow_cfg) const {
     const auto & layer = layer_for(il);
     const uint32_t stream_start = sinfo.s0;
     const uint32_t stream_count = sinfo.s1 - sinfo.s0 + 1;
@@ -3002,6 +3021,10 @@ ggml_tensor * llama_kv_cache_kvarn::materialize(
     result->op_params[8] = int32_t(tail_groups);
     result->op_params[9] = 1;
     result->op_params[10] = !swa && mat_idxs ? 1 : 0;
+    // Record-domain clamp for borrowing auxiliary contexts: the materialized
+    // path must also never read unverified record groups (see view()).
+    result->op_params[11] =
+        borrow_cfg != nullptr ? int32_t(borrow_cfg->seal_clamp_groups) : 0;
     const uint32_t slices = value ? layer.v_slices : layer.k_slices;
     if (slices > 1) {
         result = ggml_reshape_4d(

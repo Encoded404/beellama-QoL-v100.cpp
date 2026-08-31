@@ -33,6 +33,8 @@ static constexpr int KVAR_N_OP_PARAM_STAGE_GROUPS = 7;  // dynamic F16 stage dep
 static constexpr int KVAR_N_OP_PARAM_TAIL_GROUPS = 8;   // lossless tail groups within the stage
 static constexpr int KVAR_N_OP_PARAM_EAGER_RECORDS = 9; // materialize a record when its closing token is stored
 static constexpr int KVAR_N_OP_PARAM_READ_INDIRECT = 10;
+static constexpr int KVAR_N_OP_PARAM_STORE_ADVANCE_FILL = 10; // store: move the committed (sealable) fill, 0 = borrow stores only stage rows
+static constexpr int KVAR_N_OP_PARAM_MAT_SEAL_CLAMP = 11; // view/materialize: last fully verified record group, 0 = no clamp
 static __device__ __forceinline__ uint64_t kvarn_index_payload(int64_t encoded) {
     return uint64_t(encoded < -1 ? -(encoded + 2) : encoded);
 }
@@ -1686,6 +1688,12 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const int stage_groups = kvarn_resolve_stage_groups(dst);
     const int tail_groups = kvarn_resolve_tail_groups(dst, stage_groups);
     const bool eager_records = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_EAGER_RECORDS) != 0;
+    // Borrowed-context stores (llama_kvarn_borrow_config: eager_records=0,
+    // advance_fill=0) must write stage rows but never seal record groups:
+    // the stream's committed fill moves exclusively through the target's own
+    // eager stores. 0 on an unset param is safe: every store op built by
+    // llama_kv_cache_kvarn::store() carries this param explicitly.
+    const bool advance_fill = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_STORE_ADVANCE_FILL) != 0;
     GGML_ASSERT(ggml_cuda_kvarn_valid_bits(bits));
     GGML_ASSERT(head_slices == 1 || head_slices == 2 || head_slices == 4);
     GGML_ASSERT((KVAR_N_TILE_VALUES * bits) % 8 == 0);
@@ -1801,6 +1809,10 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             default:
                 GGML_ABORT("unsupported KVarN head_slices");
         }
+        // Borrowed-context stores (advance_fill=0) write stage rows but never
+        // seal record groups: only the target's own eager stores advance the
+        // stream's committed fill. See llama_kvarn_borrow_config.
+        if (advance_fill) {
         dim3 blocks_flush(n_heads, active_streams * flush_candidates, 1);
         kvarn_store_workspace_flush_kernel<<<blocks_flush, KVAR_N_DIM, KVAR_N_SHARED_BYTES, stream>>>(
             (const int64_t *) indices->data,
@@ -1822,6 +1834,7 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             tail_groups,
             swa,
             eager_records);
+        }
         dim3 blocks_commit(n_heads, active_streams * KVAR_N_DIM * stage_groups, 1);
         kvarn_store_workspace_commit_kernel<<<blocks_commit, KVAR_N_DIM, 0, stream>>>(
             (const int64_t *) indices->data,
@@ -1936,6 +1949,10 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             n_heads,
             n_tokens,
             value);
+        // Borrowed-context stores (advance_fill=0) write stage rows but never
+        // seal record groups: only the target's own eager stores advance the
+        // stream's committed fill. See llama_kvarn_borrow_config.
+        if (advance_fill) {
         dim3 blocks_flush(n_heads, active_streams * flush_candidates, 1);
         kvarn_store_workspace_flush_kernel<<<blocks_flush, KVAR_N_DIM, KVAR_N_SHARED_BYTES, stream>>>(
             (const int64_t *) indices->data,
@@ -1957,6 +1974,7 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             tail_groups,
             swa,
             eager_records);
+        }
         dim3 blocks_commit(n_heads, active_streams * KVAR_N_DIM * stage_groups, 1);
         kvarn_store_workspace_commit_kernel<<<blocks_commit, KVAR_N_DIM, 0, stream>>>(
             (const int64_t *) indices->data,
@@ -2007,22 +2025,25 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             KVAR_N_SHARED_BYTES));
 #endif
         auto prof = kvarn_prof_begin(ctx, stream, kvarn_prof_kind::STORE_HI, value, bits, n_tokens, staged_bytes);
-        dim3 blocks_flush(n_heads, n_tokens, 1);
-        kvarn_store_direct_flush_kernel<<<blocks_flush, KVAR_N_DIM, KVAR_N_SHARED_BYTES, stream>>>(
-            (const int64_t *) indices->data,
-            (const half *) stage->data,
-            (uint8_t *) records->data,
-            n_heads,
-            n_tokens,
-            n_stream,
-            groups_per_stream,
-            (int) records->ne[0],
-            bits,
-            iterations,
-            value,
-            swa,
-            stage_groups,
-            tail_groups);
+        // Borrowed-context stores never seal (see advance_fill).
+        if (advance_fill) {
+            dim3 blocks_flush(n_heads, n_tokens, 1);
+            kvarn_store_direct_flush_kernel<<<blocks_flush, KVAR_N_DIM, KVAR_N_SHARED_BYTES, stream>>>(
+                (const int64_t *) indices->data,
+                (const half *) stage->data,
+                (uint8_t *) records->data,
+                n_heads,
+                n_tokens,
+                n_stream,
+                groups_per_stream,
+                (int) records->ne[0],
+                bits,
+                iterations,
+                value,
+                swa,
+                stage_groups,
+                tail_groups);
+        }
         dim3 blocks_stage(n_heads, (n_tokens + KVAR_N_STAGE_CHUNK - 1) / KVAR_N_STAGE_CHUNK, 1);
         kvarn_store_direct_stage_kernel<<<blocks_stage, KVAR_N_DIM * KVAR_N_STAGE_CHUNK, 0, stream>>>(
             (const float *) current->data,
@@ -2178,7 +2199,8 @@ static __global__ void kvarn_materialize_kernel(
         int stage_groups,
         int tail_groups,
         bool eager_records,
-        bool read_indirect) {
+        bool read_indirect,
+        int seal_clamp_groups) {
     const int cell = blockIdx.x;
     const int logical_head = blockIdx.y;
     const int out_stream = blockIdx.z;
@@ -2239,6 +2261,13 @@ static __global__ void kvarn_materialize_kernel(
                 KVAR_N_DIM + ((group - 1) % tail_groups) * KVAR_N_DIM + pos);
             record_group = int64_t(stream) * groups_per_stream + group;
         }
+        // Borrowed-context clamp: record groups at/after the target's
+        // verified frontier are never sealed; their rows live in the F16
+        // staging region and must be materialized from there.
+        if (!explicitly_staged && seal_clamp_groups > 0 && group >= seal_clamp_groups) {
+            from_stage = true;
+            from_record = false;
+        }
         for (int slice = 0; slice < head_slices; ++slice) {
             const int h = logical_head * head_slices + slice;
             if (from_stage) {
@@ -2284,6 +2313,12 @@ void ggml_cuda_op_kvarn_materialize(ggml_backend_cuda_context & ctx, ggml_tensor
     const int stage_groups = kvarn_resolve_stage_groups(dst);
     const int tail_groups = kvarn_resolve_tail_groups(dst, stage_groups);
     const bool eager_records = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_EAGER_RECORDS) != 0;
+    // Borrowed-context stores (llama_kvarn_borrow_config: eager_records=0,
+    // advance_fill=0) must write stage rows but never seal record groups:
+    // the stream's committed fill moves exclusively through the target's own
+    // eager stores. 0 on an unset param is safe: every store op built by
+    // llama_kv_cache_kvarn::store() carries this param explicitly.
+    const bool advance_fill = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_STORE_ADVANCE_FILL) != 0;
     const bool read_indirect = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_READ_INDIRECT) != 0;
     const int n_total_stream = int(stage->ne[2] / (KVAR_N_DIM * stage_groups));
     const int groups_per_stream = int(records->ne[2] / n_total_stream);
@@ -2296,9 +2331,11 @@ void ggml_cuda_op_kvarn_materialize(ggml_backend_cuda_context & ctx, ggml_tensor
         (const int64_t *) indices->data, int(indices->ne[0]), live.get(), stream_start,
         n_stream, groups_per_stream, swa, read_indirect);
     const dim3 blocks(n_kv, n_heads / head_slices, n_stream);
+    const int seal_clamp_groups = ggml_get_op_params_i32(dst, KVAR_N_OP_PARAM_MAT_SEAL_CLAMP);
     kvarn_materialize_kernel<<<blocks, KVAR_N_DIM, size_t(head_slices) * KVAR_N_DIM * sizeof(float), stream>>>(
         (const uint8_t *) records->data, (const half *) stage->data, (const int64_t *) indices->data,
         live.get(), (half *) dst->data, n_heads, n_kv, stream_start, n_stream,
         groups_per_stream, int(records->ne[0]), bits, value, emit_rotated, swa,
-        head_slices, stage_groups, tail_groups, eager_records, read_indirect);
+        head_slices, stage_groups, tail_groups, eager_records, read_indirect,
+        seal_clamp_groups);
 }

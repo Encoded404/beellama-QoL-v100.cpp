@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-kv-cache-kvarn.h"
+#include "llama-kv-cache-kvarn-borrow.h"
 #include "llama-kv-cache-tail.h"
 #include "llama-kv-tail-request.h"
 #include "llama-kvarn.h"
@@ -4321,7 +4322,28 @@ llama_context * llama_init_from_model(
     }
 
     if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
-        if (params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || model->arch == LLM_ARCH_DFLASH) {
+        // An auxiliary (draft/MTP) context may share the target context's
+        // KVarN store instead of allocating its own cache (KVarN borrow,
+        // see llama-kv-cache-kvarn-borrow.h). In that case the aux context
+        // never needs its own KVarN storage and the target-context-only
+        // restriction does not apply.
+        //
+        // The bypass must mirror create_memory's borrow site exactly: a
+        // borrow is currently only constructed for LLM_ARCH_GEMMA4_ASSISTANT
+        // auxiliary contexts (llama-model.cpp, create_memory). If the probe
+        // passed but create_memory did not build the borrow, this context
+        // would otherwise silently proceed to allocate its OWN private KVarN
+        // store (previously impossible - KVarN was always disabled for aux
+        // contexts other than DFLASH). Keep the two sites in sync.
+        const bool kvarn_borrow_aux =
+            params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT &&
+            model->arch == LLM_ARCH_GEMMA4_ASSISTANT &&
+            params.ctx_other != nullptr &&
+            llama_kvarn_aux_borrow_supported(
+                llama_get_memory(params.ctx_other), std::max(1u, params.n_seq_max));
+
+        if ((params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || model->arch == LLM_ARCH_DFLASH) &&
+                !kvarn_borrow_aux) {
             LLAMA_LOG_WARN("%s: KVarN is target-context-only; disabling it for this auxiliary context\n", __func__);
             params.kvarn = llama_kvarn_default_params();
         } else {

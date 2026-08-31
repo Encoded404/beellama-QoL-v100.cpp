@@ -324,6 +324,7 @@ static __global__ void ggml_cuda_fattn_kvarn_init_descs_kernel(
         bool k_swa,
         bool k_eager_records,
         bool k_read_indirect,
+        int k_seal_clamp_groups,
         const uint8_t * v_records,
         const half * v_stage,
         const int64_t * v_indices,
@@ -339,6 +340,7 @@ static __global__ void ggml_cuda_fattn_kvarn_init_descs_kernel(
         bool v_swa,
         bool v_eager_records,
         bool v_read_indirect,
+        int v_seal_clamp_groups,
         int n_stream,
         int n_kv_heads,
         int slices,
@@ -393,6 +395,7 @@ static __global__ void ggml_cuda_fattn_kvarn_init_descs_kernel(
         k_desc.head_slices = k_head_slices;
         k_desc.eager_records = k_eager_records ? 1 : 0;
         k_desc.read_indirect = k_read_indirect ? 1 : 0;
+        k_desc.seal_clamp_groups = k_seal_clamp_groups;
         k_desc.original_domain = k_original_domain;
 
         ggml_cuda_fattn_kvarn_desc & v_desc = v_descs[(size_t) out_stream * n_kv_heads + h];
@@ -414,6 +417,7 @@ static __global__ void ggml_cuda_fattn_kvarn_init_descs_kernel(
         v_desc.head_slices = v_head_slices;
         v_desc.eager_records = v_eager_records ? 1 : 0;
         v_desc.read_indirect = v_read_indirect ? 1 : 0;
+        v_desc.seal_clamp_groups = v_seal_clamp_groups;
         v_desc.original_domain = v_original_domain;
     }
 }
@@ -441,6 +445,7 @@ void ggml_cuda_fattn_kvarn_init_descs(
         plan.k.swa,
         plan.k.eager_records,
         plan.k.read_indirect,
+        plan.k.seal_clamp_groups,
         (const uint8_t *) plan.v.records->data,
         (const half *) plan.v.stage->data,
         (const int64_t *) plan.v.indices->data,
@@ -456,6 +461,7 @@ void ggml_cuda_fattn_kvarn_init_descs(
         plan.v.swa,
         plan.v.eager_records,
         plan.v.read_indirect,
+        plan.v.seal_clamp_groups,
         plan.n_stream,
         plan.n_kv_heads,
         plan.slices,

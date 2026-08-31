@@ -12,6 +12,7 @@
 #include "llama-kv-cache-placement.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-kvarn.h"
+#include "llama-kv-cache-kvarn-borrow.h"
 #include "llama-kv-cache-dsa.h"
 #include "llama-kv-cache-dsa-iswa.h"
 #include "llama-kv-cache-msa.h"
@@ -2633,6 +2634,32 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                         if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
                             llama_memory_t mem_other = llama_get_memory(cparams.ctx_other);
+
+                            // KVarN borrow: when the target context stores its
+                            // K/V in a KVarN store (directly or inside the ISWA
+                            // wrapper), the auxiliary context can share that
+                            // store instead of allocating its own or reusing
+                            // plain cells: the draft reads the target records
+                            // and writes its speculative rows at the verified
+                            // frontier through the unsealed F16 staging region.
+                            // See llama-kv-cache-kvarn-borrow.h for the full
+                            // contract (cursors, seal clamps, rollback, state).
+                            if (llama_kvarn_aux_borrow_supported(mem_other, cparams.n_seq_max)) {
+                                llama_kv_cache_kvarn * kvarn = const_cast<llama_kv_cache_kvarn *>(
+                                        llama_memory_probe_kvarn(mem_other));
+                                GGML_ASSERT(kvarn != nullptr);
+                                // The auxiliary writes at most the speculative
+                                // window per cycle; bound it by the lossless
+                                // F16 staging region (invariant I1).
+                                const uint32_t max_draft_tokens =
+                                    kvarn->get_stage_groups() * KVAR_N_GROUP;
+                                res = new llama_kv_cache_kvarn_borrow(
+                                        *this, hparams, kvarn,
+                                        cparams.n_ubatch,
+                                        /* n_seq_max      */ cparams.n_seq_max,
+                                        max_draft_tokens);
+                                break;
+                            }
 
                             share = [&](int32_t il) {
                                 const llama_model * model_other = llama_get_model(cparams.ctx_other);

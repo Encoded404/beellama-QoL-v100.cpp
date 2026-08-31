@@ -287,6 +287,12 @@ behaviors, both off by default where the default is performance-neutral:
   streams stay in flight; complex K/IQ vec-dots stay at 4 warps to limit
   register pressure.
 
+## KVarN runtime env
+
+| Argument | Env var | Default | Behavior |
+|---|---|---|---|
+| — | `GGML_KVARN_BORROW` | `1` (on) | `0` disables borrowing the target's KVarN store for a Gemma-4 assistant (draft/MTP) auxiliary context; the auxiliary then uses a private cache. |
+
 ## Migration from earlier versions
 
 | Earlier spelling or surface | v0.4.0 behavior | Replacement |
