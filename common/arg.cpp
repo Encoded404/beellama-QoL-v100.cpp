@@ -5184,6 +5184,32 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
+    add_opt(common_arg(
+        {"--jsonl"}, "PATH",
+        "JSONL corpus for hidden-state dumping: each line is one chat document "
+        "with an OpenAI-compatible 'messages' array (roles user/assistant, string content)",
+        [](common_params & params, const std::string & value) {
+            params.jsonl_path = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_JSONL"));
+    add_opt(common_arg(
+        {"--output-dir"}, "PATH",
+        string_format("directory for the per-document .npz hidden-state dump files (default: %s)", params.dump_outdir.c_str()),
+        [](common_params & params, const std::string & value) {
+            params.dump_outdir = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_DUMP_OUTDIR"));
+    add_opt(common_arg(
+        {"--dump-format"}, "FORMAT",
+        string_format("extra per-token arrays in each .npz dump (default: %s)\n"
+            "  plain - input_ids + labels (next-token)\n"
+            "  roles - plain + roles int32 array (0=user, 1=assistant, 2=system, 3=tool, 4=unknown)\n"
+            "  turns - roles + turn_id int32 array (increments on each user turn)", params.dump_format.c_str()),
+        [](common_params & params, const std::string & value) {
+            params.dump_format = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_DUMP_FORMAT"));
+
     return ctx_arg;
 }
 

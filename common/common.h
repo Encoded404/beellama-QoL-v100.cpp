@@ -695,6 +695,12 @@ struct common_params {
     std::string embd_sep   = "\n";  // separator of embeddings
     std::string cls_sep    = "\t";  // separator of classification sequences
 
+    // hidden-state dump (llama-embedding-dump)
+    std::string jsonl_path  = "";   // path to JSONL corpus (one chat document per line)
+    std::string dump_outdir = ".";  // directory for the per-document .npz dump files
+    std::string dump_format = "plain"; // extra arrays per token: "plain" (ids+labels),
+                                       // "roles" (+roles int32), "turns" (+roles, turn_id)
+
     // server params
     int32_t port                = 8080;          // server listens on this network port
     bool    reuse_port          = false;         // allow multiple sockets to bind to the same port

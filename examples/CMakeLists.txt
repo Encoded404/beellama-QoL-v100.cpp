@@ -17,6 +17,7 @@ else()
     add_subdirectory(batched)
     add_subdirectory(debug)
     add_subdirectory(embedding)
+    add_subdirectory(embedding-dump)
     add_subdirectory(eval-callback)
 
     add_subdirectory(gguf-hash)
