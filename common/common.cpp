@@ -1912,16 +1912,23 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
+    // n_seq_active (--max-concurrent-streams) caps the number of
+    // simultaneously-active sequences used to reserve the decode workspace and
+    // the output buffers, while n_seq_max continues to size KV slot capacity
+    // and the prompt-cache slots. It is clamped to [1, n_seq_max]; 0 means
+    // n_seq_max.
+    cparams.n_seq_active      = params.n_seq_active > 0
+            ? std::min<uint32_t>(params.n_seq_active, cparams.n_seq_max)
+            : cparams.n_seq_max;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
-    // --n-outputs-max caps the worst-case total outputs used to reserve the
-    // graph/logits buffers, but it can never go below one output per sequence:
-    // output_reserve() hard-floors at n_seq_max and asserts the reserve fits
-    // cparams.n_outputs_max, so a smaller value would abort context creation
-    // (including the memory-fit probes). 0 keeps the upstream auto behavior.
-    cparams.n_outputs_max     = params.n_outputs_max > 0
-            ? std::max<int32_t>(params.n_outputs_max, params.n_parallel)
-            : 0;
+    // n_outputs_max is derived from the active-stream cap times the
+    // per-sequence speculative expansion, floored at n_seq_max: output_reserve()
+    // hard-floors at n_seq_max and asserts the reserve fits cparams.n_outputs_max,
+    // so a smaller value would abort context creation (including the memory-fit
+    // probes).
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
+    cparams.n_outputs_max     = std::max<uint32_t>(cparams.n_seq_max,
+            cparams.n_seq_active * std::max<uint32_t>(1, cparams.n_outputs_max_per_seq));
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
     cparams.n_threads         = params.cpuparams.n_threads;

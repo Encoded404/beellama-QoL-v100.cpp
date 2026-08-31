@@ -26,6 +26,7 @@
 #include <memory>
 #include <filesystem>
 #include <random>
+#include <set>
 #include <utility>
 #include <fstream>
 
@@ -233,6 +234,16 @@ struct server_batch {
 
     int32_t size() const {
         return (int32_t)tokens.size();
+    }
+
+    // number of distinct slot ids currently in the batch; each slot contributes
+    // one stream to the decode, so this must stay <= n_seq_active_reserve
+    int32_t n_streams() const {
+        std::set<int32_t> ids;
+        for (const auto & t : tokens) {
+            ids.insert(t.id_slot);
+        }
+        return (int32_t) ids.size();
     }
 
     void set_output(int32_t idx, bool output) {
@@ -1067,6 +1078,13 @@ private:
     // if swa_full is enabled, this is set to 0 to simulate a non-SWA model
     int32_t n_swa;
 
+    // max concurrent streams batched per llama_decode; resolves
+    // --max-concurrent-streams against the number of slots. The decode
+    // workspace and output buffers are reserved for exactly this many streams,
+    // so the server must never batch more active slots into a single decode
+    // than this.
+    int32_t n_seq_active_reserve = 1;
+
     // slots / clients
     std::vector<server_slot> slots;
 
@@ -1183,20 +1201,18 @@ private:
             return false;
         }
         const auto output_limits = server_output_limits(params_base);
-        // --n-outputs-max caps the worst-case number of concurrently output
-        // STREAMS used to reserve the graph and logits buffers. The auto path
-        // derives it from -np/--parallel, but a user who only ever runs fewer
-        // concurrent streams than slots can reclaim that reservation without
-        // reducing KV slot capacity or RAM prompt-cache slots. The reserved
-        // total is the capped stream count times the per-sequence speculative
-        // expansion (each MTP/DFlash stream emits 1 + n_draft rows), floored at
-        // n_seq_max because output_reserve() requires at least one output per
-        // sequence. A value of 0 keeps the auto behavior.
-        const int32_t n_streams_reserve = params_base.n_outputs_max > 0
-                ? std::max<int32_t>(1, std::min<int32_t>(params_base.n_outputs_max, params_base.n_parallel))
+        // --max-concurrent-streams caps how many simultaneously-active streams
+        // the decode workspace and output buffers are reserved for, independent
+        // of the slot count (-np). The server guarantees it never batches more
+        // active slots into one decode than this. The resolved value is written
+        // back into params_base.n_seq_active so the shared
+        // common_context_params_to_llama() derives n_seq_active, n_outputs_max,
+        // and n_outputs_max_per_seq consistently for the target context.
+        n_seq_active_reserve = params_base.n_seq_active > 0
+                ? std::min<int32_t>(params_base.n_seq_active, params_base.n_parallel)
                 : params_base.n_parallel;
-        params_base.n_outputs_max = std::max<int32_t>(params_base.n_parallel,
-                n_streams_reserve * output_limits.per_seq);
+        n_seq_active_reserve = std::max<int32_t>(1, n_seq_active_reserve);
+        params_base.n_seq_active = n_seq_active_reserve;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
 
         const bool has_mmproj = !params.mmproj.path.empty();
@@ -3380,6 +3396,14 @@ private:
                 return;
             }
 
+            // the decode workspace is reserved for n_seq_active_reserve streams;
+            // never batch more generating slots than that into one decode.
+            // Excess slots are simply skipped this iteration and picked up on a
+            // later update_slots() pass once an earlier slot is released.
+            if ((int32_t) generating.size() >= n_seq_active_reserve) {
+                return;
+            }
+
             // check if we can batch this slot with the previous one
             if (!slot_batched) {
                 slot_batched = &slot;
@@ -3565,6 +3589,13 @@ private:
                 }
 
                 if (!slot.is_processing()) {
+                    return;
+                }
+
+                // the decode workspace is reserved for n_seq_active_reserve
+                // streams; never add more distinct slots than that to the batch.
+                // Excess slots are skipped this iteration and processed later.
+                if (batch.n_streams() >= n_seq_active_reserve) {
                     return;
                 }
 

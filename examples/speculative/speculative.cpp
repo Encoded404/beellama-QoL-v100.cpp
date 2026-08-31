@@ -60,7 +60,10 @@ int main(int argc, char ** argv) {
 
     const auto output_limits = common_speculative_get_output_limits(
             params.n_batch, params.n_parallel, params.speculative.draft.n_max);
-    params.n_outputs_max = output_limits.total;
+    // n_outputs_max is derived in common_context_params_to_llama() from
+    // n_seq_active * n_outputs_max_per_seq; set the active-stream cap to the
+    // full parallel count so the derive matches the speculative output limits.
+    params.n_seq_active = params.n_parallel;
     params.n_outputs_max_per_seq = output_limits.per_seq;
 
     // probability threshold for splitting a draft branch (only for n_seq_dft > 1)
@@ -89,8 +92,8 @@ int main(int argc, char ** argv) {
     params.devices = params.speculative.draft.devices;
     params.model = params.speculative.draft.mparams;
     params.n_gpu_layers = params.speculative.draft.n_gpu_layers;
-    params.n_outputs_max = params.n_parallel;
-    params.n_outputs_max_per_seq = 1;
+    // n_outputs_max is derived from n_seq_active * n_outputs_max_per_seq
+    // (n_seq_active == n_parallel, per_seq == 1 here), so no override is needed.
     if (params.speculative.draft.cpuparams.n_threads > 0) {
         params.cpuparams.n_threads = params.speculative.draft.cpuparams.n_threads;
     }

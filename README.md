@@ -198,25 +198,26 @@ llama-server -m model.gguf -md draft.gguf
 
 With `--kv-unified`, the KV body is a single shared stream, so increasing `-np`
 only adds KV *slot capacity* (and RAM prompt-cache slots) — not KV memory.
-The reserved graph/logits buffers still grow with `-np` because each slot can
-emit an output per speculative step. If you only ever serve a single (or a few)
-concurrent streams but want many cached-prompt slots, cap the worst-case output
-reservation independently:
+The reserved decode workspace (graph activations / QKV buffers) still grows
+with `-np` because each slot can emit a stream per decode step. If you only
+ever serve a single (or a few) concurrent streams but want many cached-prompt
+slots, cap the number of simultaneously-active streams the workspace is
+reserved for:
 
 ```sh
-# Many RAM-cached prompt slots, but the graph/logits buffers are reserved for
-# a single concurrently-output stream.
+# Many RAM-cached prompt slots, but the decode workspace and output buffers are
+# reserved for a single concurrently-active stream.
 llama-server -m model.gguf --kv-unified -np 8 \
-  --cache-ram 16384 --n-outputs-max 1
+  --cache-ram 16384 --max-concurrent-streams 1
 ```
 
-`--n-outputs-max` is a general argument (also usable from `llama-cli`, bench,
-and perplexity) that caps the worst-case number of concurrently-output streams
-used to reserve the graph and logits buffers, applied to both the target and
-any draft/MTP context. The reserved total is the capped stream count times the
-per-sequence speculative expansion, floored at one output per sequence (a hard
-structural minimum). It is only safe to set below `-np` when you never batch
-more concurrent output streams than the cap allows.
+`--max-concurrent-streams` (`-mcs`, also usable from `llama-cli`, bench, and
+perplexity) caps the worst-case number of simultaneously-active streams used to
+reserve the decode workspace (graph activations / QKV buffers) and the host
+logits/sampling output buffers, independent of `-np`/`--parallel` (which
+continues to control KV slot capacity and RAM prompt-cache slots). It must be
+`<= -np`; at runtime the server never batches more active streams than this into
+a single decode.
 
 ### DFlash Speculative Decoding
 

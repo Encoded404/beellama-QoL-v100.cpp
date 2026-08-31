@@ -510,7 +510,8 @@ struct common_params {
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
     int32_t n_sequences           =     1; // number of sequences to decode
-    int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch); caps the worst-case concurrently-output streams used to reserve graph/logits buffers, independent of n_parallel (KV slot capacity)
+    int32_t n_seq_active          =     0; // max concurrent streams (--max-concurrent-streams) the decode workspace and output buffers are reserved for (0 = n_parallel); must be <= n_parallel and independent of KV slot capacity; n_outputs_max is derived from it
+    int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch); derived from n_seq_active * n_outputs_max_per_seq in common_context_params_to_llama, floored at n_parallel
     int32_t n_outputs_max_per_seq =     1; // max outputs per sequence
     int32_t grp_attn_n            =     1; // group-attention factor
     int32_t grp_attn_w            =   512; // group-attention width

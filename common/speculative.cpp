@@ -2640,15 +2640,10 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.cache_type_v  = params_spec.cache_type_v;
     result.kv_tail_tokens = "0";
     result.kv_tail_type   = GGML_TYPE_F16;
-    // An explicit --n-outputs-max caps the worst-case TOTAL number of outputs
-    // in a batch for the draft graph as well, matching how the target context
-    // consumes it. Without one the draft context derives its worst case from
-    // -np/--parallel (one output per slot; block drafts additionally emit every
-    // block position).
-    result.n_outputs_max = params.n_outputs_max > 0
-            ? std::min<int32_t>(params.n_outputs_max, params.n_parallel)
-            : params.n_parallel;
-    result.n_outputs_max_per_seq = 1;
+    // The draft context inherits n_seq_active (--max-concurrent-streams) from
+    // the target params. n_outputs_max is derived in
+    // common_context_params_to_llama() as n_seq_active * n_outputs_max_per_seq,
+    // so only the per-seq expansion needs to be adjusted for block drafts.
 
     // dflash/dspark decode the whole noise block in a single pass and sample every block position on the backend
     // TODO: refactor such properties to be announced by the speculative types
@@ -2661,10 +2656,6 @@ common_params common_base_params_to_speculative(const common_params & params) {
     if (has_block_draft) {
         // per-seq output positions: DFlash decodes anchor + n_max masks (n_max + 1); DSpark n_max -> +1 covers both
         const int32_t per_seq = std::max(1, params_spec.n_max + 1);
-        const int32_t total_auto = params.n_parallel * per_seq;
-        result.n_outputs_max = params.n_outputs_max > 0
-                ? std::min<int32_t>(params.n_outputs_max, total_auto)
-                : total_auto;
         if (params_spec.backend_sampling) {
             result.n_outputs_max_per_seq = per_seq;
         }

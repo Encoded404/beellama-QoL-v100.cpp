@@ -956,10 +956,21 @@ void llama_context::sched_reserve() {
 
     const int64_t t_start_us = ggml_time_us();
 
-    const uint32_t n_seqs = cparams.n_seq_max;
-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    // The decode (token-generation) workspace scales with the number of
+    // simultaneously-active streams. n_seq_active is the runtime cap the
+    // server guarantees per decode batch; n_seq_max is the KV/slot capacity.
+    // Using n_seq_active here shrinks the reserved graph activations/QKV
+    // buffers when a deployment runs fewer concurrent streams than slots.
+    const uint32_t n_seqs = cparams.n_seq_active;
+    // Prefill processes up to a full ubatch of tokens regardless of stream
+    // count, so its reserve is sized by the physical ubatch.
+    const uint32_t n_tokens_pp = std::min(cparams.n_ctx, cparams.n_ubatch);
+    // Decode batches one token per active stream plus the per-sequence
+    // speculative expansion (1 + n_draft). The token-generation graph is
+    // reserved for this worst case so it never needs a runtime realloc.
+    const uint32_t n_tokens_tg = n_seqs * std::max<uint32_t>(1, cparams.n_outputs_max_per_seq);
 
-    const size_t max_nodes = this->graph_max_nodes(n_tokens);
+    const size_t max_nodes = this->graph_max_nodes(n_tokens_pp);
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
@@ -984,7 +995,8 @@ void llama_context::sched_reserve() {
     // avoid reserving graphs with zero outputs - assume one output per sequence
     const int n_outputs = n_seqs;
 
-    LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", __func__, n_tokens, n_seqs, n_outputs);
+    LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d (pp) / %d (tg), n_seqs = %d, n_outputs = %d\n",
+            __func__, n_tokens_pp, n_tokens_tg, n_seqs, n_outputs);
 
     resolve_fused_ops(mctx.get(), n_seqs);
 
@@ -995,18 +1007,18 @@ void llama_context::sched_reserve() {
     int n_splits_tg = -1;
     int n_nodes_tg  = -1;
 
-    const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
+    const uint32_t n_outputs_pp = std::min(n_tokens_pp, cparams.n_outputs_max);
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
+        auto * gf = graph_reserve(n_tokens_pp, n_seqs, n_outputs_pp, mctx.get(),
                 model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
         if (!gf) {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
+                gf = graph_reserve(n_tokens_pp, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
                 throw std::runtime_error("failed to allocate compute pp buffers");
@@ -1020,7 +1032,7 @@ void llama_context::sched_reserve() {
 
     // reserve with tg (token generation) graph to get the number of splits and nodes
     {
-        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
+        auto * gf = graph_reserve(n_tokens_tg, n_seqs, n_tokens_tg, mctx.get(), model.hparams.no_alloc);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute tg buffers");
         }
@@ -1034,9 +1046,9 @@ void llama_context::sched_reserve() {
     {
         // TODO: not sure if the following graph would be worst case for multi-stream KV caches:
         //
-        // auto * gf = graph_reserve(n_tokens, 1, n_tokens, mctx.get());
+        // auto * gf = graph_reserve(n_tokens_pp, 1, n_tokens_pp, mctx.get());
         //
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+        auto * gf = graph_reserve(n_tokens_pp, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
         }
@@ -1068,13 +1080,13 @@ void llama_context::sched_reserve() {
     if (n_nodes_pp == n_nodes_tg) {
         LLAMA_LOG_INFO("%s: graph nodes  = %d\n", __func__, n_nodes_pp);
     } else {
-        LLAMA_LOG_INFO("%s: graph nodes  = %d (with bs=%d), %d (with bs=1)\n", __func__, n_nodes_pp, n_tokens, n_nodes_tg);
+        LLAMA_LOG_INFO("%s: graph nodes  = %d (with bs=%d), %d (with bs=1)\n", __func__, n_nodes_pp, n_tokens_pp, n_nodes_tg);
     }
 
     if (n_splits_pp == n_splits_tg) {
         LLAMA_LOG_INFO("%s: graph splits = %d\n", __func__, n_splits_pp);
     } else {
-        LLAMA_LOG_INFO("%s: graph splits = %d (with bs=%d), %d (with bs=1)\n", __func__, n_splits_pp, n_tokens, n_splits_tg);
+        LLAMA_LOG_INFO("%s: graph splits = %d (with bs=%d), %d (with bs=1)\n", __func__, n_splits_pp, n_tokens_pp, n_splits_tg);
     }
 
     const int64_t t_end_us = ggml_time_us();
@@ -1258,7 +1270,7 @@ llama_memory_status llama_context::memory_update(bool optimize) {
             return LLAMA_MEMORY_STATUS_FAILED_PREPARE;
         }
 
-        const uint32_t n_seqs = cparams.n_seq_max;
+        const uint32_t n_seqs = cparams.n_seq_active;
         const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
         const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
@@ -4293,6 +4305,7 @@ llama_context_params llama_context_default_params() {
         /*.n_batch                     =*/ 2048,
         /*.n_ubatch                    =*/ 512,
         /*.n_seq_max                   =*/ 1,
+        /*.n_seq_active                =*/ 0,
         /*.n_rs_seq                    =*/ 0,
         /*.n_outputs_max               =*/ 0,
         /*.n_outputs_max_per_seq       =*/ 1,

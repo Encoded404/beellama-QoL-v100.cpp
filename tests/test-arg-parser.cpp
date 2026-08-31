@@ -162,8 +162,50 @@ static void test(void) {
         base.n_outputs_max_per_seq = 8;
 
         const auto draft = common_base_params_to_speculative(base);
-        assert(draft.n_outputs_max == 4);
-        assert(draft.n_outputs_max_per_seq == 1);
+        // n_seq_active (--max-concurrent-streams) defaults to following
+        // n_parallel and is inherited by the draft; n_outputs_max stays as the
+        // raw (unresolved) field until common_context_params_to_llama derives it
+        assert(draft.n_seq_active == 0);
+        assert(draft.n_outputs_max == 0);
+
+        base.n_seq_active = 1;
+        const auto draft_capped = common_base_params_to_speculative(base);
+        assert(draft_capped.n_seq_active == 1);
+    }
+
+    {
+        // --max-concurrent-streams clamps to [1, n_parallel]; n_outputs_max is
+        // derived as n_seq_active * n_outputs_max_per_seq, floored at n_seq_max
+        common_params base;
+        base.n_parallel = 8;
+        base.n_seq_active = 2;
+        base.n_outputs_max_per_seq = 4;
+        auto cparams = common_context_params_to_llama(base);
+        assert(cparams.n_seq_active == 2);
+        assert(cparams.n_seq_max == 8);
+        assert(cparams.n_outputs_max == 8); // 2 * 4
+
+        base.n_seq_active = 99; // clamp to n_parallel
+        cparams = common_context_params_to_llama(base);
+        assert(cparams.n_seq_active == 8);
+        assert(cparams.n_outputs_max == 32); // 8 * 4
+
+        base.n_seq_active = 0; // auto follows n_parallel
+        cparams = common_context_params_to_llama(base);
+        assert(cparams.n_seq_active == 8);
+        assert(cparams.n_outputs_max == 32); // 8 * 4
+
+        // floor: n_outputs_max never drops below n_seq_max
+        base.n_outputs_max_per_seq = 1;
+        base.n_seq_active = 1;
+        cparams = common_context_params_to_llama(base);
+        assert(cparams.n_outputs_max == 8); // floored at n_parallel
+
+        // per_seq defaults to 1
+        base.n_outputs_max_per_seq = 0;
+        base.n_seq_active = 2;
+        cparams = common_context_params_to_llama(base);
+        assert(cparams.n_outputs_max == 8); // max(8, 2*1), floored at n_seq_max
     }
 
     printf("test-arg-parser: make sure there is no duplicated arguments in any examples\n\n");

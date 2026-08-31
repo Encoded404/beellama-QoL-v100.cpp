@@ -32,7 +32,10 @@ int main(int argc, char ** argv) {
 
     const auto output_limits = common_speculative_get_output_limits(
             params.n_batch, params.n_parallel, common_speculative_n_max(&params.speculative));
-    params.n_outputs_max = output_limits.total;
+    // n_outputs_max is derived in common_context_params_to_llama() from
+    // n_seq_active * n_outputs_max_per_seq; set the active-stream cap to the
+    // full parallel count so the derive matches the speculative output limits.
+    params.n_seq_active = params.n_parallel;
     params.n_outputs_max_per_seq = output_limits.per_seq;
 
     // init llama.cpp

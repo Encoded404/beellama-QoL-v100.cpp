@@ -180,29 +180,34 @@ Completion timing JSON includes `cache_lcp_n`, `cache_planned_n`,
 tail metric is actionable rather than silently counted as a hit. Accounted
 bytes are serialized payload accounting, not exact process-resident memory.
 
-## Worst-case output reservation
+## Worst-case workspace and output reservation
 
 The number of sequences (`-np`, `--parallel`) controls KV slot capacity and RAM
-prompt-cache slots. Independently, the *worst-case number of concurrently-output
-streams* sizes the reserved graph and logits buffers (`out_ids`, the sampling
-buffers, and the graph's output rows). With `--kv-unified` the KV body uses a
-single shared stream, so increasing `-np` no longer grows the KV body; it still
-grows the reserved output/graph buffers because each slot can emit one output
-per speculative step (MTP/DFlash streams emit `1 + n_draft` rows each). A
-deployment that only ever runs fewer concurrent streams than slots can cap that
-reservation without giving up KV slot capacity or prompt-cache slots.
+prompt-cache slots. `--max-concurrent-streams` reclaims the `-np`-scaled
+reservation for deployments that only ever run fewer concurrent streams than
+slots. It caps the worst-case number of simultaneously-active streams, and from
+that derives everything that scales with it:
 
-The reserved total is the capped stream count times the per-sequence speculative
-expansion, floored at one output per sequence (`n_seq_max`). That floor is a
-hard structural minimum: `output_reserve()` reserves at least one output per
-sequence and asserts the reserve fits the configured cap, so capping below one
-output per sequence would fail context creation (including memory-fit probes).
-The floor therefore only costs the fixed `n_seq_max`-sized reserve (a few MiB),
-not the `-np`-scaled portion.
+- **Decode workspace**: the graph activations / QKV buffers of the
+  token-generation graph scale with the number of active streams times the
+  per-sequence speculative expansion (`n_seq_active * (1 + n_draft)` tokens).
+  With `--kv-unified` the KV body is a single shared stream, so raising `-np`
+  no longer grows the KV body; it still grows this decode workspace because
+  each active slot emits one stream per decode step.
+- **Output buffers**: the host logits/sampling buffers and the graph's output
+  rows are derived as `n_seq_active * n_outputs_max_per_seq`, floored at one
+  output per sequence (`n_seq_max`), a hard structural minimum that
+  `output_reserve()` requires.
+
+The cap applies to the target and any draft/MTP context, and at runtime the
+server never batches more active streams than it into a single decode. A value
+of `0` keeps the auto `-np` behavior. Reducing it below `-np` is only safe when
+you never actually batch more concurrent streams than the cap allows, otherwise
+a transient over-cap batch must re-reserve or fails closed.
 
 | Argument | Env var | Default | Behavior |
 |---|---|---|---|
-| `-nom N`, `--n-outputs-max N` | `LLAMA_ARG_N_OUTPUTS_MAX` | `0` (= `-np`) | Caps the worst-case number of concurrently-output streams used to reserve the graph and logits buffers, applied to both the target and any draft/MTP context. A value of `0` keeps the auto `-np` behavior. Reducing it below `-np` is only safe when you never actually batch more concurrent output streams than the cap allows, otherwise a transient over-cap batch must re-reserve. |
+| `-mcs N`, `--max-concurrent-streams N` | `LLAMA_ARG_MAX_CONCURRENT_STREAMS` | `0` (= `-np`) | Caps the worst-case number of simultaneously-active streams used to reserve the decode workspace (graph activations / QKV buffers) and the host logits/sampling output buffers. Must be `<= -np`; at runtime the server never batches more active streams than this into a single decode. |
 
 ## DFlash and adaptive draft depth
 
