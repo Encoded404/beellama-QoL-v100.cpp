@@ -237,12 +237,14 @@ when a conventional quantized KV layout is easier to compare across backends.
 - Upstream `--spec-draft-type-k`
 - Upstream `--spec-draft-type-v`
 - [`GGML_CUDA_FA_ALL_QUANTS`](beellama-args.md#cuda-flashattention-build-policy)
+- [`GGML_CUDA_FA_NO_BF16`](beellama-args.md#cuda-flashattention-build-policy)
 
 ### Measurement and validation
 
 Compare cache formats with identical model, context, corpus, `-b`, and `-ub`
 values. A build with the default CUDA policy contains 50 standard vector pairs;
-the ALL option contains 169.
+the ALL option contains 169. `GGML_CUDA_FA_NO_BF16=ON` drops every BF16 pair,
+leaving 49 default or 144 with the ALL option.
 
 ### Known limitations
 

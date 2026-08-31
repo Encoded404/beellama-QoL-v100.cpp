@@ -344,6 +344,11 @@ static bool ggml_cuda_fattn_pair_compiled(ggml_type type_K, ggml_type type_V) {
         return false;
     }
 
+#if defined(GGML_CUDA_FA_NO_BF16)
+    if (type_K == GGML_TYPE_BF16 || type_V == GGML_TYPE_BF16) {
+        return false;
+    }
+#endif
 #if defined(GGML_CUDA_FA_ALL_QUANTS)
     return true;
 #else

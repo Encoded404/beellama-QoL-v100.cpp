@@ -69,18 +69,27 @@ def emit_pairs(pairs: list[tuple[str, str]]) -> str:
 
 def render() -> str:
     pairs_default = default_pairs()
+    pairs_default_no_bf16 = [p for p in pairs_default if "BF16" not in p[0] and "BF16" not in p[1]]
     pairs_all = [(type_k, type_v) for type_k in TYPES for type_v in TYPES]
+    pairs_all_no_bf16 = [p for p in pairs_all if "BF16" not in p[0] and "BF16" not in p[1]]
     assert len(TYPES) == 13
     assert len(pairs_default) == 50
+    assert len(pairs_default_no_bf16) == 49
     assert len(pairs_all) == 169
+    assert len(pairs_all_no_bf16) == 144
 
     return f"""// This file is generated from scripts/gen-fattn-vec-dispatch.py. Do not edit manually.
 //
 // The default uses the 15 KVarN bit-pair rules for quantized K/V types,
 // retains forward-only same-bit variants, and adds F16/F16 plus BF16/BF16
-// for homogeneous precision tails (50 pairs).
-#if defined(GGML_CUDA_FA_ALL_QUANTS)
+// for homogeneous precision tails (50 pairs). GGML_CUDA_FA_NO_BF16 drops
+// every BF16 pair (BF16 requires sm_80+ hardware).
+#if defined(GGML_CUDA_FA_ALL_QUANTS) && defined(GGML_CUDA_FA_NO_BF16)
+{emit_pairs(pairs_all_no_bf16)}
+#elif defined(GGML_CUDA_FA_ALL_QUANTS)
 {emit_pairs(pairs_all)}
+#elif defined(GGML_CUDA_FA_NO_BF16)
+{emit_pairs(pairs_default_no_bf16)}
 #else
 {emit_pairs(pairs_default)}
 #endif

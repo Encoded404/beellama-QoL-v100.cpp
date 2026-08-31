@@ -130,6 +130,9 @@ if (CUDAToolkit_FOUND)
 
     if (GGML_CUDA_FA_ALL_QUANTS)
         file(GLOB   SRCS "${FA_VEC_PREFIX}/fattn-vec-instance-*.cu")
+        if (GGML_CUDA_FA_NO_BF16)
+            list(FILTER SRCS EXCLUDE REGEX "fattn-vec-instance-bf16-.*[.]cu$|fattn-vec-instance-.*-bf16[.]cu$")
+        endif()
         list(APPEND GGML_SOURCES_CUDA ${SRCS})
         add_compile_definitions(GGML_CUDA_FA_ALL_QUANTS)
     else()
@@ -140,6 +143,10 @@ if (CUDAToolkit_FOUND)
             list(GET PARTS 1 V_TYPE)
             ggml_add_fattn_vec_pair(GGML_SOURCES_CUDA "${FA_VEC_PREFIX}" "${K_TYPE}" "${V_TYPE}")
         endforeach()
+    endif()
+
+    if (GGML_CUDA_FA_NO_BF16)
+        add_compile_definitions(GGML_CUDA_FA_NO_BF16)
     endif()
 
     ggml_add_backend_library(ggml-cuda
