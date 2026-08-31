@@ -154,7 +154,7 @@ buffer-device-address support. CPU placement is valid with KV offload disabled.
 | NVIDIA architecture | Toolkit and package | Native KVarN route | Qualification |
 |---|---|---|---|
 | Turing and newer, SM 7.5+ | CUDA 12.4 or 13.3 | Specialized MMA/split/vector routes with portable fallback | Current release tier; CUDA 13.3 requires preview qualification, while its CUDA 13.1 predecessor was locally exercised on SM 8.6 |
-| Volta, SM 7.0/7.2 | CUDA 12.4 | Native quantized-KV vector decode; portable direct body-plus-tail attention | Explicit build target; real-device validation required |
+| Volta, SM 7.0/7.2 | CUDA 12.4 | Native KVarN MMA and vector decode (m8n8k4 fragments), quantized-KV vector decode, portable direct body-plus-tail attention | Explicit build target; real-device validation required |
 | Pascal, SM 6.0/6.1/6.2 | CUDA 12.4 | Portable direct body-plus-tail attention | Priority compatibility target for issue #112; real-device validation required |
 | Maxwell, SM 5.0/5.2/5.3 | CUDA 12.4 | Portable direct body-plus-tail attention | Experimental until an SM 5.2 device passes runtime gates |
 | Kepler | Not in the CUDA 12.4/13.3 release lane | None | Unsupported |

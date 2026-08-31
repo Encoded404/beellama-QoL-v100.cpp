@@ -122,7 +122,11 @@ static __global__ void ggml_cuda_fattn_kvarn_vec_kernel(
         int n_gqa_blocks,
         int n_splits) {
     constexpr int SLICES = D / GGML_CUDA_FATTN_KVARN_DIM;
-    static_assert(D == 256, "KVarN vec production route currently supports D256 heads");
+    // D128: SLICES=1, DIM_GROUPS=4 (four 32-dim groups); D256: 2 slices, two
+    // dimension groups; D512: four slices, one group. Always 4 warps; each
+    // group covers a warp-aligned slab (DIM_PER_GROUP % 32 == 0).
+    static_assert(D == 128 || D == 256 || D == 512,
+        "KVarN vec supports 128/256/512-wide heads");
     static_assert(TOKENS_PER_SPLIT == 8 || TOKENS_PER_SPLIT == 16 || TOKENS_PER_SPLIT == 32,
         "KVarN vec supports 8-, 16-, or 32-token partitions");
     static_assert(MAX_GQA == 2, "KVarN vec shares one dequantized K/V value across a bounded D256 GQA group");

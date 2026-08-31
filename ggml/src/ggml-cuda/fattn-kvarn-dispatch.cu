@@ -62,9 +62,17 @@ ggml_cuda_fattn_kvarn_capabilities ggml_cuda_fattn_kvarn_device_capabilities(int
     constexpr ggml_cuda_fattn_kvarn_backend backend = GGML_CUDA_FATTN_KVARN_BACKEND_CUDA;
     const char * force_portable_capability =
         getenv("GGML_KVARN_TEST_FORCE_PORTABLE_CAPABILITY");
+    const bool capability_forced_portable =
+        force_portable_capability != nullptr && atoi(force_portable_capability) != 0;
+    // Volta (sm_70) reaches the same flash_attn_ext_f16 MMA pipeline through
+    // its m8n8k4 fragment family (VOLTA_MMA_AVAILABLE), so the generic-mma
+    // and decode-vector routes become available there. decode_split stays on
+    // the ldmatrix-fed split kernel, which only exists for Turing+.
     const bool matrix_mma =
-        turing_mma_available(device_info.cc) &&
-        !(force_portable_capability != nullptr && atoi(force_portable_capability) != 0);
+        (turing_mma_available(device_info.cc) || volta_mma_available(device_info.cc)) &&
+        !capability_forced_portable;
+    const bool decode_matrix_mma =
+        turing_mma_available(device_info.cc) && !capability_forced_portable;
 #endif
 #if defined(GGML_CUDA_KVARN)
     constexpr bool kvarn_instances = true;
@@ -77,6 +85,7 @@ ggml_cuda_fattn_kvarn_capabilities ggml_cuda_fattn_kvarn_device_capabilities(int
         backend,
         device_info.warp_size,
         matrix_mma,
+        decode_matrix_mma,
         kvarn_instances,
         device_info.max_threads_per_block,
         device_info.smpbo,
@@ -545,6 +554,7 @@ static inline bool ggml_cuda_fattn_kvarn_fast_decode_pair_enabled(int k_bits, in
 #endif
 
 static bool ggml_cuda_flash_attn_ext_kvarn_vec_supported(
+        const int device,
         const ggml_cuda_fattn_kvarn_plan & plan,
         const ggml_tensor * dst) {
     const char * enabled = getenv("GGML_KVARN_VEC");
@@ -559,8 +569,19 @@ static bool ggml_cuda_flash_attn_ext_kvarn_vec_supported(
     float max_bias = 0.0f;
     memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
 
+    const int cc = ggml_cuda_info().devices[device].cc;
+    // Volta has no ldmatrix-fed split-decode kernel, so the warp-shuffle vec
+    // kernel is the only fast decode route there. Its SLICES / DIM_GROUPS
+    // partitioning is D-generic (D128 uses 4 dim groups, D512 one group of
+    // four 128-wide slices, always 4 warps), so on Volta every KVARN head
+    // shape in the graph-admitted set is admitted. On Turing+ the proven
+    // D256 SWA/GQA2 geometry stays exclusive (the D512 vec regressed on
+    // deep-context global layers there, where split/MMA decode is available).
+    const bool volta_vec = volta_mma_available(cc);
     const int head_dim = (int) Q->ne[0];
-    if (head_dim != 256 || K->ne[0] != head_dim || V->ne[0] != head_dim ||
+    if ((!volta_vec && head_dim != 256) ||
+            (volta_vec && head_dim != 128 && head_dim != 256 && head_dim != 512) ||
+            K->ne[0] != head_dim || V->ne[0] != head_dim ||
             Q->ne[1] != 1 || Q->ne[3] != plan.n_stream || plan.n_stream <= 0) {
         return false;
     }
@@ -574,6 +595,13 @@ static bool ggml_cuda_flash_attn_ext_kvarn_vec_supported(
         return false;
     }
     const int gqa_ratio = (int) (Q->ne[2] / plan.n_kv_heads);
+    if (volta_vec) {
+        // Any GQA ratio: the kernel blocks GQA into groups of
+        // ggml_cuda_fattn_kvarn_vec_max_gqa (2) and only requires the
+        // fast-decode bit pair to be compiled.
+        return gqa_ratio > 0 &&
+            ggml_cuda_fattn_kvarn_fast_decode_pair_enabled(plan.k.bits, plan.v.bits);
+    }
     // D256 SWA/GQA2 is the proven vec geometry (benchmarked at k4v4); every KVarN bit pair
     // is wired through it. D512 vec regressed deep-context global layers and stays excluded.
     return plan.k.swa && plan.v.swa && gqa_ratio == 2 &&
@@ -675,10 +703,20 @@ static bool ggml_cuda_flash_attn_ext_kvarn_vec(
         ggml_backend_cuda_context & ctx,
         ggml_tensor * dst,
         const ggml_cuda_fattn_kvarn_plan & plan) {
-    if (!ggml_cuda_flash_attn_ext_kvarn_vec_supported(plan, dst)) {
+    if (!ggml_cuda_flash_attn_ext_kvarn_vec_supported(ctx.device, plan, dst)) {
         return false;
     }
-    return ggml_cuda_flash_attn_ext_kvarn_vec_d<256>(ctx, dst, plan);
+    const ggml_tensor * Q = dst->src[0];
+    switch ((int) Q->ne[0]) {
+        case 128:
+            return ggml_cuda_flash_attn_ext_kvarn_vec_d<128>(ctx, dst, plan);
+        case 256:
+            return ggml_cuda_flash_attn_ext_kvarn_vec_d<256>(ctx, dst, plan);
+        case 512:
+            return ggml_cuda_flash_attn_ext_kvarn_vec_d<512>(ctx, dst, plan);
+        default:
+            return false;
+    }
 }
 
 
@@ -893,8 +931,17 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_switch_ncols1(ggml_backend_cuda_c
         }
     }
 
+    // The Volta m8n8k4 fragment path requires at least ncols1*ncols2 == 32
+    // columns per CUDA block (flash_attn_ext_f16 NO_DEVICE_CODE guard under
+    // VOLTA_MMA_AVAILABLE). The 16-column case produces only ncols == 16 and
+    // must be skipped on Volta: smaller batches fall through to the
+    // 32-column case (which covers q <= 32/ncols2) or to the 64-column case,
+    // and shapes that cannot reach 32 columns are rejected by the caller's
+    // route fallback instead of trapping inside the kernel.
     if constexpr (ncols2 <= 16) {
-        if (Q->ne[1] <= 16/ncols2) {
+        if (volta_mma_available(cc)) {
+            // Volta: only the 32- and 64-column cases are instantiable.
+        } else if (Q->ne[1] <= 16/ncols2) {
             return ggml_cuda_flash_attn_ext_mma_kvarn_launch_case<DKQ, DV, 16/ncols2, ncols2>(ctx, dst);
         }
     }
@@ -1119,7 +1166,7 @@ bool ggml_cuda_flash_attn_ext_kvarn(
     const bool prompt_prefill =
         Q->ne[1] > GGML_CUDA_FATTN_KVARN_SPECIALIZED_DECODE_MAX_Q;
     const bool vector_eligible = capabilities.decode_vector && !prompt_prefill &&
-        ggml_cuda_flash_attn_ext_kvarn_vec_supported(plan, dst);
+        ggml_cuda_flash_attn_ext_kvarn_vec_supported(ctx.device, plan, dst);
     const bool split_eligible = capabilities.decode_split && !prompt_prefill &&
         ggml_cuda_flash_attn_ext_kvarn_decode_supported(plan, dst);
     const int gqa = plan.n_kv_heads > 0 && Q->ne[2] % plan.n_kv_heads == 0 ?

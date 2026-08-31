@@ -170,12 +170,15 @@ for bits_k in KVARN_DECODE_BITS:
         cases = "\n".join(
             f"DECL_FATTN_KVARN_DECODE_CASE({head_size}, {bits_k}, {bits_v});"
             for head_size in KVARN_DECODE_HEAD_SIZES)
-        # Every KVarN bit pair gets the D256 low-parallelism vec instance; D512 vec is
-        # intentionally excluded (it regressed deep-context global layers).
+        # Every KVarN bit pair gets the warp-shuffle vec instances for all
+        # head sizes: D256 SWA/GQA2 is the proven Turing+ geometry, and on
+        # Volta (no split-ldmatrix decoder) the same kernel serves D128/D512
+        # and non-SWA decode as well (see
+        # ggml_cuda_flash_attn_ext_kvarn_vec_supported).
         vec_include = '\n#include "../fattn-kvarn-vec.cuh"'
         vec_cases = "\n" + "\n".join(
             f"DECL_FATTN_KVARN_VEC_CASE({head_size}, {bits_k}, {bits_v});"
-            for head_size in KVARN_DECODE_HEAD_SIZES if head_size == 256)
+            for head_size in KVARN_DECODE_HEAD_SIZES)
         with open(f"fattn-mma-kvarn-decode-instance-k{bits_k}-v{bits_v}.cu", "w") as f:
             f.write(SOURCE_FATTN_MMA_KVARN_DECODE.format(
                 cases=cases, vec_include=vec_include, vec_cases=vec_cases))

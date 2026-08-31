@@ -101,6 +101,11 @@ struct ggml_cuda_fattn_kvarn_capability_input {
     ggml_cuda_fattn_kvarn_backend backend;
     int  physical_wave_size;
     bool matrix_mma;
+    // Decode-split eligibility, independent of generic_mma: the split kernel
+    // is built on NVIDIA ldmatrix plus m16n8 MMA fragments (Turing+ only).
+    // Volta's m8n8k4 fragments need a separate kernel family that has not
+    // been built, so Volta keeps generic-mma/decode-vector but no split.
+    bool decode_matrix_mma;
     bool kvarn_instances;
     int  max_threads_per_block;
     uint64_t shared_memory_per_block;
@@ -145,8 +150,11 @@ inline ggml_cuda_fattn_kvarn_capabilities ggml_cuda_fattn_kvarn_select_capabilit
     result.portable_tail_f16 = result.portable_native;
     result.portable_tail_bf16 = result.portable_native;
     if (input.backend == GGML_CUDA_FATTN_KVARN_BACKEND_CUDA) {
+        // generic_mma covers the tensor-core MMA family available on the
+        // device (Turing m16n8k16 *or* Volta m8n8k4); decode_split needs the
+        // ldmatrix-fed split kernel and is gated separately.
         result.generic_mma = input.matrix_mma && result.store_materialize;
-        result.decode_split = result.generic_mma;
+        result.decode_split = input.decode_matrix_mma && result.store_materialize;
         result.decode_vector = result.generic_mma;
     } else if (input.backend == GGML_CUDA_FATTN_KVARN_BACKEND_HIP) {
         result.generic_mma =
@@ -164,7 +172,10 @@ inline ggml_cuda_fattn_kvarn_capabilities ggml_cuda_fattn_kvarn_select_capabilit
     result.specialized_routes =
         result.generic_mma || result.decode_split || result.decode_vector;
     // On CUDA, generic MMA is valid for every graph-admitted original-V
-    // shape. HIP's family bit is only an inventory claim: RDNA/CDNA template
+    // shape, including Volta: the original-domain tile loader
+    // (flash_attn_ext_kvarn_load_tile) reconstructs records with the inverse
+    // WHT in fp32 warp scratch and is independent of the mma fragment family.
+    // HIP's family bit is only an inventory claim: RDNA/CDNA template
     // support is operation-specific, so HIP stays on the unbounded rotated
     // portable domain until the bounded original-V window matrix is proven on
     // both physical wave sizes.

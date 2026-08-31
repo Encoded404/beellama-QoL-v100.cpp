@@ -13,10 +13,12 @@ static inline int ggml_cuda_fattn_kvarn_vec_tokens_per_split() {
     return 16;
 }
 
-// Bounded GQA sharing for the proven D256 SWA low-parallelism decode path.
+// Bounded GQA sharing for the decode path: two Q heads share every
+// dequantized K/V value. On Turing+ this stays on the proven D256 SWA
+// geometry; on Volta (no split-ldmatrix decoder) the same kernel serves all
+// KVARN head sizes with the same two-head block.
 template<int D>
 constexpr int ggml_cuda_fattn_kvarn_vec_max_gqa() {
-    static_assert(D == 256, "KVarN vec production route is currently proven only for D256");
     return 2;
 }
 
