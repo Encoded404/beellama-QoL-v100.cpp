@@ -6,6 +6,20 @@ BeeLlama.cpp (or just Bee) is a performance-focused llama.cpp fork for squeezing
 
 > Not quite a pegasus, but close enough.
 
+## About this fork
+
+This is Encoded404's quality-of-life branch of [Anbeeld's BeeLlama.cpp](https://github.com/Anbeeld/beellama.cpp), itself a performance-focused fork of llama.cpp. This repo targets Volta (sm_70) class GPUs and a V100 workflow, so it carries a focused set of changes on top of Bee that are committed one feature at a time and rebased as upstream and Bee advance.
+
+What this fork adds beyond upstream Bee:
+
+- **Volta native quantized-KV decode**: the CUDA FlashAttention vector kernel reads quantized KV caches in place on Volta instead of materializing the KV slice to fp16 every decode step, plus a GQA-shared two-head block and a dedicated Volta MMVQ parameter table to keep HBM2 streams in flight.
+- **Native KVarN attention on Volta**: the generic-MMA route is available through Volta's m8n8k4 fragment family (the ldmatrix split decoder remains Turing+), and the warp-shuffle vector decode path serves D128/D256/D512 heads.
+- **KVarN borrow for speculative contexts**: a Gemma-4 assistant (draft/MTP) context can share the target's KVarN store instead of allocating its own cache, with record-domain reads clamped to the target's verified frontier.
+- **`GGML_CUDA_FA_NO_BF16`**: a build option that drops every BF16 FlashAttention pair for pre-sm80 hardware, cutting compile time and binary size (BF16 KV tails then fall back to F16).
+- **MARS relaxed verification**: `--spec-verify-mars` accepts a draft token that is not the target's sampled pick when it ranks within the raw top-k and its logit ratio vs the top-1 clears a theta threshold.
+
+For the full Bee feature and public-repo comparison, read [docs/beellama-features.md](docs/beellama-features.md). For the complete argument reference, read [docs/beellama-args.md](docs/beellama-args.md).
+
 [![Support my work!](https://anbeeld.com/images/support.jpg)](https://anbeeld.com/support)
 
 ## Fork Features
