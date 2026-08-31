@@ -257,18 +257,33 @@ build tier.
 ### What it is
 
 The KV cache precision tail (KVCPT), set with `--kv-tail-tokens`, makes the newest
-attention-visible entries exact in F16 or BF16 for standard quantized and KVarN
+attention-visible entries exact or near-exact in F16, BF16, or Q8_0 for standard
+quantized caches, and exact in F16/BF16 for KVarN
 target caches. A partial request overlays
 a compact `N + R` exact-history ring while retaining the complete selected
 quantized cache; current-ubatch K/V is a separate graph-local exact source.
 A standard quantized tail defaults to BF16, while a KVarN tail defaults to F16;
-`--kv-tail-type` can explicitly select either representation for either family.
+`--kv-tail-type` can explicitly select F16, BF16, or Q8_0 for a standard cache and
+F16/BF16 for a KVarN cache.
 A request covering an SWA group's full visibility window uses a bodyless
 compact-native `W + R` F16/BF16 ring when the segmented route is supported.
 Non-SWA full-context groups keep their established representation. Source selection is
 per query, so a 512-token prefill does not make the same 512 rows exact for
 every query. Body and tail logits share one FP32 softmax; the runtime does not
 normalize two attention results independently.
+
+A standard cache can also store its exact-history ring in `q8_0`
+(`--kv-tail-type q8_0`), halving the memory of an F16/BF16 tail at a small KLD
+cost versus the exact representation. The stored tail stays quantized; only the
+per-attention pack workspace reconstructs rows. The quantized tail always goes
+through the packed FlashAttention vector path on CUDA (the F16/BF16-only
+indexed-small kernel is skipped), and short quantized tails are padded to the
+256-row kernel stride with the extra rows masked out. This makes `q8_0` a
+practical middle ground between a full F16/BF16 tail and no tail at all for
+VRAM-constrained Gemma 4 deployments on Volta, where the stored rows save memory
+and decode still reads them natively. On backends without a complete quantized-tail
+route (Metal, SYCL, Vulkan), the explicit `q8_0` request fails closed instead of
+silently downgrading.
 
 Route selection also records whether each model layer supplies an explicit
 self-attention bias. That capability is derived from loaded layer tensors, not
@@ -398,7 +413,11 @@ standard tail and KVarN's intrinsic minimum suffix.
 Gemma 4 needs a separate policy. Its 1024-token sliding window makes a 1024 tail
 exact across most layers, causing a sharp memory and throughput transition.
 Standard q8 without a tail is the safer general default when throughput and
-older-context coverage matter. See [KV Cache Precision Tail: Implementation and Benchmarks](https://anbeeld.com/articles/kv-cache-precision-tail-implementation-and-benchmarks) and the [combined benchmark review](https://anbeeld.com/articles/kv-cache-quantization-benchmarks-kvarn-precision-tail) for the quality, memory, and throughput tradeoffs.
+older-context coverage matter. When VRAM is the constraint and a small recency
+edge is still useful, a short `q8_0` tail (128-256 tokens) lands between no tail
+and a full F16/BF16 tail: it keeps the recent rows quantized at roughly half the
+exact-tail memory and stays on the native decode path, while prefill follows the
+same F16-materialization path any quantized body already uses. See [KV Cache Precision Tail: Implementation and Benchmarks](https://anbeeld.com/articles/kv-cache-precision-tail-implementation-and-benchmarks) and the [combined benchmark review](https://anbeeld.com/articles/kv-cache-quantization-benchmarks-kvarn-precision-tail) for the quality, memory, and throughput tradeoffs.
 
 `auto` requests 1024 exact tokens for every applicable canonical target-cache
 group and caps each request by that group's effective context or attention

@@ -222,8 +222,9 @@ llama_kv_tail_type_resolution llama_kv_tail_resolve_type(
         ggml_type family_default,
         const llama_kv_tail_route_capability & bf16,
         const llama_kv_tail_route_capability & f16) {
-    if (requested != GGML_TYPE_COUNT && requested != GGML_TYPE_BF16 && requested != GGML_TYPE_F16) {
-        throw std::invalid_argument("KV tail type resolution requires F16, BF16, or COUNT");
+    if (requested != GGML_TYPE_COUNT && requested != GGML_TYPE_BF16 &&
+            requested != GGML_TYPE_F16 && requested != GGML_TYPE_Q8_0) {
+        throw std::invalid_argument("KV tail type resolution requires F16, BF16, Q8_0, or COUNT");
     }
     if (family_default != GGML_TYPE_BF16 && family_default != GGML_TYPE_F16) {
         throw std::invalid_argument("KV tail family default must be F16 or BF16");
@@ -231,6 +232,12 @@ llama_kv_tail_type_resolution llama_kv_tail_resolve_type(
 
     const bool automatic = requested == GGML_TYPE_COUNT;
     const ggml_type preferred = automatic ? family_default : requested;
+    if (preferred == GGML_TYPE_Q8_0) {
+        // Q8_0 tails have no auto-resolution fallback. Route capability is
+        // determined by the probe; fail closed here if this helper is ever
+        // reached with an explicit Q8_0 request.
+        return { false, GGML_TYPE_COUNT, false, LLAMA_KV_TAIL_OP_NONE, LLAMA_KV_TAIL_OP_NONE };
+    }
     const auto & preferred_capability = preferred == GGML_TYPE_BF16 ? bf16 : f16;
     if (preferred_capability.supported) {
         return { true, preferred, false, LLAMA_KV_TAIL_OP_NONE, LLAMA_KV_TAIL_OP_NONE };
@@ -324,8 +331,9 @@ llama_kv_tail_storage_plan llama_kv_tail_storage_plan_for(
         result.effective_tokens = 0;
         return result;
     }
-    if (request.exact_type != GGML_TYPE_F16 && request.exact_type != GGML_TYPE_BF16) {
-        throw std::invalid_argument("standard KV tail type must be F16 or BF16");
+    if (request.exact_type != GGML_TYPE_F16 && request.exact_type != GGML_TYPE_BF16 &&
+            request.exact_type != GGML_TYPE_Q8_0) {
+        throw std::invalid_argument("standard KV tail type must be F16, BF16, or Q8_0");
     }
 
     result.layout = llama_kv_tail_layout_for(

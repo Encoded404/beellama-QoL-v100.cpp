@@ -63,6 +63,37 @@ static __global__ void k_flash_attn_ext_tail_pack_arenas_vec(
     }
 }
 
+// Row-oriented pack for quantized tail types (e.g. Q8_0). Quantized rows are
+// not d*type_size contiguous: each row is a sequence of quantization blocks,
+// so the arena must be filled with full rows using ggml_row_size. The packed
+// arena keeps the same quantized type; the vec kernel consumes it natively.
+static __global__ void k_flash_attn_ext_tail_pack_quant_rows(
+        const char * src, const char * current, char * dst, const int32_t * run_desc,
+        int row_bytes, int tail_stride, int n_head, int n_active,
+        int desc_stride, int history_slots,
+        size_t nb1, size_t nb2, size_t current_nb1, size_t current_nb2) {
+    const size_t n = size_t(row_bytes)*tail_stride*n_head*n_active;
+    for (size_t i = size_t(blockIdx.x)*blockDim.x + threadIdx.x;
+            i < n; i += size_t(blockDim.x)*gridDim.x) {
+        size_t rem = i;
+        const int ib = int(rem % row_bytes); rem /= row_bytes;
+        const int it = int(rem % tail_stride); rem /= tail_stride;
+        const int ih = int(rem % n_head); rem /= n_head;
+        const int ia = int(rem);
+        const int32_t * desc = run_desc + desc_stride*ia;
+        char value = 0;
+        if (it < desc[4]) {
+            const int slot = desc[6 + it];
+            const bool from_current = current && slot >= history_slots;
+            const int row = from_current ? slot - history_slots : slot;
+            const char * base = from_current ? current : src;
+            value = base[size_t(row)*(from_current ? current_nb1 : nb1) +
+                    size_t(ih)*(from_current ? current_nb2 : nb2) + ib];
+        }
+        dst[i] = value;
+    }
+}
+
 static __global__ void k_flash_attn_ext_tail_pack_body_rows(
         const char * src, uint8_t * dst, const int32_t * run_desc,
         int row_bytes, int n_kv, int body_stride, int n_head, int n_active,
@@ -508,8 +539,17 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
     GGML_ASSERT(history_slots > 0 && history_slots <= kt->ne[1] && vt->ne[1] == kt->ne[1]);
     const bool tail_bodyless = ggml_get_op_params_i32(
             dst, GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_BODYLESS) != 0;
-    const bool indexed_small = tail_stride <= 256;
-    const int compute_stride = tail_bodyless ?
+    const bool tail_quantized_k = ggml_is_quantized(kt->type);
+    const bool tail_quantized_v = ggml_is_quantized(vt->type);
+    const bool tail_quantized = tail_quantized_k || tail_quantized_v;
+    const bool indexed_small = !tail_quantized && tail_stride <= 256;
+    // Quantized tails cannot use the indexed-small kernel, so they always go
+    // through the packed vec path. That path requires a K/V extent that is a
+    // multiple of FATTN_KQ_STRIDE (256); pad short quantized tails (e.g. 128)
+    // to satisfy the VEC kernel eligibility. The mask pack already writes
+    // -INF for the padded positions, and the quant pack zero-fills the padded
+    // rows, so the extra extent is safely masked away.
+    const int compute_stride = (tail_bodyless || tail_quantized) ?
             int(GGML_PAD(tail_stride, FATTN_KQ_STRIDE)) :
             int(ggml_cuda_tail_compute_stride(tail_stride));
     const size_t n_tail_rows = size_t(q_max)*n_head*n_active;
@@ -536,10 +576,18 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
             kb_row_bytes*body_stride*kb->ne[2]*n_active : 1;
     const size_t vb_packed_bytes = body_packed && !tail_bodyless ?
             vb_row_bytes*body_stride*vb->ne[2]*n_active : 1;
+    const size_t kt_row_bytes = ggml_row_size(kt->type, d_k);
+    const size_t vt_row_bytes = ggml_row_size(vt->type, d_v);
+    const size_t kt_packed_bytes = tail_quantized_k ?
+            kt_row_bytes*compute_stride*n_head_k*n_active :
+            kt_elements*ggml_type_size(kt->type);
+    const size_t vt_packed_bytes = tail_quantized_v ?
+            vt_row_bytes*compute_stride*n_head_v*n_active :
+            vt_elements*ggml_type_size(vt->type);
     ggml_cuda_pool_alloc<uint8_t> kt_alloc(pool,
-            indexed_small ? 1 : kt_elements*ggml_type_size(kt->type));
+            indexed_small ? 1 : kt_packed_bytes);
     ggml_cuda_pool_alloc<uint8_t> vt_alloc(pool,
-            indexed_small ? 1 : vt_elements*ggml_type_size(vt->type));
+            indexed_small ? 1 : vt_packed_bytes);
     ggml_cuda_pool_alloc<float> q_alloc(pool,
             indexed_small && !body_packed ? 1 : q_elements);
     ggml_cuda_pool_alloc<half> mask_alloc(pool,
@@ -555,14 +603,14 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
 
     const int threads = 256;
     auto blocks_for = [threads](size_t n) { return int(std::min<size_t>((n + threads - 1)/threads, 65535)); };
-    const bool kt_vec = !indexed_small && kt->nb[0] == ggml_type_size(kt->type) &&
+    const bool kt_vec = !tail_quantized_k && !indexed_small && kt->nb[0] == ggml_type_size(kt->type) &&
             size_t(d_k)*kt->nb[0] % sizeof(uint4) == 0 &&
             kt->nb[1] % alignof(uint4) == 0 && kt->nb[2] % alignof(uint4) == 0 &&
             uintptr_t(kt->data) % alignof(uint4) == 0 && uintptr_t(kt_alloc.get()) % alignof(uint4) == 0 &&
             (!kt_current || (kt_current->nb[0] == kt->nb[0] &&
                 kt_current->nb[1] % alignof(uint4) == 0 && kt_current->nb[2] % alignof(uint4) == 0 &&
                 uintptr_t(kt_current->data) % alignof(uint4) == 0));
-    const bool vt_vec = !indexed_small && vt->nb[0] == ggml_type_size(vt->type) &&
+    const bool vt_vec = !tail_quantized_v && !indexed_small && vt->nb[0] == ggml_type_size(vt->type) &&
             size_t(d_v)*vt->nb[0] % sizeof(uint4) == 0 &&
             vt->nb[1] % alignof(uint4) == 0 && vt->nb[2] % alignof(uint4) == 0 &&
             uintptr_t(vt->data) % alignof(uint4) == 0 && uintptr_t(vt_alloc.get()) % alignof(uint4) == 0 &&
@@ -575,6 +623,13 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
             (const char *) kt->data, kt_current ? (const char *) kt_current->data : nullptr,
             (uint4 *) kt_alloc.get(), (const int32_t *) rd->data,
             int(size_t(d_k)*kt->nb[0]/sizeof(uint4)), compute_stride, n_head_k, n_active,
+            desc_stride, history_slots, kt->nb[1], kt->nb[2],
+            kt_current ? kt_current->nb[1] : 0, kt_current ? kt_current->nb[2] : 0);
+    } else if (tail_quantized_k) {
+        k_flash_attn_ext_tail_pack_quant_rows<<<blocks_for(kt_row_bytes*compute_stride*n_head_k*n_active), threads, 0, ctx.stream()>>>(
+            (const char *) kt->data, kt_current ? (const char *) kt_current->data : nullptr,
+            (char *) kt_alloc.get(), (const int32_t *) rd->data,
+            int(kt_row_bytes), compute_stride, n_head_k, n_active,
             desc_stride, history_slots, kt->nb[1], kt->nb[2],
             kt_current ? kt_current->nb[1] : 0, kt_current ? kt_current->nb[2] : 0);
     } else if (!indexed_small && ggml_type_size(kt->type) == sizeof(uint16_t)) {
@@ -602,6 +657,13 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
             (const char *) vt->data, vt_current ? (const char *) vt_current->data : nullptr,
             (uint4 *) vt_alloc.get(), (const int32_t *) rd->data,
             int(size_t(d_v)*vt->nb[0]/sizeof(uint4)), compute_stride, n_head_v, n_active,
+            desc_stride, history_slots, vt->nb[1], vt->nb[2],
+            vt_current ? vt_current->nb[1] : 0, vt_current ? vt_current->nb[2] : 0);
+    } else if (tail_quantized_v) {
+        k_flash_attn_ext_tail_pack_quant_rows<<<blocks_for(vt_row_bytes*compute_stride*n_head_v*n_active), threads, 0, ctx.stream()>>>(
+            (const char *) vt->data, vt_current ? (const char *) vt_current->data : nullptr,
+            (char *) vt_alloc.get(), (const int32_t *) rd->data,
+            int(vt_row_bytes), compute_stride, n_head_v, n_active,
             desc_stride, history_slots, vt->nb[1], vt->nb[2],
             vt_current ? vt_current->nb[1] : 0, vt_current ? vt_current->nb[2] : 0);
     } else if (!indexed_small && ggml_type_size(vt->type) == sizeof(uint16_t)) {
@@ -651,10 +713,18 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
     ggml_cuda_tail_make_contiguous(q_packed, d_k, q_max, n_head, n_active, sizeof(float));
     ggml_tensor k_packed = *kt;
     k_packed.data = kt_alloc.get();
-    ggml_cuda_tail_make_contiguous(k_packed, d_k, compute_stride, n_head_k, n_active, ggml_type_size(kt->type));
+    if (tail_quantized_k) {
+        ggml_cuda_tail_make_contiguous_type(k_packed, d_k, compute_stride, n_head_k, n_active);
+    } else {
+        ggml_cuda_tail_make_contiguous(k_packed, d_k, compute_stride, n_head_k, n_active, ggml_type_size(kt->type));
+    }
     ggml_tensor v_packed = *vt;
     v_packed.data = vt_alloc.get();
-    ggml_cuda_tail_make_contiguous(v_packed, d_v, compute_stride, n_head_v, n_active, ggml_type_size(vt->type));
+    if (tail_quantized_v) {
+        ggml_cuda_tail_make_contiguous_type(v_packed, d_v, compute_stride, n_head_v, n_active);
+    } else {
+        ggml_cuda_tail_make_contiguous(v_packed, d_v, compute_stride, n_head_v, n_active, ggml_type_size(vt->type));
+    }
     ggml_tensor mask_packed = *mt;
     mask_packed.data = mask_alloc.get();
     ggml_cuda_tail_make_contiguous(mask_packed, compute_stride, q_max, 1, n_active, sizeof(half));

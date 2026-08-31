@@ -37,12 +37,16 @@ contexts remain on standard cache types and do not inherit the target tail.
 | Argument | Env var | Default | Behavior |
 |---|---|---|---|
 | `--kv-tail-tokens SPEC` | `LLAMA_ARG_KV_TAIL_TOKENS` | `0` | For standard caches, `0` keeps the ordinary cache path. For KVarN, omitted or `0` retains the intrinsic 128-token exact suffix. A number applies to every canonical group; KVarN rounds positive values upward to complete 128-token groups. `N0,N1` follows canonical group order, while `full=N,swa=N` accepts unique role aliases or structural IDs such as `full@l0`. Invalid, duplicate, incomplete, ambiguous, or wrong-length specifications fail context creation. `auto` requests 1024 exact tokens per applicable target-cache group, capped by that group's effective context or attention window. |
-| `--kv-tail-type TYPE` | `LLAMA_ARG_KV_TAIL_TYPE` | `bf16` for standard caches; `f16` for KVarN | Selects `f16` or `bf16` exact storage for compact history and compact-native SWA. An explicit value overrides the cache-family default in either direction. Other types are rejected. |
+| `--kv-tail-type TYPE` | `LLAMA_ARG_KV_TAIL_TYPE` | `bf16` for standard caches; `f16` for KVarN | Selects `f16`, `bf16`, or `q8_0` storage for the compact history and compact-native SWA of a standard cache, or `f16`/`bf16` for a KVarN cache. An explicit value overrides the cache-family default in either direction. The `q8_0` tail keeps the recent-token rows quantized at half the memory of `f16`/`bf16`; it is available for standard caches only and has no automatic fallback, so an unsupported route fails closed rather than changing representation. Other types are rejected. |
 
 An omitted tail type remains automatic until context placement. If the standard
 BF16 default lacks a complete Metal or SYCL route but F16 is complete, automatic
 selection warns and resolves once to F16. Explicit `--kv-tail-type bf16` fails
-instead of changing the requested representation.
+instead of changing the requested representation. An explicit `--kv-tail-type
+q8_0` is never downgraded: it either finds a complete route (CUDA and CPU, via
+the quantized FlashAttention vector pair and the row-convertible CPU reference)
+or fails context creation so the requested representation is not silently
+replaced.
 
 Explicit values are capped by the group's effective attention window and context
 capacity. KVarN values are also rounded upward to 128-token groups. Startup logs

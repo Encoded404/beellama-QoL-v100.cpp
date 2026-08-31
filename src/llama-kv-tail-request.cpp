@@ -45,8 +45,9 @@ llama_kv_tail_request llama_kv_tail_request_parse(
         ggml_type exact_type) {
     llama_kv_tail_request result;
     result.exact_type = exact_type;
-    if (exact_type != GGML_TYPE_COUNT && exact_type != GGML_TYPE_F16 && exact_type != GGML_TYPE_BF16) {
-        result.error = "KV tail type must be F16, BF16, or the cache-family default";
+    if (exact_type != GGML_TYPE_COUNT && exact_type != GGML_TYPE_F16 &&
+            exact_type != GGML_TYPE_BF16 && exact_type != GGML_TYPE_Q8_0) {
+        result.error = "KV tail type must be F16, BF16, Q8_0, or the cache-family default";
         return result;
     }
     if (specification.empty()) {

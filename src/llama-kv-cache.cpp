@@ -406,8 +406,9 @@ llama_kv_cache::llama_kv_cache(
     const bool is_mla = hparams.is_mla();
 
     if (tail_tokens > 0 && tail_type != GGML_TYPE_COUNT &&
-            tail_type != GGML_TYPE_F16 && tail_type != GGML_TYPE_BF16) {
-        throw std::invalid_argument("standard KV tail type must be F16 or BF16");
+            tail_type != GGML_TYPE_F16 && tail_type != GGML_TYPE_BF16 &&
+            tail_type != GGML_TYPE_Q8_0) {
+        throw std::invalid_argument("standard KV tail type must be F16, BF16, or Q8_0");
     }
     const bool tail_type_auto = tail_type == GGML_TYPE_COUNT;
     if (tail_type_auto) {

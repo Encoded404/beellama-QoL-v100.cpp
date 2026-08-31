@@ -25,7 +25,7 @@ For the full Bee feature and public-repo comparison, read [docs/beellama-feature
 ## Fork Features
 
 - **Variance-normalized KV-cache quantization (KVarN)**: provides higher precision at similar memory costs. Independent K and V bit widths at `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, and `kvarn8`, set with `--cache-type-k` and `--cache-type-v`.
-- **KV cache precision tail**: keep most of the KV cache quantized while storing recent tokens in F16/BF16, enabled with `--kv-tail-tokens`. A single global softmax merges the quantized body and the precision tail under FlashAttention, without materializing the whole cache.
+- **KV cache precision tail**: keep most of the KV cache quantized while storing recent tokens in F16/BF16, or in `q8_0` at half that memory, enabled with `--kv-tail-tokens` and `--kv-tail-type`. A single global softmax merges the quantized body and the precision tail under FlashAttention, without materializing the whole cache.
 - **Standard low-bit KV cache types**: `q2_0`, `q2_1`, `q3_0`, `q3_1`, `q6_0`, and `q6_1`, usable for either target or draft caches alongside the upstream `q4`/`q5`/`q8` types.
 - **Adaptive draft-max for DFlash**: adjusts the active DFlash draft horizon at runtime instead of using a fixed `--spec-draft-n-max`, comparing speculative throughput against a no-spec baseline.
 - **Reasoning-loop protection**: the server detects repeated hidden reasoning output and intervenes.
@@ -61,7 +61,7 @@ The measurements come from Qwen 3.6 27B Q5_K_S at 64K context on Wikitext-2 raw 
 
 A 1024-token tail is a useful starting point for low-bit Qwen caches. Prefer more body precision when old and recent tokens matter equally; consider 2048 only when the newest two thousand tokens are genuinely the privileged working set. Standard caches generally have slightly faster prefill.
 
-Gemma 4 needs a separate decision. Its 1024-token sliding window makes a 1024 tail exact across most layers, sharply changing memory and throughput. Standard `q8_0 / q8_0` without a tail is the safer Gemma default when throughput and older-context coverage matter, and the benchmark results recommend avoiding quantized KV cache when Gemma quality is non-negotiable.
+Gemma 4 needs a separate decision. Its 1024-token sliding window makes a 1024 tail exact across most layers, sharply changing memory and throughput. Standard `q8_0 / q8_0` without a tail is the safer Gemma default when throughput and older-context coverage matter, and the benchmark results recommend avoiding quantized KV cache when Gemma quality is non-negotiable. When VRAM is tight, a short `q8_0` tail (`--kv-tail-type q8_0`, 128-256 tokens) is a useful middle ground: it stores the recent rows at half the F16/BF16 tail memory, stays on the native Volta decode path, and only pays the same F16 materialization prefill already applies to a quantized body.
 
 ### Standard-Only KV Cache Ladder
 

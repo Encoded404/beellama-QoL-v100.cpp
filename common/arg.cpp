@@ -469,8 +469,10 @@ static void parse_kv_tail_type(common_params & params, const std::string & value
         params.kv_tail_type = GGML_TYPE_F16;
     } else if (value == "bf16") {
         params.kv_tail_type = GGML_TYPE_BF16;
+    } else if (value == "q8_0") {
+        params.kv_tail_type = GGML_TYPE_Q8_0;
     } else {
-        throw std::invalid_argument("--kv-tail-type must be f16 or bf16");
+        throw std::invalid_argument("--kv-tail-type must be f16, bf16, or q8_0");
     }
 }
 
@@ -2696,7 +2698,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_KV_TAIL_TOKENS"));
     add_opt(common_arg(
         {"--kv-tail-type"}, "TYPE",
-        "exact KV-cache tail type: f16 or bf16\n"
+        "exact KV-cache tail type: f16, bf16, or q8_0 (standard caches); f16 or bf16 (KVarN)\n"
         "(default: bf16 for standard caches, f16 for KVarN)",
         [](common_params & params, const std::string & value) {
             parse_kv_tail_type(params, value);
