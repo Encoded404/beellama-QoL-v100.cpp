@@ -5638,8 +5638,14 @@ void ggml_flash_attn_ext_add_kv_tail(
     GGML_ASSERT(a != NULL && a->op == GGML_OP_FLASH_ATTN_EXT);
     GGML_ASSERT(k_tail != NULL && v_tail != NULL && mask_tail != NULL && query_order != NULL && run_desc != NULL);
     GGML_ASSERT(a->src[5] == NULL && a->src[6] == NULL && a->src[7] == NULL && a->src[8] == NULL && a->src[9] == NULL);
-    GGML_ASSERT((k_tail->type == GGML_TYPE_F32 || k_tail->type == GGML_TYPE_F16 || k_tail->type == GGML_TYPE_BF16) &&
-                (v_tail->type == GGML_TYPE_F32 || v_tail->type == GGML_TYPE_F16 || v_tail->type == GGML_TYPE_BF16));
+    // The tail K/V rows may be exact F32/F16/BF16 or a quantized format such
+    // as Q8_0. Both the CPU reference kernel (ggml_compute_forward_flash_attn_ext_tail_ref)
+    // and the CUDA packed-vector tail kernel dequantize quantized tail rows,
+    // so only reject types without a to_float converter.
+    GGML_ASSERT((k_tail->type == GGML_TYPE_F32 || k_tail->type == GGML_TYPE_F16 ||
+                 k_tail->type == GGML_TYPE_BF16 || ggml_get_type_traits(k_tail->type)->to_float != NULL) &&
+                (v_tail->type == GGML_TYPE_F32 || v_tail->type == GGML_TYPE_F16 ||
+                 v_tail->type == GGML_TYPE_BF16 || ggml_get_type_traits(v_tail->type)->to_float != NULL));
     GGML_ASSERT(mask_tail->type == GGML_TYPE_F16);
     GGML_ASSERT(query_order->type == GGML_TYPE_I32 && query_order->ne[1] == run_desc->ne[1]);
     GGML_ASSERT(run_desc->type == GGML_TYPE_I32 &&
