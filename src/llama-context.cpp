@@ -281,6 +281,12 @@ llama_context::llama_context(
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
         throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
     }
+    // n_seq_active (--max-concurrent-streams) caps the decode-workspace and
+    // output-buffer reservation; it defaults to n_seq_max and is clamped to
+    // [1, n_seq_max] so sched_reserve()/resolve_fused_ops() never see 0.
+    cparams.n_seq_active = params.n_seq_active > 0
+            ? std::min<uint32_t>(params.n_seq_active, cparams.n_seq_max)
+            : cparams.n_seq_max;
 
     cparams.kv_tail_rollback_tokens = params.n_rs_seq;
     cparams.n_rs_seq = params.n_rs_seq;
