@@ -103,7 +103,10 @@ static llama_kv_tail_route_capability probe_standard_kv_tail_route(
         throw std::runtime_error("failed to create standard KV tail capability context");
     }
     constexpr int64_t n_body = 256;
-    constexpr int64_t n_tail = 16;
+    // Must be a multiple of every quantized block size (32) so that a
+    // quantized exact-V tensor shaped [n_tail, head_dim_v] is never flagged
+    // transposed (nb[0] > nb[1] when ne[0] < block size).
+    constexpr int64_t n_tail = 32;
     auto * idx64 = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I64, 1);
     auto * tail_idx64 = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I64, 1);
     auto * idx32 = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 1);
