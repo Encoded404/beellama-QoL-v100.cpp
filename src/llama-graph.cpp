@@ -3627,7 +3627,10 @@ ggml_tensor * llm_graph_context::build_attn(
             value = ggml_reshape_2d(ctx0, value, n_embd_head*n_heads, value->ne[2]);
             ggml_tensor * read_idxs = ggml_reshape_1d(ctx0, tail_read_idxs,
                     tail_read_idxs->ne[0]*ubatch.n_tokens);
-            value = ggml_get_rows_as(ctx0, value, read_idxs, value->type);
+            // ggml_get_rows_as cannot emit a quantized output type; a
+            // quantized tail row is dequantized to F32 on gather.
+            const ggml_type gather_type = ggml_is_quantized(value->type) ? GGML_TYPE_F32 : value->type;
+            value = ggml_get_rows_as(ctx0, value, read_idxs, gather_type);
             return ggml_reshape_4d(ctx0, value, n_embd_head, n_heads,
                     tail_read_idxs->ne[0], ubatch.n_tokens);
         };
@@ -4063,7 +4066,10 @@ ggml_tensor * llm_graph_context::build_attn(
             value = ggml_reshape_2d(ctx0, value, n_embd_head*n_heads, value->ne[2]);
             ggml_tensor * read_idxs = ggml_reshape_1d(ctx0, tail_read_idxs,
                     tail_read_idxs->ne[0]*ubatch.n_tokens);
-            value = ggml_get_rows_as(ctx0, value, read_idxs, value->type);
+            // ggml_get_rows_as cannot emit a quantized output type; a
+            // quantized tail row is dequantized to F32 on gather.
+            const ggml_type gather_type = ggml_is_quantized(value->type) ? GGML_TYPE_F32 : value->type;
+            value = ggml_get_rows_as(ctx0, value, read_idxs, gather_type);
             return ggml_reshape_4d(ctx0, value, n_embd_head, n_heads,
                     tail_read_idxs->ne[0], ubatch.n_tokens);
         };

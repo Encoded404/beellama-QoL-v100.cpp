@@ -164,8 +164,15 @@ static llama_kv_tail_route_capability probe_standard_kv_tail_route(
                 compact_supports(ggml_set_rows(ctx.get(), tail_v, src_v, tail_idx64));
     }
 
-    requirements.gather_k = compact_supports(ggml_get_rows_as(ctx.get(), tail_k, idx32, exact_k));
-    requirements.gather_v = compact_supports(ggml_get_rows_as(ctx.get(), tail_v, idx32, exact_v));
+    // ggml_get_rows_as cannot emit a quantized output type: the generic
+    // get_rows kernel dequantizes quantized sources to F32/F16/BF16 (see
+    // ggml_compute_forward_get_rows_q). A quantized tail row is therefore
+    // gathered (dequantized) to F32, which is also the type the generic-route
+    // scorer consumes. F16/BF16 tails keep gathering in their exact type.
+    const ggml_type gather_k_type = ggml_is_quantized(exact_k) ? GGML_TYPE_F32 : exact_k;
+    const ggml_type gather_v_type = ggml_is_quantized(exact_v) ? GGML_TYPE_F32 : exact_v;
+    requirements.gather_k = compact_supports(ggml_get_rows_as(ctx.get(), tail_k, idx32, gather_k_type));
+    requirements.gather_v = compact_supports(ggml_get_rows_as(ctx.get(), tail_v, idx32, gather_v_type));
 
     auto * q = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, spec.head_dim_k, 1);
     auto * body_scores = ggml_mul_mat(ctx.get(), body_k, q);
