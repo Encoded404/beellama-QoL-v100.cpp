@@ -3476,6 +3476,139 @@ static void ggml_compute_forward_swiglu_oai(
     }
 }
 
+// ggml_compute_forward_swiglu_clamp
+
+static void ggml_compute_forward_swiglu_clamp_f32(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0   = dst->src[0];
+    const ggml_tensor * src1   = dst->src[1];
+    char *              src0_d = (char *) src0->data;
+    char *              src1_d = (char *) (src1 ? src1->data : src0->data);
+    const size_t        src0_o = src0->nb[1];
+    const size_t        src1_o = src1 ? src1->nb[1] : src0->nb[1];
+
+    GGML_ASSERT(ggml_is_contiguous_1(src0));
+    GGML_ASSERT(ggml_is_contiguous_1(dst));
+
+    if (src1) {
+        GGML_ASSERT(ggml_is_contiguous_1(src1));
+        GGML_ASSERT(src0->type == src1->type);
+    }
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nc = src1 ? src0->ne[0] : src0->ne[0] / 2;
+    const int nr = ggml_nrows(src0);
+
+    GGML_ASSERT(dst->ne[0] == nc);
+    GGML_ASSERT(ggml_nrows(dst) == nr);
+
+    const int32_t swapped = ggml_get_op_params_i32(dst, 1);
+    const float   limit   = ggml_get_op_params_f32(dst, 3);
+
+    const int dr  = (nr + nth - 1) / nth;
+    const int ir0 = dr * ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    for (int i1 = ir0; i1 < ir1; i1++) {
+        float * src0_p = (float *) (src0_d + i1 * src0_o);
+        float * src1_p = (float *) (src1_d + i1 * src1_o);
+        float * dst_p  = (float *) ((char *) dst->data + i1 * (dst->nb[1]));
+
+        if (!src1) {
+            src0_p += swapped ? nc : 0;
+            src1_p += swapped ? 0 : nc;
+        }
+
+        for (int k = 0; k < nc; k++) {
+            const float gate = std::min(src0_p[k], limit);
+            const float up   = std::clamp(src1_p[k], -limit, limit);
+            dst_p[k]         = gate / (1.f + expf(-gate)) * up;
+        }
+
+#ifndef NDEBUG
+        for (int k = 0; k < nc; k++) {
+            const float x = dst_p[k];
+            GGML_UNUSED(x);
+            assert(!isnan(x));
+            assert(!isinf(x));
+        }
+#endif  // NDEBUG
+    }
+}
+
+static void ggml_compute_forward_swiglu_clamp_f16(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0   = dst->src[0];
+    const ggml_tensor * src1   = dst->src[1];
+    char *              src0_d = (char *) src0->data;
+    char *              src1_d = (char *) (src1 ? src1->data : src0->data);
+    const size_t        src0_o = src0->nb[1];
+    const size_t        src1_o = src1 ? src1->nb[1] : src0->nb[1];
+
+    GGML_ASSERT(ggml_is_contiguous_1(src0));
+    GGML_ASSERT(ggml_is_contiguous_1(dst));
+
+    if (src1) {
+        GGML_ASSERT(ggml_is_contiguous_1(src1));
+        GGML_ASSERT(src0->type == src1->type);
+    }
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nc = src1 ? src0->ne[0] : src0->ne[0] / 2;
+    const int nr = ggml_nrows(src0);
+
+    GGML_ASSERT(dst->ne[0] == nc);
+    GGML_ASSERT(ggml_nrows(dst) == nr);
+
+    const int32_t swapped = ggml_get_op_params_i32(dst, 1);
+    const float   limit   = ggml_get_op_params_f32(dst, 3);
+
+    const int dr  = (nr + nth - 1) / nth;
+    const int ir0 = dr * ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    for (int i1 = ir0; i1 < ir1; i1++) {
+        ggml_fp16_t * src0_p = (ggml_fp16_t *) (src0_d + i1 * src0_o);
+        ggml_fp16_t * src1_p = (ggml_fp16_t *) (src1_d + i1 * src1_o);
+        ggml_fp16_t * dst_p  = (ggml_fp16_t *) ((char *) dst->data + i1 * (dst->nb[1]));
+
+        if (!src1) {
+            src0_p += swapped ? nc : 0;
+            src1_p += swapped ? 0 : nc;
+        }
+
+        for (int k = 0; k < nc; k++) {
+            const float gate = std::min(GGML_FP16_TO_FP32(src0_p[k]), limit);
+            const float up   = std::clamp(GGML_FP16_TO_FP32(src1_p[k]), -limit, limit);
+            dst_p[k]         = GGML_FP32_TO_FP16(gate / (1.f + expf(-gate)) * up);
+        }
+
+#ifndef NDEBUG
+        for (int k = 0; k < nc; k++) {
+            const float x = GGML_FP16_TO_FP32(dst_p[k]);
+            GGML_UNUSED(x);
+            assert(!isnan(x));
+            assert(!isinf(x));
+        }
+#endif  // NDEBUG
+    }
+}
+
+static void ggml_compute_forward_swiglu_clamp(const ggml_compute_params * params, ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            ggml_compute_forward_swiglu_clamp_f32(params, dst);
+            break;
+        case GGML_TYPE_F16:
+            ggml_compute_forward_swiglu_clamp_f16(params, dst);
+            break;
+        default:
+            GGML_ABORT("fatal error");
+    }
+}
+
 // ggml_compute_forward_geglu_erf
 
 static void ggml_compute_forward_geglu_erf_f32(
@@ -7482,18 +7615,21 @@ static void ggml_compute_forward_conv_transpose_2d_impl(
             }
         }
 
-        // permute source data (src1) from (Sw x Sh x Cin) to (Cin x Sw x Sh)
+        // permute source data (src1) from (Sw x Sh x Cin) to (Cin x Sw x Sh), for all batches
         {
             kernel_t * const wdata = (kernel_t *) params->wdata + nk;
-            for (int i12 = 0; i12 < ne12; i12++) {
-                for (int i11 = 0; i11 < ne11; i11++) {
-                    const float * const src = (float *)((char *) src1->data + i12*nb12 + i11*nb11);
-                    kernel_t * dst_data = wdata + i11*ne10*ne12;
-                    for (int i10 = 0; i10 < ne10; i10++) {
-                        if constexpr (std::is_same_v<kernel_t, ggml_fp16_t>) {
-                            dst_data[i10*ne12 + i12] = GGML_CPU_FP32_TO_FP16(src[i10]);
-                        } else {
-                            dst_data[i10*ne12 + i12] = src[i10];
+            for (int i13 = 0; i13 < ne13; i13++) {
+                kernel_t * const wdata_b = wdata + i13*ne10*ne11*ne12;
+                for (int i12 = 0; i12 < ne12; i12++) {
+                    for (int i11 = 0; i11 < ne11; i11++) {
+                        const float * const src = (float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11);
+                        kernel_t * dst_data = wdata_b + i11*ne10*ne12;
+                        for (int i10 = 0; i10 < ne10; i10++) {
+                            if constexpr (std::is_same_v<kernel_t, ggml_fp16_t>) {
+                                dst_data[i10*ne12 + i12] = GGML_CPU_FP32_TO_FP16(src[i10]);
+                            } else {
+                                dst_data[i10*ne12 + i12] = src[i10];
+                            }
                         }
                     }
                 }
@@ -7520,24 +7656,27 @@ static void ggml_compute_forward_conv_transpose_2d_impl(
     kernel_t * const wdata_src = wdata + nk;
 
     for (int i2 = ip0; i2 < ip1; i2++) { // Cout
-        float * dst_data = (float *)((char *) dst->data + i2*nb2);
         kernel_t * wdata_kernel = wdata + i2*ne01*ne00*ne03;
-        for (int i11 = 0; i11 < ne11; i11++) {
-            for (int i10 = 0; i10 < ne10; i10++) {
-                const int i1n = i11*ne10*ne12 + i10*ne12;
-                for (int i01 = 0; i01 < ne01; i01++) {
-                    for (int i00 = 0; i00 < ne00; i00++) {
-                        float v = 0;
-                        if constexpr (std::is_same_v<kernel_t, ggml_fp16_t>) {
-                            ggml_vec_dot_f16(ne03, &v, 0,
-                                    wdata_src + i1n, 0,
-                                    wdata_kernel + i01*ne00*ne03 + i00*ne03, 0, 1);
-                        } else {
-                            ggml_vec_dot_f32(ne03, &v, 0,
-                                    wdata_src + i1n, 0,
-                                    wdata_kernel + i01*ne00*ne03 + i00*ne03, 0, 1);
+        for (int i3 = 0; i3 < ne3; i3++) { // batch
+            float * dst_data = (float *)((char *) dst->data + i3*nb3 + i2*nb2);
+            kernel_t * wdata_src_b = wdata_src + i3*ne10*ne11*ne12;
+            for (int i11 = 0; i11 < ne11; i11++) {
+                for (int i10 = 0; i10 < ne10; i10++) {
+                    const int i1n = i11*ne10*ne12 + i10*ne12;
+                    for (int i01 = 0; i01 < ne01; i01++) {
+                        for (int i00 = 0; i00 < ne00; i00++) {
+                            float v = 0;
+                            if constexpr (std::is_same_v<kernel_t, ggml_fp16_t>) {
+                                ggml_vec_dot_f16(ne03, &v, 0,
+                                        wdata_src_b + i1n, 0,
+                                        wdata_kernel + i01*ne00*ne03 + i00*ne03, 0, 1);
+                            } else {
+                                ggml_vec_dot_f32(ne03, &v, 0,
+                                        wdata_src_b + i1n, 0,
+                                        wdata_kernel + i01*ne00*ne03 + i00*ne03, 0, 1);
+                            }
+                            dst_data[(i11*stride + i01)*ne0 + i10*stride + i00] += v;
                         }
-                        dst_data[(i11*stride + i01)*ne0 + i10*stride + i00] += v;
                     }
                 }
             }
@@ -10534,6 +10673,10 @@ void ggml_compute_forward_glu(
             {
                 ggml_compute_forward_geglu_quick(params, dst);
             } break;
+        case GGML_GLU_OP_SWIGLU_CLAMP:
+            {
+                ggml_compute_forward_swiglu_clamp(params, dst);
+            } break;
         default:
             {
                 GGML_ABORT("fatal error");
@@ -11674,14 +11817,17 @@ static inline int64_t kvarn_cpu_read_cell(
         int64_t encoded, bool read_indirect, bool swa, bool & staged,
         int64_t * assigned_slot = nullptr) {
     GGML_UNUSED(read_indirect);
-    GGML_UNUSED(swa);
-    staged = encoded < -1;
+    staged = !swa && encoded < -1;
     const uint64_t payload = uint64_t(kvarn_cpu_index_payload(encoded));
     if (assigned_slot != nullptr) {
         const uint32_t packed = uint32_t(payload >> 32u);
-        *assigned_slot = packed == 0 ? -1 : int64_t(packed - 1u);
+        *assigned_slot = swa || packed == 0 ? -1 : int64_t(packed - 1u);
     }
     return int64_t(uint32_t(payload));
+}
+
+static inline int64_t kvarn_cpu_swa_stream(int64_t encoded) {
+    return int64_t(uint64_t(encoded) >> 32u);
 }
 
 static void kvarn_cpu_hadamard(float * values) {
@@ -12005,11 +12151,11 @@ void ggml_compute_forward_kvarn_store(const ggml_compute_params * params, ggml_t
         GGML_ASSERT(encoded_idx >= 0);
         const uint64_t payload = uint64_t(encoded_idx);
         const uint32_t packed_slot = uint32_t(payload >> 32u);
-        const int64_t assigned_slot = packed_slot == 0 ? -1 : int64_t(packed_slot - 1u);
+        const int64_t assigned_slot = swa || packed_slot == 0 ? -1 : int64_t(packed_slot - 1u);
         const int64_t idx = int64_t(uint32_t(payload));
         const int64_t group_global = idx / 128;
         const int64_t pos = idx % 128;
-        const int64_t stream = swa ? 0 : group_global / groups_per_stream;
+        const int64_t stream = swa ? kvarn_cpu_swa_stream(encoded_idx) : group_global / groups_per_stream;
         const int64_t group = swa ? group_global : group_global - stream * groups_per_stream;
         GGML_ASSERT(stream >= 0 && stream < n_stream);
         if (!swa) {
@@ -12105,7 +12251,7 @@ void ggml_compute_forward_kvarn_materialize(const ggml_compute_params * params, 
         const int64_t idx = kvarn_cpu_read_cell(encoded, read_indirect, swa, staged);
         const int64_t group_global = idx / KVAR_N_GROUP;
         const int64_t pos = idx % KVAR_N_GROUP;
-        const int64_t stream = swa ? stream_start : group_global / groups_per_stream;
+        const int64_t stream = swa ? kvarn_cpu_swa_stream(encoded) : group_global / groups_per_stream;
         if (stream < stream_start || stream >= stream_start + n_stream) {
             continue;
         }
@@ -12128,7 +12274,8 @@ void ggml_compute_forward_kvarn_materialize(const ggml_compute_params * params, 
         const int64_t cell = cell_stream % n_kv;
         const int64_t out_stream = cell_stream / n_kv;
         const int64_t stream = stream_start + out_stream;
-        const int64_t encoded = (swa || read_indirect) ? idx_data[cell] : cell;
+        const int64_t encoded = swa ? idx_data[stream*n_kv + cell] :
+                (read_indirect ? idx_data[cell] : cell);
         std::array<std::array<float, KVAR_N_GROUP>, 4> rows = {};
         if (encoded != -1) {
             bool explicitly_staged;

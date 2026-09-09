@@ -35,6 +35,13 @@ def main() -> None:
         f"release workflows still pass removed GGML_HIP_ROCWMMA_FATTN: {stale_rocwmma}",
     )
 
+    cmake = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
+    for component, value in (("MAJOR", 0), ("MINOR", 4), ("PATCH", 6)):
+        require(
+            f"set(LLAMA_VERSION_{component} {value})" in cmake,
+            f"v0.4.6 release metadata has the wrong {component.lower()} version",
+        )
+
     release = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
     preview_dispatch = (WORKFLOWS / "release-preview-dispatch.yml").read_text(encoding="utf-8")
     stable_dispatch = (WORKFLOWS / "release-dispatch.yml").read_text(encoding="utf-8")
@@ -74,6 +81,13 @@ def main() -> None:
     require(
         "cuda-architecture-compile" not in release,
         "release workflow must not run the exhaustive CUDA architecture matrix",
+    )
+    require(
+        "cache-from: ${{ matrix.config.name != 'rocm' && format('type=registry,ref={0}:buildcache-runtime-{1}', needs.release-meta.outputs.image_repo, matrix.config.name) || '' }}"
+        in release
+        and "cache-to: ${{ matrix.config.name != 'rocm' && format('type=registry,ref={0}:buildcache-runtime-{1},mode=max', needs.release-meta.outputs.image_repo, matrix.config.name) || '' }}"
+        in release,
+        "ROCm Docker packaging must bypass the oversized GHCR registry cache",
     )
     require(
         "${{ inputs.publish_release && 'stable' || 'preview' }}" in release,

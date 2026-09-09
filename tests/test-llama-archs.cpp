@@ -6,6 +6,10 @@
 #include "ggml-cpp.h"
 #include "llama.h"
 #include "llama-cpp.h"
+#include "speculative.h"
+
+#include "../src/llama-context.h"
+#include "../src/llama-kv-cache-kvarn.h"
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
@@ -65,7 +69,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--test-mtp-ubatch-sync]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--test-mtp-ubatch-sync] [--test-mtp-request-reset] [--test-mtp-kvarn-routing]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -118,7 +122,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
             || arch == LLM_ARCH_KIMI_LINEAR
             || arch == LLM_ARCH_BAILINGMOE3
             || arch == LLM_ARCH_KIMI_K3
-            || arch == LLM_ARCH_MISTRAL4) {
+            || arch == LLM_ARCH_MISTRAL4
+            || arch == LLM_ARCH_HY_V4) {
         n_embd = 128;
         n_head = 1;
         n_ff   = 192;
@@ -194,7 +199,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
             || arch == LLM_ARCH_KIMI_LINEAR
             || arch == LLM_ARCH_BAILINGMOE3
             || arch == LLM_ARCH_KIMI_K3
-            || arch == LLM_ARCH_MISTRAL4) {
+            || arch == LLM_ARCH_MISTRAL4
+            || arch == LLM_ARCH_HY_V4) {
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,       uint32_t(576));
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,     uint32_t(512));
         ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(64));
@@ -238,7 +244,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_ROPE_FREQ_BASE_SWA,              10000.0f);
         // SWA pattern: every 5th layer is full attention (matches E2B layer_types)
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, uint32_t(5));
-    } else if (arch == LLM_ARCH_COHERE2MOE || arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_STEP35 ||
+    } else if (arch == LLM_ARCH_COHERE2MOE || arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_SPARK2_5 ||
             arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_GRANITE_SWA || arch == LLM_ARCH_DOTS3NOTE) {
         std::vector<uint32_t> pattern;
         pattern.reserve(n_layer);
@@ -252,12 +258,63 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
 
     // MSA requires one indexer head per GQA (KV) head, unlike the DSA archs where the
     // indexer head count is independent of the main attention head count.
-    ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,   arch == LLM_ARCH_MINIMAX_M3 || arch == LLM_ARCH_DEEPSEEK4 ? n_head : uint32_t(1));
-    ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,   uint32_t(64));
+    if (arch == LLM_ARCH_QWEN4EXP) {
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,    uint32_t(4));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK, uint32_t(8));
+        // without this the QSA layers fall back to dense and go uncovered
+        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(n_layer, 4));
+
+        // has_cell_ext() needs ple_n_heads here: the indexer cache serializes no ext without it
+        const uint32_t ple_ngram_size      = 3;
+        const uint32_t ple_heads_per_ngram = 2;
+        const uint32_t ple_n_heads         = (ple_ngram_size - 1)*ple_heads_per_ngram;
+        GGML_ASSERT(n_embd % ple_n_heads == 0);
+        const uint32_t ple_head_dim = n_embd/ple_n_heads;
+
+        std::vector<uint64_t> ple_head_offsets(ple_n_heads);
+        std::vector<uint64_t> ple_head_vocab_sizes(ple_n_heads, n_vocab);
+        for (uint32_t h = 0; h < ple_n_heads; h++) {
+            ple_head_offsets[h] = uint64_t(h)*n_vocab;
+        }
+
+        // the PLE history lives in the recurrent cache, so it must sit on a linear attention layer
+        ms.add_kv(LLM_KV_PLE_LAYERS,                  std::vector<uint32_t>({ 0 }));
+        ms.add_kv(LLM_KV_PLE_NGRAM_SIZE,              ple_ngram_size);
+        ms.add_kv(LLM_KV_PLE_HEADS_PER_NGRAM,         ple_heads_per_ngram);
+        ms.add_kv(LLM_KV_PLE_CONV_KERNEL,             uint32_t(4));
+        ms.add_kv(LLM_KV_PLE_EOS_TOKEN_ID,            uint32_t(0));
+        ms.add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER,  ple_head_dim);
+        ms.add_kv(LLM_KV_PLE_LAYER_MULTIPLIERS,       std::vector<uint64_t>({ 1, 3, 5 }));
+        ms.add_kv(LLM_KV_PLE_HEAD_OFFSETS,            ple_head_offsets);
+        ms.add_kv(LLM_KV_PLE_HEAD_VOCAB_SIZES,        ple_head_vocab_sizes);
+    }
+
+    // minimax-m3 keeps one indexer head per GQA head; the rest use a fixed 64 to match the fused
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,   arch == LLM_ARCH_MINIMAX_M3 ? n_head : uint32_t(64));
+    // qwen4exp ropes indexer keys with the main rotary width, so its head can't be < n_rot
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,
+              arch == LLM_ARCH_QWEN4EXP ? n_embd_head : uint32_t(128));
+
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,        uint32_t(8));
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,   uint32_t(4));
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS, uint32_t(1));
     ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS, std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
+
+    if (arch == LLM_ARCH_HY_V4) {
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,     uint32_t(4));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,   1.0e-6f);
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_MAGNITUDE, 2.0f);
+        ms.add_kv(LLM_KV_SWIGLU_CLAMP_EXP,           10.0f);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,       1.0f);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,        true);
+        // layer 0 must own an indexer, the odd layers share it
+        std::vector<uint32_t> indexer_types;
+        indexer_types.reserve(n_layer);
+        for (uint32_t il = 0; il < n_layer; il++) {
+            indexer_types.push_back(il % 2 ? 0 : 1);
+        }
+        ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES, indexer_types);
+    }
 
     if (arch == LLM_ARCH_DEEPSEEK4) {
         ms.add_kv(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,         uint32_t(8));
@@ -297,7 +354,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     ms.add_kv(LLM_KV_XIELU_ALPHA_P,             1.0f);
     ms.add_kv(LLM_KV_XIELU_BETA,                1.0f);
     ms.add_kv(LLM_KV_XIELU_EPS,                 1.0e-7f);
-    ms.add_kv(LLM_KV_SSM_INNER_SIZE,            arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ? 256 : 2*n_embd);
+    ms.add_kv(LLM_KV_SSM_INNER_SIZE,            arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP ? 256 : 2*n_embd);
     ms.add_kv(LLM_KV_SSM_CONV_KERNEL,           uint32_t(4));
     ms.add_kv(LLM_KV_SSM_STATE_SIZE,            uint32_t(128));
     ms.add_kv(LLM_KV_SSM_TIME_STEP_RANK,        n_head);
@@ -447,6 +504,239 @@ static int test_mtp_ubatch_sync(const size_t seed) {
     return 0;
 }
 
+static int test_mtp_request_reset(const size_t seed) {
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN35, false, true);
+    // Two trunk layers (recurrent + attention) followed by the MTP block.
+    gguf_set_val_u32(gguf_ctx.get(), "qwen35.block_count", 3);
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    model_params.load_mtp = true;
+
+    size_t tmp = seed;
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tmp, model_params));
+    if (!model) {
+        throw std::runtime_error("failed to create MTP model");
+    }
+
+    llama_context_params target_params = llama_context_default_params();
+    target_params.n_ctx = 8;
+    target_params.n_batch = 4;
+    target_params.n_ubatch = 4;
+    llama_context_ptr ctx_tgt(llama_init_from_model(model.get(), target_params));
+    if (!ctx_tgt) {
+        throw std::runtime_error("failed to create target context");
+    }
+
+    llama_context_params draft_params = target_params;
+    draft_params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    llama_context_ptr ctx_dft(llama_init_from_model(model.get(), draft_params));
+    if (!ctx_dft) {
+        throw std::runtime_error("failed to create MTP context");
+    }
+
+    common_params_speculative params;
+    params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+    params.draft.ctx_tgt = ctx_tgt.get();
+    params.draft.ctx_dft = ctx_dft.get();
+    params.draft.backend_sampling = false;
+    common_speculative_ptr spec(common_speculative_init(params, 1));
+    if (!spec) {
+        throw std::runtime_error("failed to create MTP speculative driver");
+    }
+
+    std::vector<uint8_t> state;
+    if (!common_speculative_get_state(spec.get(), 0, state)) {
+        throw std::runtime_error("failed to read initial MTP state");
+    }
+
+    const std::vector<uint8_t> initial_state = state;
+    size_t cursor = 0;
+    const auto read_u32 = [&]() {
+        uint32_t value;
+        std::memcpy(&value, state.data() + cursor, sizeof(value));
+        cursor += sizeof(value);
+        return value;
+    };
+    const auto read_i32 = [&]() {
+        int32_t value;
+        std::memcpy(&value, state.data() + cursor, sizeof(value));
+        cursor += sizeof(value);
+        return value;
+    };
+    const auto read_u64 = [&]() {
+        uint64_t value;
+        std::memcpy(&value, state.data() + cursor, sizeof(value));
+        cursor += sizeof(value);
+        return value;
+    };
+
+    const uint32_t magic = read_u32();
+    const uint32_t version = read_u32();
+    const uint32_t type = read_u32();
+    const int32_t seq_id = read_i32();
+    const uint64_t payload_size = read_u64();
+    const size_t checksum_offset = cursor;
+    (void) read_u64();
+    const size_t payload_offset = cursor;
+    if (magic != 0x43455053 || version != 1 ||
+            type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP || seq_id != 0 ||
+            payload_offset + payload_size != state.size() || payload_size < 3*sizeof(uint32_t)) {
+        throw std::runtime_error("unexpected serialized MTP state format");
+    }
+
+    uint32_t width;
+    std::memcpy(&width, state.data() + payload_offset + 2*sizeof(uint32_t), sizeof(width));
+    if (payload_size != 3*sizeof(uint32_t) + size_t(width)*sizeof(float)) {
+        throw std::runtime_error("unexpected serialized MTP state width");
+    }
+    std::vector<float> stale(width, 1.0f);
+    std::memcpy(state.data() + payload_offset + 3*sizeof(uint32_t), stale.data(), stale.size()*sizeof(float));
+
+    uint64_t checksum = 1469598103934665603ULL;
+    const auto hash_bytes = [&](const void * ptr, size_t size) {
+        const auto * bytes = static_cast<const uint8_t *>(ptr);
+        for (size_t i = 0; i < size; ++i) {
+            checksum = (checksum ^ bytes[i])*1099511628211ULL;
+        }
+    };
+    hash_bytes(&magic, sizeof(magic));
+    hash_bytes(&version, sizeof(version));
+    hash_bytes(&type, sizeof(type));
+    hash_bytes(&seq_id, sizeof(seq_id));
+    hash_bytes(&payload_size, sizeof(payload_size));
+    hash_bytes(state.data() + payload_offset, payload_size);
+    std::memcpy(state.data() + checksum_offset, &checksum, sizeof(checksum));
+
+    const auto prefill = [&](const std::vector<uint8_t> & carry) {
+        llama_memory_clear(llama_get_memory(ctx_tgt.get()), true);
+        llama_memory_clear(llama_get_memory(ctx_dft.get()), true);
+        if (!common_speculative_set_state(spec.get(), 0, carry)) {
+            throw std::runtime_error("failed to initialize MTP carry state");
+        }
+
+        llama_batch batch = llama_batch_init(2, 0, 1);
+        common_batch_add(batch, 1, 0, { 0 }, true);
+        common_batch_add(batch, 2, 1, { 0 }, true);
+        const bool ok = llama_decode(ctx_tgt.get(), batch) == 0 &&
+                common_speculative_process(spec.get(), batch);
+        llama_batch_free(batch);
+        if (!ok) {
+            throw std::runtime_error("failed to prefill MTP request");
+        }
+
+        std::vector<uint8_t> pending;
+        if (!common_speculative_get_state(spec.get(), 0, pending)) {
+            throw std::runtime_error("failed to read prefilled MTP state");
+        }
+        const float * expected = llama_get_embeddings_nextn_ith(ctx_tgt.get(), 1);
+        const size_t pending_offset = payload_offset + 3*sizeof(uint32_t);
+        if (!expected || std::memcmp(pending.data() + pending_offset, expected, width*sizeof(float)) != 0) {
+            throw std::runtime_error("MTP prefill did not retain the final target hidden state");
+        }
+
+        // The server (and speculative-simple) calls begin AFTER prompt processing.
+        common_speculative_begin(spec.get(), 0, { 1, 2 });
+        std::vector<uint8_t> after_begin;
+        if (!common_speculative_get_state(spec.get(), 0, after_begin) || after_begin != pending) {
+            throw std::runtime_error("MTP begin erased freshly prefilled hidden state");
+        }
+
+        // A checkpoint's restored carry is also valid, not previous-request residue.
+        if (!common_speculative_set_state(spec.get(), 0, state) ||
+                !common_speculative_set_state(spec.get(), 0, pending)) {
+            throw std::runtime_error("failed to restore MTP checkpoint carry");
+        }
+        common_speculative_begin(spec.get(), 0, { 1, 2 });
+        if (!common_speculative_get_state(spec.get(), 0, after_begin) || after_begin != pending) {
+            throw std::runtime_error("MTP begin erased restored checkpoint carry");
+        }
+
+        constexpr auto flags = LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED;
+        const size_t size = llama_state_seq_get_size_ext(ctx_dft.get(), 0, flags);
+        std::vector<uint8_t> cache(size);
+        if (size == 0 || llama_state_seq_get_data_ext(ctx_dft.get(), cache.data(), size, 0, flags) != size) {
+            throw std::runtime_error("failed to save prefilled draft cache");
+        }
+        return cache;
+    };
+
+    const auto fresh = prefill(initial_state);
+    const auto reused = prefill(state);
+    if (fresh != reused) {
+        throw std::runtime_error("previous-request MTP carry contaminated the new prompt's draft cache");
+    }
+
+    return 0;
+}
+
+static llama_model_ptr make_synthetic_mtp_model(llm_arch arch, bool moe, size_t seed) {
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe, true);
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    model_params.load_mtp = true;
+    return llama_model_ptr(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &seed, model_params));
+}
+
+static int test_mtp_kvarn_routing(const size_t seed) {
+    struct route_case {
+        llm_arch arch;
+        bool moe;
+    };
+    // Qwen4Exp is covered by the pure route policy and real-model acceptance.
+    // Its synthetic full-model fixture does not represent its standalone sidecar topology.
+    for (const route_case & test : {
+            route_case{ LLM_ARCH_QWEN35, false },
+            route_case{ LLM_ARCH_QWEN35MOE, true } }) {
+        fprintf(stderr, "checking owned MTP KVarN route for %s\n", llm_arch_name(test.arch));
+        llama_model_ptr model = make_synthetic_mtp_model(test.arch, test.moe, seed);
+        if (!model) {
+            throw std::runtime_error(std::string("failed to create synthetic MTP model for ") + llm_arch_name(test.arch));
+        }
+
+        llama_context_params params = llama_context_default_params();
+        params.n_ctx = 256;
+        params.n_batch = 64;
+        params.n_ubatch = 32;
+        params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        params.offload_kqv = false;
+        params.kvarn = llama_kvarn_params_for_type(LLAMA_KVARN_K4V2_G128);
+        params.kv_tail_tokens = 0;
+
+        llama_context_ptr ctx(llama_init_from_model(model.get(), params));
+        if (!ctx) {
+            fprintf(stderr, "owned MTP KVarN route rejected %s\n", llm_arch_name(test.arch));
+            return 1;
+        }
+        if (dynamic_cast<llama_kv_cache_kvarn *>(llama_get_memory(ctx.get())) == nullptr) {
+            fprintf(stderr, "owned MTP route did not construct KVarN storage for %s\n", llm_arch_name(test.arch));
+            return 1;
+        }
+        if (ctx->get_cparams().kv_tail_tokens != 128 || llama_get_memory(ctx.get())->get_kv_tail_group_count() != 1) {
+            fprintf(stderr, "owned MTP KVarN route did not retain one intrinsic 128-token exact suffix for %s\n",
+                    llm_arch_name(test.arch));
+            return 1;
+        }
+    }
+
+    llama_model_ptr unsupported = make_synthetic_mtp_model(LLM_ARCH_QWEN3NEXT, true, seed);
+    if (!unsupported) {
+        throw std::runtime_error("failed to create unsupported synthetic MTP model");
+    }
+    llama_context_params params = llama_context_default_params();
+    params.n_ctx = 256;
+    params.n_batch = 64;
+    params.n_ubatch = 32;
+    params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    params.offload_kqv = false;
+    params.kvarn = llama_kvarn_params_for_type(LLAMA_KVARN_K4V2_G128);
+    if (llama_init_from_model(unsupported.get(), params) != nullptr) {
+        fprintf(stderr, "unclassified MTP architecture accepted draft KVarN\n");
+        return 1;
+    }
+
+    return 0;
+}
+
 static std::vector<float> get_logits(
         llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false) {
     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
@@ -491,6 +781,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_QWEN3NEXT:
         case LLM_ARCH_QWEN3VLMOE:
         case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_QWEN4EXP:
         case LLM_ARCH_PHIMOE:
         case LLM_ARCH_DBRX:
         case LLM_ARCH_OLMOE:
@@ -512,6 +803,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_ERNIE4_5_MOE:
         case LLM_ARCH_HUNYUAN_MOE:
         case LLM_ARCH_HY_V3:
+        case LLM_ARCH_HY_V4:
         case LLM_ARCH_OPENAI_MOE:
         case LLM_ARCH_LFM2MOE:
         case LLM_ARCH_SMALLTHINKER:
@@ -587,7 +879,7 @@ static bool arch_supported(const llm_arch arch) {
     }
     // FIXME: these hit scheduler/view-backed-output issues with WebGPU on CI.
 #ifdef GGML_USE_WEBGPU
-    if (arch == LLM_ARCH_DEEPSEEK32 || arch == LLM_ARCH_GLM_DSA || arch == LLM_ARCH_DOTS3NOTE) {
+    if (arch == LLM_ARCH_DEEPSEEK32 || arch == LLM_ARCH_GLM_DSA || arch == LLM_ARCH_DOTS3NOTE || arch == LLM_ARCH_QWEN4EXP) {
         return false;
     }
 #endif // GGML_USE_WEBGPU
@@ -603,22 +895,27 @@ static bool arch_supported(const llm_arch arch) {
     return true;
 }
 
-static int save_models(const llm_arch target_arch, const size_t seed, const ggml_log_level log_level, const std::string & dir) {
+static int save_models(const llm_arch target_arch, const size_t seed, const int verbosity, const std::string & dir) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
             void * user_data;
-        } original_logger;
-        ggml_log_level min_level; // prints below this log level go to debug log
+        } log_old;
+
+        int verbosity;
+
+        user_data_t(int verbosity) : verbosity(verbosity) {
+            llama_log_get(&log_old.callback, &log_old.user_data);
+        }
     };
-    user_data_t ud;
-    llama_log_get(&ud.original_logger.callback, &ud.original_logger.user_data);
-    ud.min_level = log_level;
+    user_data_t ud(verbosity);
 
     llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
         const user_data_t * ud = (const user_data_t *) user_data;
-        const ggml_log_level level_eff = level >= ud->min_level ? level : GGML_LOG_LEVEL_DEBUG;
-        ud->original_logger.callback(level_eff, text, ud->original_logger.user_data);
+        int verbosity = common_log_get_verbosity(level);
+        if (verbosity <= ud->verbosity) {
+            ud->log_old.callback(level, text, ud->log_old.user_data);
+        }
     }, &ud);
 
     for (const llm_arch & arch : llm_arch_all()) {
@@ -652,26 +949,31 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
             llama_model_save_to_file(model_and_ctx.first.get(), path.c_str());
         }
     }
-    llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+    llama_log_set(ud.log_old.callback, ud.log_old.user_data);
     return 0;
 }
 
-static int test_backends(const llm_arch target_arch, const size_t seed, const ggml_log_level log_level) {
+static int test_backends(const llm_arch target_arch, const size_t seed, const int verbosity) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
             void * user_data;
-        } original_logger;
-        ggml_log_level min_level; // prints below this log level go to debug log
+        } log_old;
+
+        int verbosity;
+
+        user_data_t(int verbosity) : verbosity(verbosity) {
+            llama_log_get(&log_old.callback, &log_old.user_data);
+        }
     };
-    user_data_t ud;
-    llama_log_get(&ud.original_logger.callback, &ud.original_logger.user_data);
-    ud.min_level = log_level;
+    user_data_t ud(verbosity);
 
     llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
         const user_data_t * ud = (const user_data_t *) user_data;
-        const ggml_log_level level_eff = level >= ud->min_level ? level : GGML_LOG_LEVEL_DEBUG;
-        ud->original_logger.callback(level_eff, text, ud->original_logger.user_data);
+        int verbosity = common_log_get_verbosity(level);
+        if (verbosity <= ud->verbosity) {
+            ud->log_old.callback(level, text, ud->log_old.user_data);
+        }
     }, &ud);
 
     const std::vector<llama_token> tokens = get_tokens(128, 128, seed);
@@ -767,6 +1069,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                 std::string status_nmse      = "\033[1;33mSKIP\033[0m";
                 std::string status_roundtrip = "\033[1;33mSKIP\033[0m";
                 char nmse_str[12] = {0};
+
                 bool skip = !arch_supported(arch) || (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR && dc.devs.empty());
                 if (!skip) {
                     if (logits_cpu.empty()) {
@@ -817,22 +1120,31 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
             }
         }
     }
-    llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+    llama_log_set(ud.log_old.callback, ud.log_old.user_data);
     return all_ok ? 0 : 1;
 }
 
 int main(int argc, char ** argv) {
-    // FIXME these tests are disabled in the CI for macOS-latest-cmake-arm64 because they are segfaulting
+    // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
+    common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
     common_init();
+
     std::random_device rd;
 
     llm_arch arch = LLM_ARCH_UNKNOWN;
     size_t seed = rd();
-    ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
     std::string out;
     bool test_mtp_sync = false;
+    bool test_mtp_reset = false;
+    bool test_mtp_kvarn = false;
+
+    int verbosity = LOG_LEVEL_ERROR;
 
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            usage(argv);
+            return 0;
+        }
         if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
             if (i + 1 < argc) {
                 const std::string arch_name = argv[++i];
@@ -854,9 +1166,13 @@ int main(int argc, char ** argv) {
                 return 1;
             }
         }
-        if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
-            log_level = GGML_LOG_LEVEL_INFO;
-            continue;
+        if (strcmp(argv[i], "-v") == 0) {
+            if (i + 1 < argc) {
+                verbosity = std::stoull(argv[++i]);
+            } else {
+                usage(argv);
+                return 1;
+            }
         }
         if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--out") == 0) {
             if (i + 1 < argc) {
@@ -869,17 +1185,29 @@ int main(int argc, char ** argv) {
         if (strcmp(argv[i], "--test-mtp-ubatch-sync") == 0) {
             test_mtp_sync = true;
         }
+        if (strcmp(argv[i], "--test-mtp-request-reset") == 0) {
+            test_mtp_reset = true;
+        }
+        if (strcmp(argv[i], "--test-mtp-kvarn-routing") == 0) {
+            test_mtp_kvarn = true;
+        }
     }
     printf("%s: using seed %zu\n", __func__, seed);
 
     try {
         if (!out.empty()) {
-            return save_models(arch, seed, log_level, out);
+            return save_models(arch, seed, verbosity, out);
         }
         if (test_mtp_sync) {
             return test_mtp_ubatch_sync(seed);
         }
-        return test_backends(arch, seed, log_level);
+        if (test_mtp_reset) {
+            return test_mtp_request_reset(seed);
+        }
+        if (test_mtp_kvarn) {
+            return test_mtp_kvarn_routing(seed);
+        }
+        return test_backends(arch, seed, verbosity);
     } catch (const std::exception & err) {
         fprintf(stderr, "encountered runtime error: %s\n", err.what());
         return -1;

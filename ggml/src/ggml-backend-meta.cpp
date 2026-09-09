@@ -568,6 +568,37 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return true;
     };
 
+    auto split_states_proportional = [&](const ggml_backend_meta_split_state & a,
+                                          const ggml_backend_meta_split_state & b) -> bool {
+        if (a.axis != b.axis || a.axis < 0 || a.axis >= GGML_MAX_DIMS) {
+            return false;
+        }
+        std::vector<int64_t> per_device_a(n_bufs, 0);
+        std::vector<int64_t> per_device_b(n_bufs, 0);
+        int64_t total_a = 0;
+        int64_t total_b = 0;
+        for (size_t j = 0; j < n_bufs; ++j) {
+            for (size_t s = 0; s < a.n_segments; ++s) {
+                per_device_a[j] += a.ne[s*n_bufs + j] * a.nr[s];
+            }
+            for (size_t s = 0; s < b.n_segments; ++s) {
+                per_device_b[j] += b.ne[s*n_bufs + j] * b.nr[s];
+            }
+            total_a += per_device_a[j];
+            total_b += per_device_b[j];
+        }
+        if (total_a <= 0 || total_b <= 0) {
+            return false;
+        }
+        for (size_t j = 0; j < n_bufs; ++j) {
+            if ((long double) per_device_a[j] * total_b !=
+                    (long double) per_device_b[j] * total_a) {
+                return false;
+            }
+        }
+        return true;
+    };
+
     auto handle_generic = [&](const std::vector<ggml_backend_meta_split_state> & src_ss, bool scalar_only) -> ggml_backend_meta_split_state {
         ggml_backend_meta_split_state ret = {GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1};
         for (size_t i = 0; i < GGML_MAX_SRC; i++) {
@@ -589,6 +620,18 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         }
         GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
         return ret;
+    };
+
+    auto handle_src0_with_mirrored_inputs = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        GGML_ASSERT(tensor->src[0] != nullptr);
+        for (size_t i = 1; i < GGML_MAX_SRC; ++i) {
+            if (tensor->src[i] == nullptr || tensor->src[i] == tensor) {
+                continue;
+            }
+            GGML_ASSERT(src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
+                    split_states_equal(src_ss[i], src_ss[0]));
+        }
+        return src_ss[0];
     };
 
     // Some ops process data on a per-row bases:
@@ -647,8 +690,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         }
         if (src_ss[0].axis == src_ss[1].axis && src_ss[0].axis >= GGML_BACKEND_SPLIT_AXIS_2 &&
                 src_ss[0].axis < GGML_MAX_DIMS) {
-            GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
-            return src_ss[0];
+            GGML_ASSERT(split_states_proportional(src_ss[0], src_ss[1]));
+            return src_ss[1]; // output follows the query-head split
         }
         // batched matmul with the batches split across devices and a replicated activation
         if (src_ss[0].axis >= GGML_BACKEND_SPLIT_AXIS_2 && src_ss[0].axis < GGML_MAX_DIMS &&
@@ -1062,7 +1105,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } break;
             case GGML_OP_SOFT_MAX:
             case GGML_OP_SOFT_MAX_BACK: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ false);
+                split_state = handle_src0_with_mirrored_inputs(src_ss);
             } break;
             case GGML_OP_ROPE: {
                 split_state = handle_rope(src_ss);
@@ -1849,14 +1892,17 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
 struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft) {
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
 
-    constexpr size_t compute_headroom = 16; // Maximum number of views per statically allocated tensor that can be created between evals.
+    // Speculative graphs can create more than 16 transient views per source
+    // tensor when a target or draft uses tensor-parallel Meta placement.
+    constexpr size_t compute_headroom = 32;
     const ggml_init_params params_static = {
         /*.mem_size   =*/ ggml_get_mem_size(ctx),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
     const ggml_init_params params_compute = {
-        /*.mem_size   =*/ compute_headroom*ggml_get_mem_size(ctx),
+        // Alignment can consume the final slot; reserve one full header.
+        /*.mem_size   =*/ compute_headroom*ggml_get_mem_size(ctx) + ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
@@ -1944,6 +1990,42 @@ struct ggml_backend_meta_context {
     size_t                      max_subgraphs = 0;
     size_t                      n_subgraphs   = 0;
     uint64_t                    uid           = 0;
+
+    // Parent UIDs do not describe in-place graph rewrites. Retain the reachable
+    // tensor metadata (not tensor contents) before reusing a projection.
+    struct tensor_snapshot {
+        const ggml_tensor * address;
+        ggml_tensor value;
+    };
+    std::vector<tensor_snapshot> graph_snapshot;
+    std::vector<const ggml_tensor *> graph_roots;
+    std::vector<int32_t> graph_use_counts;
+    int graph_n_nodes = 0;
+
+    bool projection_matches(const ggml_cgraph * graph) const {
+        if (graph->uid == 0 || graph->uid != uid || graph_n_nodes != graph->n_nodes ||
+                graph_roots.size() != size_t(graph->n_nodes + graph->n_leafs)) {
+            return false;
+        }
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            if (graph_roots[i] != graph->nodes[i] ||
+                    graph_use_counts[i] != ggml_node_get_use_count(graph, i)) {
+                return false;
+            }
+        }
+        for (int i = 0; i < graph->n_leafs; ++i) {
+            if (graph_roots[graph->n_nodes + i] != graph->leafs[i]) {
+                return false;
+            }
+        }
+        for (const auto & saved : graph_snapshot) {
+            if (memcmp(&saved.value, saved.address,
+                    GGML_TENSOR_SIZE - sizeof(ggml_tensor::padding)) != 0) {
+                return false;
+            }
+        }
+        return true;
+    }
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
@@ -2109,50 +2191,59 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
 
-    std::set<ggml_backend_buffer_t> dynamic_kvarn_buffers;
+    const bool needs_rebuild = !backend_ctx->projection_matches(cgraph);
+    std::set<ggml_backend_buffer_t> kvarn_dependency_buffers;
     std::set<ggml_backend_buffer_t> dependency_meta_buffers;
-    std::set<const ggml_tensor *> visited_dependencies;
-    std::vector<const ggml_tensor *> dependencies;
-    dependencies.reserve(cgraph->n_nodes + cgraph->n_leafs);
-    for (int i = 0; i < cgraph->n_nodes; ++i) {
-        dependencies.push_back(cgraph->nodes[i]);
-    }
-    for (int i = 0; i < cgraph->n_leafs; ++i) {
-        dependencies.push_back(cgraph->leafs[i]);
-    }
-    while (!dependencies.empty()) {
-        const ggml_tensor * tensor = dependencies.back();
-        dependencies.pop_back();
-        if (tensor == nullptr || !visited_dependencies.insert(tensor).second) {
-            continue;
+    if (needs_rebuild) {
+        // Retire consumers before projected tensor storage is reset or rewritten.
+        if (!backend_ctx->graph_snapshot.empty()) {
+            ggml_backend_meta_synchronize(backend);
         }
-        if (ggml_backend_buffer_t owner = ggml_backend_meta_tensor_owner_buffer(tensor)) {
-            dependency_meta_buffers.insert(owner);
+        backend_ctx->graph_snapshot.clear();
+        backend_ctx->graph_roots.clear();
+        backend_ctx->graph_use_counts.clear();
+        backend_ctx->graph_n_nodes = cgraph->n_nodes;
+        std::set<const ggml_tensor *> visited_dependencies;
+        std::vector<const ggml_tensor *> dependencies;
+        dependencies.reserve(cgraph->n_nodes + cgraph->n_leafs);
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            dependencies.push_back(cgraph->nodes[i]);
+            backend_ctx->graph_roots.push_back(cgraph->nodes[i]);
+            backend_ctx->graph_use_counts.push_back(ggml_node_get_use_count(cgraph, i));
         }
-        if (tensor->op == GGML_OP_KVARN_STORE ||
-                tensor->op == GGML_OP_KVARN_VIEW ||
-                tensor->op == GGML_OP_KVARN_MATERIALIZE) {
+        for (int i = 0; i < cgraph->n_leafs; ++i) {
+            dependencies.push_back(cgraph->leafs[i]);
+            backend_ctx->graph_roots.push_back(cgraph->leafs[i]);
+        }
+        // Visit parents before graph-external dependencies so a replaced source
+        // invalidates the snapshot before any detached source is dereferenced.
+        for (size_t cursor = 0; cursor < dependencies.size(); ++cursor) {
+            const ggml_tensor * tensor = dependencies[cursor];
+            if (tensor == nullptr || !visited_dependencies.insert(tensor).second) {
+                continue;
+            }
+            backend_ctx->graph_snapshot.push_back({tensor, *tensor});
             if (ggml_backend_buffer_t owner = ggml_backend_meta_tensor_owner_buffer(tensor)) {
-                dynamic_kvarn_buffers.insert(owner);
+                dependency_meta_buffers.insert(owner);
+            }
+            if (tensor->op == GGML_OP_KVARN_STORE ||
+                    tensor->op == GGML_OP_KVARN_VIEW ||
+                    tensor->op == GGML_OP_KVARN_MATERIALIZE) {
+                if (ggml_backend_buffer_t owner = ggml_backend_meta_tensor_owner_buffer(tensor)) {
+                    kvarn_dependency_buffers.insert(owner);
+                }
+            }
+            if (tensor->view_src != nullptr && tensor->view_src != tensor) {
+                dependencies.push_back(tensor->view_src);
+            }
+            for (size_t i = 0; i < GGML_MAX_SRC; ++i) {
+                if (tensor->src[i] != nullptr && tensor->src[i] != tensor) {
+                    dependencies.push_back(tensor->src[i]);
+                }
             }
         }
-        if (tensor->view_src != nullptr && tensor->view_src != tensor) {
-            dependencies.push_back(tensor->view_src);
-        }
-        for (size_t i = 0; i < GGML_MAX_SRC; ++i) {
-            if (tensor->src[i] != nullptr && tensor->src[i] != tensor) {
-                dependencies.push_back(tensor->src[i]);
-            }
-        }
-    }
 
-    // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
-    // KVarN graph-local nodes are rebuilt in place between decode steps while
-    // the scheduler intentionally retains the parent graph UID. Their source
-    // tensors and operation parameters are therefore part of the executable
-    // identity even when the parent UID is unchanged.
-    const bool needs_rebuild = (cgraph->uid == 0) ||
-            (cgraph->uid != backend_ctx->uid) || !dynamic_kvarn_buffers.empty();
+    }
 
     bool max_nnodes_raised = false;
     if (cgraph->n_nodes > backend_ctx->max_nnodes) {
@@ -2178,16 +2269,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 used_buffers.emplace(cgraph->nodes[i]->buffer);
             }
         }
-        used_buffers.insert(dynamic_kvarn_buffers.begin(), dynamic_kvarn_buffers.end());
+        used_buffers.insert(kvarn_dependency_buffers.begin(), kvarn_dependency_buffers.end());
         used_buffers.insert(dependency_meta_buffers.begin(), dependency_meta_buffers.end());
         for (ggml_backend_buffer_t buf : used_buffers) {
             ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buf->context;
-            // Ordinary scheduler-created views select the prepared container
-            // from init_tensor. A KVarN-triggered rebuild can happen without
-            // that callback, so advance every participating meta buffer as one
-            // graph generation before projecting any of its nodes.
-            if (!dynamic_kvarn_buffers.empty() &&
-                    buf_ctx->stc_compute_index != buf_ctx->stc_compute_index_next) {
+            // Scheduler allocation normally selects the prepared container in
+            // init_tensor. Property-only rewrites can happen without that
+            // callback, so always advance to the next graph generation before
+            // projecting any rewritten nodes.
+            if (buf_ctx->stc_compute_index != buf_ctx->stc_compute_index_next) {
                 buf_ctx->stc_compute_index = buf_ctx->stc_compute_index_next;
             }
             buf_ctx->stc_compute_index_next =
@@ -2201,16 +2291,24 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         size_t n_subgraphs  = 0;
         size_t max_tmp_size = 0;
 
+        auto meta_tensor_is_external_host = [](const ggml_tensor * tensor) {
+            if (tensor->buffer != nullptr && !ggml_backend_buffer_is_meta(tensor->buffer) &&
+                    ggml_backend_buffer_is_host(tensor->buffer)) {
+                return true;
+            }
+            return tensor->view_src != nullptr && tensor->view_src->op == GGML_OP_NONE &&
+                    !ggml_backend_buffer_is_meta(tensor->view_src->buffer) &&
+                    ggml_backend_buffer_is_host(tensor->view_src->buffer);
+        };
+
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE &&
-                        !ggml_backend_buffer_is_meta(node->view_src->buffer) &&
-                        ggml_backend_buffer_is_host(node->view_src->buffer)) {
-                    // FIXME s_copy_main is on the CPU and its view seems to be incorrectly added to the graph nodes.
-                    // For regular usage this doesn't matter since it's a noop but trying to call ggml_backend_meta_buffer_simple_tensor results in a crash.
+                if (meta_tensor_is_external_host(node)) {
+                    // External CPU scheduler boundaries are already materialized;
+                    // inner device schedulers consume them as ordinary inputs.
                     bcj.nodes[i] = node;
                     continue;
                 }
@@ -2380,9 +2478,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             int i_start = 0;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE &&
-                        !ggml_backend_buffer_is_meta(node->view_src->buffer) &&
-                        ggml_backend_buffer_is_host(node->view_src->buffer)) {
+                if (meta_tensor_is_external_host(node)) {
                     continue;
                 }
                 const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);
@@ -2480,12 +2576,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     const size_t hash_pos_ij = ggml_hash_insert(&cgraph_ij->visited_hash_set, node_ij);
                     cgraph_ij->use_counts[hash_pos_ij] = cgraph->use_counts[hash_pos_orig];
                 }
-                // A projected meta graph reuses tensor objects whose data
-                // pointers, view offsets, and shapes can change in place even
-                // while the parent graph UID remains stable. Keep the UID
-                // unset so backends such as CUDA compare node properties before
-                // reusing a captured executable graph.
-                cgraph_ij->uid = 0;
+                // Retain an executable identity only while every parent and
+                // dependency property matches. A rewrite rebuilds these projected
+                // tensors and assigns a new identity before capture can resume.
+                cgraph_ij->uid = ggml_graph_next_uid();
             }
         }
     }

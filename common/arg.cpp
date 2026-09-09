@@ -403,7 +403,10 @@ static llama_kvarn_type kvarn_type_from_bits(int32_t key_bits, int32_t value_bit
             string_format("kvarn_k%dv%d_g128", key_bits, value_bits).c_str());
 }
 
-static void parse_target_cache_type(common_params & params, bool key, const std::string & value) {
+static void parse_kvarn_cache_type(
+        ggml_type & backing_type,
+        int32_t & kvarn_bits_out,
+        const std::string & value) {
     const int32_t redirected_kvarn_bits = kvarn_bits_from_legacy_cache_type(value);
     const std::string cache_type = redirected_kvarn_bits != 0
         ? string_format("kvarn%d", redirected_kvarn_bits)
@@ -416,22 +419,29 @@ static void parse_target_cache_type(common_params & params, bool key, const std:
 
     const int32_t kvarn_bits = kvarn_bits_from_cache_type(cache_type);
     if (kvarn_bits != 0) {
-        if (key) {
-            params.cache_kvarn_bits_k = kvarn_bits;
-            params.cache_type_k = kvarn_fallback_cache_type(kvarn_bits);
-        } else {
-            params.cache_kvarn_bits_v = kvarn_bits;
-            params.cache_type_v = kvarn_fallback_cache_type(kvarn_bits);
-        }
+        kvarn_bits_out = kvarn_bits;
+        backing_type = kvarn_fallback_cache_type(kvarn_bits);
         return;
     }
 
+    kvarn_bits_out = 0;
+    backing_type = kv_cache_type_from_str(cache_type);
+}
+
+static void parse_target_cache_type(common_params & params, bool key, const std::string & value) {
     if (key) {
-        params.cache_kvarn_bits_k = 0;
-        params.cache_type_k = kv_cache_type_from_str(cache_type);
+        parse_kvarn_cache_type(params.cache_type_k, params.cache_kvarn_bits_k, value);
     } else {
-        params.cache_kvarn_bits_v = 0;
-        params.cache_type_v = kv_cache_type_from_str(cache_type);
+        parse_kvarn_cache_type(params.cache_type_v, params.cache_kvarn_bits_v, value);
+    }
+}
+
+static void parse_draft_cache_type(common_params & params, bool key, const std::string & value) {
+    auto & draft = params.speculative.draft;
+    if (key) {
+        parse_kvarn_cache_type(draft.cache_type_k, draft.cache_kvarn_bits_k, value);
+    } else {
+        parse_kvarn_cache_type(draft.cache_type_v, draft.cache_kvarn_bits_v, value);
     }
 }
 
@@ -1106,6 +1116,11 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         ));
     }
 
+    // if the preserve_reasoning kwarg was not specified explicitly, enable it by default
+    if (!params.default_template_kwargs.count("preserve_reasoning")) {
+        params.default_template_kwargs["preserve_reasoning"] = "true";
+    }
+
     return true;
 }
 
@@ -1420,27 +1435,29 @@ static utf8_argv make_utf8_argv() {
 }
 #endif
 
-static void common_params_kvarn_normalize(common_params & params) {
-    int32_t key_bits = params.cache_kvarn_bits_k;
-    int32_t value_bits = params.cache_kvarn_bits_v;
-    const int32_t swa_key_bits = params.cache_kvarn_swa_bits_k;
-    const int32_t swa_value_bits = params.cache_kvarn_swa_bits_v;
+static void common_kvarn_pair_normalize(
+        ggml_type & cache_type_k,
+        ggml_type & cache_type_v,
+        int32_t & cache_kvarn_bits_k,
+        int32_t & cache_kvarn_bits_v,
+        llama_kvarn_params & kvarn,
+        const char * option_k,
+        const char * option_v) {
+    int32_t key_bits = cache_kvarn_bits_k;
+    int32_t value_bits = cache_kvarn_bits_v;
 
     if (key_bits == 0 && value_bits == 0) {
-        if (swa_key_bits != 0 || swa_value_bits != 0) {
-            throw std::invalid_argument("KVarN SWA cache overrides require KVarN --cache-type-k and --cache-type-v");
-        }
-        params.kvarn = llama_kvarn_default_params();
+        kvarn = llama_kvarn_default_params();
         return;
     }
 
     if (key_bits == 0) {
-        LOG_WRN("warning: --cache-type-v uses KVarN but --cache-type-k is %s; forcing K to kvarn%d\n",
-                kv_cache_type_name(params.cache_type_k), value_bits);
+        LOG_WRN("warning: %s uses KVarN but %s is %s; forcing K to kvarn%d\n",
+                option_v, option_k, kv_cache_type_name(cache_type_k), value_bits);
         key_bits = value_bits;
     } else if (value_bits == 0) {
-        LOG_WRN("warning: --cache-type-k uses KVarN but --cache-type-v is %s; forcing V to kvarn%d\n",
-                kv_cache_type_name(params.cache_type_v), key_bits);
+        LOG_WRN("warning: %s uses KVarN but %s is %s; forcing V to kvarn%d\n",
+                option_k, option_v, kv_cache_type_name(cache_type_v), key_bits);
         value_bits = key_bits;
     }
 
@@ -1450,11 +1467,34 @@ static void common_params_kvarn_normalize(common_params & params) {
                 "invalid KVarN cache type combination: kvarn%d/kvarn%d", key_bits, value_bits));
     }
 
-    params.kvarn = llama_kvarn_params_for_type(type);
-    params.cache_kvarn_bits_k = key_bits;
-    params.cache_kvarn_bits_v = value_bits;
-    params.cache_type_k = kvarn_fallback_cache_type(key_bits);
-    params.cache_type_v = kvarn_fallback_cache_type(value_bits);
+    kvarn = llama_kvarn_params_for_type(type);
+    cache_kvarn_bits_k = key_bits;
+    cache_kvarn_bits_v = value_bits;
+    cache_type_k = kvarn_fallback_cache_type(key_bits);
+    cache_type_v = kvarn_fallback_cache_type(value_bits);
+}
+
+static void common_params_kvarn_normalize(common_params & params) {
+    const int32_t swa_key_bits = params.cache_kvarn_swa_bits_k;
+    const int32_t swa_value_bits = params.cache_kvarn_swa_bits_v;
+
+    if (params.cache_kvarn_bits_k == 0 && params.cache_kvarn_bits_v == 0 &&
+            (swa_key_bits != 0 || swa_value_bits != 0)) {
+        throw std::invalid_argument("KVarN SWA cache overrides require KVarN --cache-type-k and --cache-type-v");
+    }
+
+    common_kvarn_pair_normalize(
+            params.cache_type_k,
+            params.cache_type_v,
+            params.cache_kvarn_bits_k,
+            params.cache_kvarn_bits_v,
+            params.kvarn,
+            "--cache-type-k",
+            "--cache-type-v");
+
+    if (params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED) {
+        return;
+    }
 
     if ((swa_key_bits == 0) != (swa_value_bits == 0)) {
         throw std::invalid_argument("KVarN SWA cache overrides require both --cache-type-k-swa and --cache-type-v-swa");
@@ -1473,6 +1513,18 @@ static void common_params_kvarn_normalize(common_params & params) {
     if (params.grp_attn_n != 1) {
         throw std::invalid_argument("KVarN does not support Self-Extend/group attention; use --grp-attn-n 1");
     }
+}
+
+static void common_params_draft_kvarn_normalize(common_params & params) {
+    auto & draft = params.speculative.draft;
+    common_kvarn_pair_normalize(
+            draft.cache_type_k,
+            draft.cache_type_v,
+            draft.cache_kvarn_bits_k,
+            draft.cache_kvarn_bits_v,
+            draft.kvarn,
+            "--spec-draft-type-k",
+            "--spec-draft-type-v");
 }
 
 static common_speculative_dm_controller common_speculative_dm_controller_from_name(const std::string & value) {
@@ -1526,6 +1578,8 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             exit(0);
         }
         common_params_kvarn_normalize(ctx_arg.params);
+        common_params_draft_kvarn_normalize(ctx_arg.params);
+        common_validate_draft_kvarn_mode(ctx_arg.params.speculative);
         ctx_arg.params.lr.init();
         common_validate_reasoning_loop_guard_params(ctx_arg.params.reasoning_loop_guard);
         ctx_arg.params.sampling.reasoning_budget_tracking =
@@ -1869,6 +1923,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_CTX_SIZE"));
+    add_opt(common_arg(
+        { "--kv-unified-per-slot" }, "N",
+        "context limit per parallel slot (default: unset, behavior unchanged).\n"
+        "when set without -c/--ctx-size, the shared KV pool is sized to n_parallel*N",
+        [](common_params & params, int value) {
+            params.kv_unified_per_slot = value;
+        }
+    ).set_env("LLAMA_ARG_KV_UNIFIED_PER_SLOT").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
         {"-n", "--predict", "--n-predict"}, "N",
         string_format(
@@ -2982,18 +3044,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_LOAD_MODE"));
     add_opt(common_arg(
-        {"--tensor-read-lazy"}, "MODE",
+        {"-lzm", "--lazy-mode"}, "MODE",
         "on-demand reading of certain tensors, for example per-layer embeddings (default: auto)\n"
         "- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)\n"
         "- auto: on, but only for tensors larger than 4 GiB\n"
         "- off: always keep them resident",
         [](common_params & params, const std::string & value) {
-            /**/ if (value == "on")   { params.tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_ON;   }
-            else if (value == "auto") { params.tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_AUTO; }
-            else if (value == "off")  { params.tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_OFF;  }
+            /**/ if (value == "on")   { params.lazy_mode = LLAMA_LAZY_MODE_ON;   }
+            else if (value == "auto") { params.lazy_mode = LLAMA_LAZY_MODE_AUTO; }
+            else if (value == "off")  { params.lazy_mode = LLAMA_LAZY_MODE_OFF;  }
             else { throw std::invalid_argument("invalid value"); }
         }
-    ).set_env("LLAMA_ARG_TENSOR_READ_LAZY"));
+    ).set_env("LLAMA_ARG_LAZY_MODE"));
     add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
@@ -3823,6 +3885,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                     LOG_WRN("Setting 'enable_thinking' via --chat-template-kwargs is deprecated. "
                             "Use --reasoning on / --reasoning off instead.\n");
                 }
+                if (item.key() == "preserve_reasoning") {
+                    LOG_WRN("Setting 'preserve_reasoning' via --chat-template-kwargs is deprecated. "
+                            "Use --reasoning-preserve / --no-reasoning-preserve instead.\n");
+                }
                 params.default_template_kwargs[item.key()] = item.value().dump();
             }
         }
@@ -4063,7 +4129,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--reasoning-preserve"},
         {"--no-reasoning-preserve"},
-        "preserve reasoning trace in the full history, not just the last assistant message (default: template default)\n"
+        "preserve reasoning trace in the full history, not just the last assistant message (default: enabled)\n"
         "compatible with certain templates having 'supports_preserve_reasoning' capability\n"
         "example: https://docs.z.ai/guides/capabilities/thinking-mode#preserved-thinking",
         [](common_params & params, bool value) {
@@ -4072,6 +4138,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             } else {
                 params.default_template_kwargs["preserve_reasoning"] = "false";
             }
+            params.preserve_reasoning_specified = true;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_PRESERVE"));
     add_opt(common_arg(
@@ -4211,6 +4278,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             common_log_set_file(common_log_main(), value.c_str());
         }
     ).set_env("LLAMA_ARG_LOG_FILE"));
+    add_opt(common_arg(
+        {"--log-jsonl"},
+        {"--no-log-jsonl"},
+        "Log as JSONL (one JSON object per line) to stdout, this also disables colored logging (default: disabled)",
+        [](common_params &, bool value) {
+            common_log_set_jsonl(common_log_main(), value);
+        }
+    ).set_env("LLAMA_ARG_LOG_JSONL"));
     add_opt(common_arg(
         {"--log-prompts-dir"}, "PATH",
         "Log prompts to directory (auto-created if not present; only used for debugging, default: disabled)",
@@ -4500,12 +4575,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format(
             "KV cache data type for K for the draft model\n"
             "allowed values: %s\n"
+            "KVarN values require one model-backed speculative mode with an owned draft KV cache\n"
             "(default: %s)",
-            get_all_kv_cache_types().c_str(),
+            get_all_kv_cache_types(/*include_kvarn_pseudo_types =*/ true).c_str(),
             kv_cache_type_name(params.speculative.draft.cache_type_k)
         ),
         [](common_params & params, const std::string & value) {
-            params.speculative.draft.cache_type_k = kv_cache_type_from_str(value);
+            parse_draft_cache_type(params, /*key =*/ true, value);
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K"));
     add_opt(common_arg(
@@ -4513,12 +4589,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format(
             "KV cache data type for V for the draft model\n"
             "allowed values: %s\n"
+            "KVarN values require one model-backed speculative mode with an owned draft KV cache\n"
             "(default: %s)",
-            get_all_kv_cache_types().c_str(),
+            get_all_kv_cache_types(/*include_kvarn_pseudo_types =*/ true).c_str(),
             kv_cache_type_name(params.speculative.draft.cache_type_v)
         ),
         [](common_params & params, const std::string & value) {
-            params.speculative.draft.cache_type_v = kv_cache_type_from_str(value);
+            parse_draft_cache_type(params, /*key =*/ false, value);
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V"));
     add_opt(common_arg(
