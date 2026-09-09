@@ -2810,20 +2810,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         ).set_env("LLAMA_ARG_N_PARALLEL"));
     }
     add_opt(common_arg(
-        {"-mcs", "--max-concurrent-streams"}, "N",
-        string_format("max concurrent streams the decode workspace and output buffers are reserved for (default: %d, 0 = -np/--parallel)\n"
-            "caps the graph activations/QKV workspace and the logits/sampling buffers\n"
-            "independently of -np/--parallel, which still controls KV slot capacity and RAM\n"
-            "prompt-cache slots. Must be <= -np; at runtime the server never batches more\n"
-            "concurrent streams than this", params.n_seq_active),
-        [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("error: max-concurrent-streams must be non-negative (0 = follow -np/--parallel)\n");
-            }
-            params.n_seq_active = value;
-        }
-    ).set_env("LLAMA_ARG_MAX_CONCURRENT_STREAMS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PERPLEXITY}));
-    add_opt(common_arg(
         {"-ns", "--sequences"}, "N",
         string_format("number of sequences to decode (default: %d)", params.n_sequences),
         [](common_params & params, int value) {

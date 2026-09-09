@@ -204,21 +204,6 @@ ever serve a single (or a few) concurrent streams but want many cached-prompt
 slots, cap the number of simultaneously-active streams the workspace is
 reserved for:
 
-```sh
-# Many RAM-cached prompt slots, but the decode workspace and output buffers are
-# reserved for a single concurrently-active stream.
-llama-server -m model.gguf --kv-unified -np 8 \
-  --cache-ram 16384 --max-concurrent-streams 1
-```
-
-`--max-concurrent-streams` (`-mcs`, also usable from `llama-cli`, bench, and
-perplexity) caps the worst-case number of simultaneously-active streams used to
-reserve the decode workspace (graph activations / QKV buffers) and the host
-logits/sampling output buffers, independent of `-np`/`--parallel` (which
-continues to control KV slot capacity and RAM prompt-cache slots). It must be
-`<= -np`; at runtime the server never batches more active streams than this into
-a single decode.
-
 ### DFlash Speculative Decoding
 
 ```sh
