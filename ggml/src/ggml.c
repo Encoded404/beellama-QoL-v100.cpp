@@ -1151,6 +1151,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+    "MARS_STATS",
 };
 
 static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
@@ -1176,7 +1177,6 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "cumsum(x)",
     "Σx/n",
     "argmax(x)",
-    "mars_stats(x)",
     "count_equal(x)",
     "repeat(x)",
     "repeat_back(x)",

@@ -34,12 +34,12 @@ static std::string capture_stderr(const std::function<void()> & fn) {
     const int stderr_fd = _fileno(stderr);
     const int saved_fd  = _dup(stderr_fd);
     assert(saved_fd >= 0);
-    assert(_dup2(_fileno(capture), stderr_fd) == 0);
+    assert(_dup2(_fileno(capture), stderr_fd) == stderr_fd);
 #else
     const int stderr_fd = fileno(stderr);
     const int saved_fd  = dup(stderr_fd);
     assert(saved_fd >= 0);
-    assert(dup2(fileno(capture), stderr_fd) == 0);
+    assert(dup2(fileno(capture), stderr_fd) == stderr_fd);
 #endif
 
     fn();
@@ -53,10 +53,10 @@ static std::string capture_stderr(const std::function<void()> & fn) {
     }
 
 #ifdef _WIN32
-    assert(_dup2(saved_fd, stderr_fd) == 0);
+    assert(_dup2(saved_fd, stderr_fd) == stderr_fd);
     _close(saved_fd);
 #else
-    assert(dup2(saved_fd, stderr_fd) == 0);
+    assert(dup2(saved_fd, stderr_fd) == stderr_fd);
     close(saved_fd);
 #endif
     fclose(capture);

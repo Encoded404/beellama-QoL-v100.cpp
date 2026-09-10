@@ -117,7 +117,7 @@ int main(int argc, char ** argv) {
         "wide MMA tile must retain shape and device-resource fallbacks");
 
     const auto cuda_caps = ggml_cuda_fattn_kvarn_select_capabilities({
-        GGML_CUDA_FATTN_KVARN_BACKEND_CUDA, 32, true, true, 1024, 48*1024, 4*1024,
+        GGML_CUDA_FATTN_KVARN_BACKEND_CUDA, 32, true, true, true, 1024, 48*1024, 4*1024,
     });
     ok &= expect(cuda_caps.generic_mma && cuda_caps.decode_split && cuda_caps.decode_vector &&
                  cuda_caps.portable_native && cuda_caps.specialized_routes &&
@@ -128,7 +128,7 @@ int main(int argc, char ** argv) {
         "Turing-or-newer CUDA must expose independent portable and specialized KVarN capabilities");
 
     const auto pre_turing_cuda_caps = ggml_cuda_fattn_kvarn_select_capabilities({
-        GGML_CUDA_FATTN_KVARN_BACKEND_CUDA, 32, false, true, 1024, 48*1024, 4*1024,
+        GGML_CUDA_FATTN_KVARN_BACKEND_CUDA, 32, false, false, true, 1024, 48*1024, 4*1024,
     });
     ok &= expect(!pre_turing_cuda_caps.generic_mma &&
                  !pre_turing_cuda_caps.decode_split &&
@@ -143,7 +143,7 @@ int main(int argc, char ** argv) {
         "pre-Turing CUDA must retain unbounded portable rotated-domain KVarN attention");
 
     const auto low_shared_cuda_caps = ggml_cuda_fattn_kvarn_select_capabilities({
-        GGML_CUDA_FATTN_KVARN_BACKEND_CUDA, 32, false, true, 1024, 2*1024, 4*1024,
+        GGML_CUDA_FATTN_KVARN_BACKEND_CUDA, 32, false, false, true, 1024, 2*1024, 4*1024,
     });
     ok &= expect(!low_shared_cuda_caps.store_materialize &&
                  !low_shared_cuda_caps.portable_native &&
@@ -151,20 +151,20 @@ int main(int argc, char ** argv) {
         "CUDA with insufficient shared memory must fail KVarN capabilities closed");
 
     const auto low_threads_cuda_caps = ggml_cuda_fattn_kvarn_select_capabilities({
-        GGML_CUDA_FATTN_KVARN_BACKEND_CUDA, 32, false, true, 64, 48*1024, 4*1024,
+        GGML_CUDA_FATTN_KVARN_BACKEND_CUDA, 32, false, false, true, 64, 48*1024, 4*1024,
     });
     ok &= expect(!low_threads_cuda_caps.store_materialize &&
                  !low_threads_cuda_caps.portable_native,
         "CUDA unable to launch a 128-thread portable block must fail closed");
 
     const auto wrong_warp_cuda_caps = ggml_cuda_fattn_kvarn_select_capabilities({
-        GGML_CUDA_FATTN_KVARN_BACKEND_CUDA, 64, false, true, 1024, 48*1024, 4*1024,
+        GGML_CUDA_FATTN_KVARN_BACKEND_CUDA, 64, false, false, true, 1024, 48*1024, 4*1024,
     });
     ok &= expect(!wrong_warp_cuda_caps.portable_native,
         "CUDA portable KVarN attention must require the physical 32-thread warp contract");
 
     const auto disabled_cuda_caps = ggml_cuda_fattn_kvarn_select_capabilities({
-        GGML_CUDA_FATTN_KVARN_BACKEND_CUDA, 32, true, false, 1024, 48*1024, 4*1024,
+        GGML_CUDA_FATTN_KVARN_BACKEND_CUDA, 32, true, true, false, 1024, 48*1024, 4*1024,
     });
     ok &= expect(!disabled_cuda_caps.store_materialize &&
                  !disabled_cuda_caps.portable_native &&
@@ -172,7 +172,7 @@ int main(int argc, char ** argv) {
         "a build without KVarN instances must advertise no native route");
 
     const auto rdna_caps = ggml_cuda_fattn_kvarn_select_capabilities({
-        GGML_CUDA_FATTN_KVARN_BACKEND_HIP, 32, true, true, 1024, 48*1024, 4*1024,
+        GGML_CUDA_FATTN_KVARN_BACKEND_HIP, 32, true, true, true, 1024, 48*1024, 4*1024,
     });
     ok &= expect(rdna_caps.generic_mma && !rdna_caps.decode_split && !rdna_caps.decode_vector &&
                   rdna_caps.portable_native && rdna_caps.specialized_routes &&
@@ -184,7 +184,7 @@ int main(int argc, char ** argv) {
         "RDNA wave32 must expose generic/portable KVarN routes without NVIDIA-only split decode");
 
     const auto cdna_caps = ggml_cuda_fattn_kvarn_select_capabilities({
-        GGML_CUDA_FATTN_KVARN_BACKEND_HIP, 64, true, true, 1024, 48*1024, 4*1024,
+        GGML_CUDA_FATTN_KVARN_BACKEND_HIP, 64, true, true, true, 1024, 48*1024, 4*1024,
     });
     ok &= expect(cdna_caps.generic_mma && !cdna_caps.decode_split && !cdna_caps.decode_vector &&
                   cdna_caps.portable_native && cdna_caps.specialized_routes &&
@@ -248,7 +248,7 @@ int main(int argc, char ** argv) {
 #endif
 
     const auto old_amd_caps = ggml_cuda_fattn_kvarn_select_capabilities({
-        GGML_CUDA_FATTN_KVARN_BACKEND_HIP, 32, false, true, 1024, 48*1024, 4*1024,
+        GGML_CUDA_FATTN_KVARN_BACKEND_HIP, 32, false, false, true, 1024, 48*1024, 4*1024,
     });
     ok &= expect(!old_amd_caps.generic_mma && !old_amd_caps.decode_split &&
                  !old_amd_caps.decode_vector && old_amd_caps.portable_native &&
@@ -256,7 +256,7 @@ int main(int argc, char ** argv) {
         "AMD targets without WMMA/MFMA must remain portable-native");
 
     const auto musa_caps = ggml_cuda_fattn_kvarn_select_capabilities({
-        GGML_CUDA_FATTN_KVARN_BACKEND_MUSA, 32, false, true, 1024, 48*1024, 4*1024,
+        GGML_CUDA_FATTN_KVARN_BACKEND_MUSA, 32, false, false, true, 1024, 48*1024, 4*1024,
     });
     ok &= expect(!musa_caps.generic_mma && !musa_caps.decode_split &&
                  !musa_caps.decode_vector && musa_caps.portable_native &&
