@@ -1011,8 +1011,8 @@ int main(int argc, char ** argv) {
             const int il = out + 1;
             if (use_pca) {
                 const double real_frac = real_trace[out] > 0.0 ? eigenvalues[out][0] / real_trace[out] : 0.0;
-                const double real_ratio = (eigenvalues[out].size() > 1 && eigenvalues[out][1] > 0.0f)
-                                        ? eigenvalues[out][0] / eigenvalues[out][1] : 0.0;
+                const bool have_ratio = eigenvalues[out].size() > 1 && eigenvalues[out][1] > 0.0f;
+                const double real_ratio = have_ratio ? eigenvalues[out][0] / eigenvalues[out][1] : 0.0;
                 float max_resid = 0.0f;
                 for (float r : real_residual[out]) {
                     max_resid = std::max(max_resid, r);
@@ -1027,7 +1027,14 @@ int main(int argc, char ** argv) {
                         printf("            n/a");
                     }
                 }
-                printf("        %.4f", real_ratio);
+                if (have_ratio) {
+                    printf("        %.4f", real_ratio);
+                } else {
+                    // do NOT print 0.0 here: with a single extracted component lambda2 does not
+                    // exist, and a bare "0.0000" reads as a catastrophic measurement rather than
+                    // as "not computed"
+                    printf("        n/a (need --n-components 2)");
+                }
                 if (params.cvector_null_perms > 0) {
                     if (!null_ratio[out].empty()) {
                         const auto r = mean_sd(null_ratio[out]);

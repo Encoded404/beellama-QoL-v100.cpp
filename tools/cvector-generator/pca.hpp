@@ -63,7 +63,12 @@ struct pca_model {
 
     pca_model(struct ggml_tensor * t_input) {
 #ifdef GGML_USE_CUDA
-        fprintf(stderr, "%s: using CUDA backend\n", __func__);
+        // printed once rather than once per layer (and again per null permutation)
+        static bool logged_backend = false;
+        if (!logged_backend) {
+            fprintf(stderr, "%s: using CUDA backend\n", __func__);
+            logged_backend = true;
+        }
         backend = ggml_backend_cuda_init(0); // init device 0
         if (!backend) {
             fprintf(stderr, "%s: ggml_backend_cuda_init() failed\n", __func__);
