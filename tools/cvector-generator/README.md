@@ -176,5 +176,12 @@ Example to use output file with `llama-cli`:
 (Tips: The control vector works better when apply to layers higher than 10)
 
 ```sh
-./llama-cli -m ./llama-3.Q4_K_M.gguf -p "<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful assistant<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nSing a song<|im_end|><|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n" --special --control-vector-scaled ./control_vector.gguf 0.8 --control-vector-layer-range 10 31
+./llama-cli -m ./llama-3.Q4_K_M.gguf -p "<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful assistant<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nSing a song<|im_end|><|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n" --special --control-vector-scaled ./control_vector.gguf:0.8 --control-vector-layer-range 10 31
 ```
+
+Note the scale is attached with a **colon** (`FILE:SCALE`), not a space. Multiple vectors can be
+given comma-separated: `--control-vector-scaled a.gguf:0.8,b.gguf:1.2`.
+
+Positive scale pushes generation towards the **positive** prompt of each pair, because directions
+are oriented so that `dot(v, mean(pos) - mean(neg)) > 0`. To steer towards the negative side, use
+a negative scale.
