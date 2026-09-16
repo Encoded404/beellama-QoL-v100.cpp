@@ -8,40 +8,48 @@
 
 namespace mean {
 
-static void run(
-        const std::vector<struct ggml_tensor *> & v_input, // shape of v_input[0]: [n_embd, n_samples]
-        const std::vector<struct ggml_tensor *> & v_output) {
-    printf("%s: Running mean...\n", __func__);
-    for (size_t il = 0; il < v_input.size(); ++il) {
-        // prepare output vector
-        struct ggml_tensor * ctrl_out = v_output[il];
-        ggml_format_name(ctrl_out, "direction.%zu", il+1);
+// reduce a single layer to one direction by taking the mean of the sample rows.
+//
+// input  : shape [n_embd, n_samples], host-side F32 data
+// output : one vector of length n_embd, L2-normalized
+// prenorm: optional out-param, receives the norm of the mean vector *before* normalization.
+//          because the emitted vector is unit-length this is the only informative magnitude,
+//          and it is what a caller would need in order to compare across layers.
+static void run_layer(
+        struct ggml_tensor * input,
+        struct ggml_tensor * output,
+        float * prenorm = nullptr) {
+    GGML_ASSERT(input->type == GGML_TYPE_F32);
+    GGML_ASSERT(output->type == GGML_TYPE_F32);
 
-        // calculate mean vector
-        struct ggml_tensor * t_layer = v_input[il];
-        GGML_ASSERT(t_layer->ne[0] == ctrl_out->ne[0]); // == n_embd
-        for (int ic = 0; ic < t_layer->ne[0]; ic++) {
-            float f = 0.0;
-            for (int ir = 0; ir < t_layer->ne[1]; ir++) {
-                f += ggml_get_f32_nd(t_layer, ic, ir, 0, 0);
-            }
-            f /= t_layer->ne[1];
-            ggml_set_f32_1d(ctrl_out, ic, f);
+    // calculate mean vector
+    GGML_ASSERT(input->ne[0] == output->ne[0]); // == n_embd
+    for (int ic = 0; ic < input->ne[0]; ic++) {
+        float f = 0.0;
+        for (int ir = 0; ir < input->ne[1]; ir++) {
+            f += ggml_get_f32_nd(input, ic, ir, 0, 0);
         }
+        f /= input->ne[1];
+        ggml_set_f32_1d(output, ic, f);
+    }
 
-        // normalize output vector
-        float norm = 0.0;
-        for (int i = 0; i < ggml_nelements(ctrl_out); i++) {
-            float f = ggml_get_f32_1d(ctrl_out, i);
-            norm += f*f;
-        }
-        norm = sqrt(norm);
-        for (int i = 0; i < ggml_nelements(ctrl_out); i++) {
-            float f = ggml_get_f32_1d(ctrl_out, i);
-            ggml_set_f32_1d(ctrl_out, i, f / norm);
-        }
+    // normalize output vector
+    float norm = 0.0;
+    for (int i = 0; i < ggml_nelements(output); i++) {
+        float f = ggml_get_f32_1d(output, i);
+        norm += f*f;
+    }
+    norm = sqrt(norm);
 
-        printf("%s: Done layer %d / %d\n", __func__, (int) il+1, (int) v_input.size());
+    if (prenorm != nullptr) {
+        *prenorm = norm;
+    }
+
+    if (norm > 0.0f) {
+        for (int i = 0; i < ggml_nelements(output); i++) {
+            float f = ggml_get_f32_1d(output, i);
+            ggml_set_f32_1d(output, i, f / norm);
+        }
     }
 }
 

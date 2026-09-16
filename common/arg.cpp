@@ -4256,6 +4256,64 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_CVECTOR_GENERATOR}));
     add_opt(common_arg(
+        {"--pos-mode"}, "{all, last, range}",
+        "which token positions contribute to the difference vector (default: all)\n"
+        "  all   - position-by-position, over the range where BOTH prompts have real tokens\n"
+        "  last  - only the final token of each sequence (what CAA / ASC extract)\n"
+        "  range - positions [start, end) of each sequence (see --pos-range)",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "all")   { params.cvector_pos_mode = CVECTOR_POS_ALL;   }
+            else if (value == "last")  { params.cvector_pos_mode = CVECTOR_POS_LAST;  }
+            else if (value == "range") { params.cvector_pos_mode = CVECTOR_POS_RANGE; }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ).set_examples({LLAMA_EXAMPLE_CVECTOR_GENERATOR}));
+    add_opt(common_arg(
+        {"--pos-range"}, "START", "END",
+        "token position range for --pos-mode range: [START, END) within each unpadded sequence.\n"
+        "END accepts -1 to mean the end of the sequence (default: 0 -1)",
+        [](common_params & params, const std::string & start, const std::string & end) {
+            params.cvector_pos_start = std::stoi(start);
+            params.cvector_pos_end   = std::stoi(end);
+        }
+    ).set_examples({LLAMA_EXAMPLE_CVECTOR_GENERATOR}));
+    add_opt(common_arg(
+        {"--n-components"}, "N",
+        string_format("number of PCA components to extract per layer (default: %d).\n"
+                      "components 2..N are written to separate files derived from the output path",
+                      params.cvector_n_components),
+        [](common_params & params, int value) {
+            params.cvector_n_components = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CVECTOR_GENERATOR}));
+    add_opt(common_arg(
+        {"--null-permutations"}, "N",
+        string_format("run N pairing-breaking permutations to calibrate the PCA eigenvalue spectrum "
+                      "(default: %d = off).\n"
+                      "The null uses the same iteration budget as the main run and costs about N times as much.\n"
+                      "Note: permuting sample order or flipping pos/neg leaves the spectrum invariant, so only a\n"
+                      "pairing-breaking null is meaningful. It detects whether the identity pairing adds structure\n"
+                      "beyond arbitrary pairings; it cannot see a shared/mean direction, which is permutation-\n"
+                      "invariant. Compare against the mean_frac column printed by --stats.", params.cvector_null_perms),
+        [](common_params & params, int value) {
+            params.cvector_null_perms = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CVECTOR_GENERATOR}));
+    add_opt(common_arg(
+        {"--stats"},
+        "print per-layer vector norms and PCA eigenvalues",
+        [](common_params & params) {
+            params.cvector_stats = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CVECTOR_GENERATOR}));
+    add_opt(common_arg(
+        {"--no-hash"},
+        "skip SHA-256 hashing of the model file when writing provenance metadata",
+        [](common_params & params) {
+            params.cvector_no_hash = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CVECTOR_GENERATOR}));
+    add_opt(common_arg(
         {"--output-format"}, "{md,jsonl}",
         "output format for batched-bench results (default: md)",
         [](common_params & params, const std::string & value) {

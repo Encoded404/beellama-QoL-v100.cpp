@@ -135,6 +135,16 @@ enum dimre_method {
     DIMRE_METHOD_MEAN,
 };
 
+// token-position selection for cvector-generator.
+//   ALL   : compare pos/neg position-by-position over the padded sequence (legacy behaviour)
+//   LAST  : use only the final token of each sequence, unpadded (matches CAA / ASC extraction)
+//   RANGE : use positions [start, end) of each unpadded sequence
+enum cvector_position_mode {
+    CVECTOR_POS_ALL,
+    CVECTOR_POS_LAST,
+    CVECTOR_POS_RANGE,
+};
+
 enum common_conversation_mode {
     COMMON_CONVERSATION_MODE_DISABLED = 0,
     COMMON_CONVERSATION_MODE_ENABLED  = 1,
@@ -834,6 +844,13 @@ struct common_params {
     dimre_method cvector_dimre_method = DIMRE_METHOD_PCA;
     std::string cvector_positive_file = "tools/cvector-generator/positive.txt";
     std::string cvector_negative_file = "tools/cvector-generator/negative.txt";
+    cvector_position_mode cvector_pos_mode = CVECTOR_POS_ALL;
+    int  cvector_pos_start = 0;  // RANGE mode: first selected position (inclusive)
+    int  cvector_pos_end   = -1; // RANGE mode: last selected position (exclusive), -1 == end of sequence
+    int  cvector_n_components = 1;  // number of PCA components to extract per layer (1..n_pairs)
+    int  cvector_null_perms   = 0;  // if >0, run this many pairing-breaking permutations to calibrate the spectrum
+    bool cvector_stats        = false; // print per-layer norms / eigenvalues
+    bool cvector_no_hash      = false; // skip SHA-256 hashing of the model file when writing provenance
 
     bool spm_infill = false; // suffix/prefix/middle pattern for infill
 
