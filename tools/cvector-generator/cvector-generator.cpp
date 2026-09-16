@@ -671,6 +671,23 @@ int main(int argc, char ** argv) {
     printf("positions/pair:   %d (total samples: %d)\n", n_cols_first, ctx_train.n_samples);
     printf("longest sequence: %d tokens\n", max_decode_len);
 
+    // activations for every pair and every layer are held in host memory until the reduction, so
+    // the footprint grows with positions-per-pair. Say so before allocating rather than after.
+    {
+        const double gib = (double) (n_layers - 2) * ctx_train.n_pairs * ctx_train.n_samples *
+                           n_embd * sizeof(float) * 2.0 / (1024.0 * 1024.0 * 1024.0);
+        printf("capture estimate: %.2f GiB host RAM for %d layers x %d pairs x %d samples\n",
+               gib, n_layers - 2, ctx_train.n_pairs, ctx_train.n_samples);
+        if (gib > 8.0) {
+            fprintf(stderr,
+                    "warning: this run will hold ~%.1f GiB of activations in host RAM.\n"
+                    "         Reduce --pos-range, use --pos-mode last, or use fewer pairs.\n"
+                    "         (Storing positives and negatives separately is what makes the\n"
+                    "          pairing-breaking null possible; --null-permutations 0 would only\n"
+                    "          halve this, not fix the scaling.)\n", gib);
+        }
+    }
+
     if (n_layers - 2 <= 0) {
         fprintf(stderr, "error: model has too few layers (%d) for control vector extraction\n", n_layers);
         return 1;
