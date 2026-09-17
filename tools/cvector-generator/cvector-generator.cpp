@@ -762,18 +762,25 @@ int main(int argc, char ** argv) {
 
     // activations for every pair and every layer are held in host memory until the reduction, so
     // the footprint grows with positions-per-pair. Say so before allocating rather than after.
+    //
+    // a single layer holds pair_n_cols[pair] * n_embd floats for one pair, so summing over pairs
+    // gives n_samples * n_embd per side. n_pairs must NOT appear as a factor: n_samples is already
+    // the sum of the per-pair counts, and multiplying by n_pairs overstates this by a factor of
+    // n_pairs (with --pos-mode last that is one position per pair, so it is exactly n_pairs).
+    // the last layer may be absent on architectures that row-select it, so this is an upper bound.
     {
-        const double gib = (double) (n_layers - 2) * ctx_train.n_pairs * ctx_train.n_samples *
-                           n_embd * sizeof(float) * 2.0 / (1024.0 * 1024.0 * 1024.0);
-        printf("capture estimate: %.2f GiB host RAM for %d layers x %d pairs x %d samples\n",
-               gib, n_layers - 2, ctx_train.n_pairs, ctx_train.n_samples);
+        const double gib = (double) (n_layers - 1) * ctx_train.n_samples * n_embd *
+                           sizeof(float) * 2.0 / (1024.0 * 1024.0 * 1024.0);
+        printf("capture estimate: up to %.2f GiB host RAM for %d layers x %d samples\n",
+               gib, n_layers - 1, ctx_train.n_samples);
         if (gib > 8.0) {
             fprintf(stderr,
-                    "warning: this run will hold ~%.1f GiB of activations in host RAM.\n"
+                    "warning: this run will hold up to ~%.1f GiB of activations in host RAM.\n"
                     "         Reduce --pos-range, use --pos-mode last, or use fewer pairs.\n"
                     "         (Storing positives and negatives separately is what makes the\n"
                     "          pairing-breaking null possible; --null-permutations 0 would only\n"
-                    "          halve this, not fix the scaling.)\n", gib);
+                    "          halve this, not fix the scaling. --layers does not help here: it\n"
+                    "          releases unselected layers only after every layer is captured.)\n", gib);
         }
     }
 
