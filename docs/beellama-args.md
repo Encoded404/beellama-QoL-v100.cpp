@@ -304,6 +304,31 @@ configuration example.
 
 Use the same corpus, context, logical batch, and physical ubatch for both KLD legs.
 
+## Control vector layer selection
+
+`--layers` restricts `llama-cvector-generator` to a subset of the model's layers.
+Reduction cost is per layer and identical for each, and a PCA null pass multiplies
+it, so this is the main lever on extraction runtime. Layers left out are not
+reduced and not written; the runtime loader reads an absent `direction.N` as a zero
+vector, so a partial file applies cleanly and needs no placeholder tensors.
+
+| Argument | Env var | Default | Behavior |
+|---|---|---|---|
+| `--layers SPEC` | — | Every captured layer | `SPEC` is a comma-separated list of inclusive layer-index ranges, for example `1-8`, `58-59`, or `1-8,58-59`. An open-ended `N-` means `N` through the last steerable layer. Layer 0 is rejected; the usable range is `[1, n_layer-1]`. |
+
+Emitted vectors stay named `direction.N` with the true layer index, so a selected
+subset still lands on the intended layers at inference. Because
+`--control-vector-scaled` carries one scale per file and emitted vectors are
+L2-normalized, bands that need different scales belong in different files: the same
+numeric scale is a much larger perturbation at layer 2 than at layer 58. The
+`controlvector.layer_scale` array records the per-emitted-layer eigenvalue (PCA) or
+pre-normalization norm (mean) for choosing those scales. It is informational only —
+no control-vector metadata is read at load time, so scaling is always manual.
+
+See [cvector-generator](../tools/cvector-generator/README.md#layer-selection) for
+how to pick bands and why the bands that carry signal are not the ones you would
+guess.
+
 ## CUDA FlashAttention build policy
 
 | Argument | Env var | Default | Behavior |

@@ -18,10 +18,13 @@ Related PRs:
 ./cvector-generator -m ./llama-3.Q4_K_M.gguf -ngl 99
 
 # With advanced options
-./cvector-generator -m ./llama-3.Q4_K_M.gguf -ngl 99 --pca-iter 2000 --pca-batch 100
+./cvector-generator -m ./llama-3.Q4_K_M.gguf -ngl 99 --pca-iter 2000 --n-components 3
 
 # Using mean value instead of PCA
 ./cvector-generator -m ./llama-3.Q4_K_M.gguf --method mean
+
+# Only the layers you intend to steer (the reduction is per layer, so this is much faster)
+./cvector-generator -m ./llama-3.Q4_K_M.gguf --pos-mode last --layers 1-8
 
 # To see help message
 ./cvector-generator -h
@@ -75,13 +78,55 @@ final layer is capturable:
 All layers between 1 and `M` are required; only the final layer may be absent. A missing interior
 layer is an error rather than a silently truncated vector set.
 
+## Layer selection
+
+`--layers SPEC` restricts the reduction and the output file to a subset of the layers, where
+`SPEC` is comma-separated inclusive ranges: `1-8`, `58-59`, `1-8,58-59`. An open-ended `N-` means
+`N` through the last steerable layer.
+
+This is the main lever on runtime. **The reduction dominates, and every layer costs the same** —
+`--null-permutations` multiplies that cost by the permutation count, and each null run extracts two
+components regardless of `--n-components`. Reducing 10 of 60 layers is roughly a 6x saving.
+`--pca-iter` is not a lever: it is a cap that any layer with a decent eigenvalue gap reaches long
+before, which is visible in `--stats` as a terminal residual just under the tolerance.
+
+Selecting layers is also not purely an optimization. Layers differ enormously in whether they
+carry a usable direction, and averaging over the ones that do not is how a vector ends up being
+mostly noise. `--stats` prints the three columns to select on:
+
+| column | meaning | what to look for |
+|---|---|---|
+| `mean_frac` | fraction of the scatter mass lying along `mean(pos) - mean(neg)` | high — most prompt pairs agree on one direction |
+| `real l1/trace` vs `null l1/trace` | does the pairing add top-component mass beyond arbitrary pairings of the same negatives | `real` clearly above `null` |
+| `real l1/l2` vs `null l1/l2` | is the top direction dominant relative to chance | `real` above `null` |
+
+Read `mean_frac` first. It is permutation-invariant, so the null cannot see it, and it is what
+governs whether one added direction is a fair summary of the difference. A layer can show `real`
+far above `null` and still have `mean_frac` near zero: that is a real shared direction which is
+*not* the mean direction. In that regime `mean_frac` also bounds how many prompts are actually
+contributing — if the pairwise differences were perfectly aligned, `mean_frac` would equal
+`k/n` where `k` is the number of prompts carrying the mean component, so `mean_frac` 0.05 over
+32 pairs means two or three prompts. Treat those layers as a separate experiment, not as part of a
+band.
+
+Bands needing different scales must go in **separate files**. Emitted vectors are L2-normalized,
+so one numeric `--control-vector-scaled` scale is a much larger perturbation at layer 2 than at
+layer 58, and the scale is per file. Use `controlvector.layer_scale` to set the ratio between
+bands. Note that **no metadata is read at load time** — `common_control_vector_load_one` reads only
+the `direction.N` tensors and ignores `layer_scale` completely — so this is always manual.
+
+Absent layers are safe. The loader zero-fills them (`result.data.resize(max(size, n_embd*idx), 0)`)
+and `llama_adapter_cvec::tensor_for` gates on the requested range, so a missing `direction.N` is
+simply a zero vector and adding it is a no-op. A subset file needs no placeholders. Emitted tensors
+keep the true layer index in their name, so a subset still lands on the right layers at inference.
+
 ## Provenance
 
 Every written file carries metadata describing how it was produced:
 
 - `controlvector.source_model_path` / `source_model_sha256` / `source_model_desc` / `source_model_size`
 - `controlvector.positive_file` / `positive_sha256`, `negative_file` / `negative_sha256`
-- `controlvector.method`, `pos_mode`, `pos_start`, `pos_end`, `n_pairs`, `n_cols`, `n_samples`
+- `controlvector.method`, `pos_mode`, `layers`, `pos_start`, `pos_end`, `n_pairs`, `n_cols`, `n_samples`
 - `controlvector.n_components`, `component_index`, `pca_batch`, `pca_iterations`
 - `controlvector.n_embd`, `layer_first`, `layer_scale`
 
@@ -161,6 +206,12 @@ positions, so it must be combined with `--pos-mode last` or a fixed `--pos-range
   that deflating by the Rayleigh quotient is only the true rank-1 update once the iteration has
   converged; with a small `--pca-iter` on a near-degenerate spectrum the extracted eigenvalues
   are not guaranteed to be ordered.
+- `--pca-batch` is inert in this tree: `pca_params::n_batch` is set from it and never read, since
+  the batched-graph path that used it for the iteration count was removed. It is accepted only for
+  command-line compatibility and is still recorded in the provenance metadata. Nothing in the
+  tool reads control-vector metadata back at load time either — `layer_scale`, `method`, and the
+  rest are documentation, and the applied scale is always the one you pass to
+  `--control-vector-scaled`.
 
 ## Tips and tricks
 

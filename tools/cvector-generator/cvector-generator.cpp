@@ -63,10 +63,17 @@ static void print_usage(int, char ** argv) {
     printf("                %s -m ./llama-3.Q4_K_M.gguf --pos-mode last\n", argv[0]);
     printf("\n    top-3 components with a pairing-breaking null:\n");
     printf("                %s -m ./llama-3.Q4_K_M.gguf --pos-mode last --n-components 3 --null-permutations 16 --stats\n", argv[0]);
+    printf("\n    only the layers you intend to steer (much faster; the reduction is per layer):\n");
+    printf("                %s -m ./llama-3.Q4_K_M.gguf --pos-mode last --layers 1-8\n", argv[0]);
     printf("\n");
     printf("note: emitted vectors are named `direction.N` and are applied to the residual\n");
     printf("      stream *at the end of layer N*, i.e. direction.N == the activation it was\n");
     printf("      measured from (l_out-N). layer 0 is not steerable and is not emitted.\n");
+    printf("      --layers restricts which N are reduced and written; layers left out are simply\n");
+    printf("      absent from the file and read back as zero, so a banded file applies cleanly.\n");
+    printf("      That is the intended way to give a band its own scale: --control-vector-scaled\n");
+    printf("      carries one scale per file, so bands that need different scales need different\n");
+    printf("      files.\n");
     printf("\n");
 }
 
@@ -175,6 +182,86 @@ static const char * pos_mode_name(cvector_position_mode m) {
         case CVECTOR_POS_RANGE: return "range";
     }
     return "?";
+}
+
+//////////////////////////////////////////////////
+// layer selection
+
+// comma-separated inclusive ranges, e.g. "1-8", "58-59" or "1-8,58-59".
+// an empty spec is accepted and means "the caller decides" (every captured layer).
+static bool parse_layer_spec(const std::string & spec, int n_layers, std::vector<int> & out) {
+    out.clear();
+    if (spec.empty()) {
+        return true;
+    }
+
+    std::istringstream ss(spec);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {
+        const size_t b = tok.find_first_not_of(" \t");
+        const size_t e = tok.find_last_not_of(" \t");
+        if (b == std::string::npos) {
+            fprintf(stderr, "error: --layers: empty entry in '%s'\n", spec.c_str());
+            return false;
+        }
+        tok = tok.substr(b, e - b + 1);
+
+        int first = 0;
+        int last  = 0;
+        const size_t dash = tok.find('-');
+        try {
+            if (dash == std::string::npos) {
+                first = last = std::stoi(tok);
+            } else {
+                first = std::stoi(tok.substr(0, dash));
+                const std::string rhs = tok.substr(dash + 1);
+                last = rhs.empty() ? n_layers - 1 : std::stoi(rhs); // "58-" == 58 to the last steerable layer
+            }
+        } catch (...) {
+            fprintf(stderr, "error: --layers: cannot parse '%s' in '%s' (expected N or N-M, comma-separated)\n",
+                    tok.c_str(), spec.c_str());
+            return false;
+        }
+
+        // layer 0 is never steerable, so the usable range is [1, n_layers-1]
+        if (first < 1 || last < first || last > n_layers - 1) {
+            fprintf(stderr, "error: --layers: range %d-%d is outside the steerable range [1, %d]\n",
+                    first, last, n_layers - 1);
+            return false;
+        }
+        for (int il = first; il <= last; ++il) {
+            out.push_back(il);
+        }
+    }
+
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+
+    if (out.empty()) {
+        fprintf(stderr, "error: --layers: '%s' selects no layers\n", spec.c_str());
+        return false;
+    }
+    return true;
+}
+
+// render a sorted layer list back as "1-8,58-59", collapsing consecutive runs
+static std::string format_layer_list(const std::vector<int> & layers) {
+    std::string s;
+    for (size_t i = 0; i < layers.size(); ) {
+        size_t j = i;
+        while (j + 1 < layers.size() && layers[j + 1] == layers[j] + 1) {
+            ++j;
+        }
+        if (!s.empty()) {
+            s += ",";
+        }
+        s += to_string_(layers[i]);
+        if (j != i) {
+            s += "-" + to_string_(layers[j]);
+        }
+        i = j + 1;
+    }
+    return s;
 }
 
 struct tokenized_prompt {
@@ -401,6 +488,7 @@ struct provenance {
 
     std::string method;
     std::string pos_mode;
+    std::string layers; // the emitted layer bands, e.g. "1-8"
     int pos_start = 0;
     int pos_end   = -1;
     int n_pairs   = 0;
@@ -445,6 +533,7 @@ static void export_gguf(
 
     gguf_set_val_str(ctx, (arch + ".method").c_str(),   prov.method.c_str());
     gguf_set_val_str(ctx, (arch + ".pos_mode").c_str(), prov.pos_mode.c_str());
+    gguf_set_val_str(ctx, (arch + ".layers").c_str(),   prov.layers.c_str());
     gguf_set_val_u32(ctx, (arch + ".pos_start").c_str(), (uint32_t) prov.pos_start);
     // written as i32: the convention is that a negative END means "end of sequence", which would be
     // lost if this were stored as an unsigned value
@@ -824,13 +913,42 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // --- 6. reduce ---
+    // --- 6. choose which layers to reduce ---
+    std::vector<int> sel;
+    if (!parse_layer_spec(params.cvector_layers, n_layers, sel)) {
+        return 1;
+    }
+    if (sel.empty()) {
+        for (int il = 1; il <= il_last; ++il) {
+            sel.push_back(il);
+        }
+    } else {
+        for (int il : sel) {
+            if (il > il_last) {
+                fprintf(stderr, "error: --layers asks for layer %d but the highest captured layer is %d\n",
+                        il, il_last);
+                return 1;
+            }
+        }
+    }
+
+    // release the activations of layers that will not be reduced: each holds
+    // 2 * n_pairs * n_cols * n_embd floats and they are the bulk of the resident memory here
+    for (int il = 1; il <= il_last; ++il) {
+        if (!std::binary_search(sel.begin(), sel.end(), il)) {
+            ctx_train.pos_data[il].clear();
+            ctx_train.pos_data[il].shrink_to_fit();
+            ctx_train.neg_data[il].clear();
+            ctx_train.neg_data[il].shrink_to_fit();
+        }
+    }
+
     const bool use_pca = params.cvector_dimre_method == DIMRE_METHOD_PCA;
 
     const int n_components = params.cvector_n_components;
-    const int n_out_layers = il_last; // layers 1 .. il_last -> direction.1 .. direction.il_last
+    const int n_out_layers = (int) sel.size();
 
-    printf("layers emitted:   %d (direction.1 .. direction.%d)\n", n_out_layers, n_out_layers);
+    printf("layers reduced:   %d (direction.%s)\n", n_out_layers, format_layer_list(sel).c_str());
     if (il_last < n_layers - 1) {
         printf("note:              the final layer (l_out-%d) was row-selected by this architecture "
                "and is not emitted\n", n_layers - 1);
@@ -869,18 +987,20 @@ int main(int argc, char ** argv) {
     struct ggml_tensor * t_in_mean = ggml_new_tensor_2d(ctx_host, GGML_TYPE_F32, n_embd, n_samples_total);
     struct ggml_tensor * t_mean    = ggml_new_tensor_1d(ctx_host, GGML_TYPE_F32, n_embd);
 
-    // one output tensor per emitted layer, reused for every component
+    // one output tensor per emitted layer, reused for every component.
+    // the name carries the *layer index*, not the output position, so a selected
+    // subset still lands on the right layer at inference
     std::vector<struct ggml_tensor *> t_dirs(n_out_layers);
     for (int out = 0; out < n_out_layers; ++out) {
         t_dirs[out] = ggml_new_tensor_1d(ctx_host, GGML_TYPE_F32, n_embd);
-        ggml_format_name(t_dirs[out], "direction.%d", out + 1);
+        ggml_format_name(t_dirs[out], "direction.%d", sel[out]);
     }
 
     PCA::pca_params pca_params;
     pca_params.n_threads    = params.cpuparams.n_threads;
     pca_params.n_batch      = params.n_pca_batch;
     pca_params.n_iterations = params.n_pca_iterations;
-    pca_params.n_layers     = n_out_layers;
+    pca_params.n_layers     = n_layers;
     pca_params.verbose      = false;
 
     PCA::pca_params null_params = pca_params;
@@ -891,8 +1011,8 @@ int main(int argc, char ** argv) {
 
     std::mt19937 rng(1234);
 
-    for (int il = 1; il <= il_last; ++il) {
-        const int out = il - 1;
+    for (int out = 0; out < n_out_layers; ++out) {
+        const int il = sel[out];
 
         std::vector<int> perm_id(ctx_train.n_pairs);
         std::iota(perm_id.begin(), perm_id.end(), 0);
@@ -922,7 +1042,7 @@ int main(int argc, char ** argv) {
             GGML_ASSERT((size_t) ggml_nelements(t_in_pca) == embd_major.size());
             t_in_pca->data = embd_major.data();
 
-            pca_params.i_layer = out;
+            pca_params.i_layer = il - 1;
             PCA::run_layer(pca_params, t_in_pca, n_components, false, dirs[out], eigenvalues[out],
                            &real_residual[out]);
 
@@ -963,7 +1083,7 @@ int main(int argc, char ** argv) {
 
                     std::vector<std::vector<float>> ndirs;
                     std::vector<float> nev;
-                    null_params.i_layer = out;
+                    null_params.i_layer = il - 1;
                     PCA::run_layer(null_params, t_in_pca, 2, true, ndirs, nev);
 
                     const double ntrace = scatter_trace(ns);
@@ -1025,7 +1145,7 @@ int main(int argc, char ** argv) {
             printf("\n");
         }
         for (int out = 0; out < n_out_layers; ++out) {
-            const int il = out + 1;
+            const int il = sel[out];
             if (use_pca) {
                 const double real_frac = real_trace[out] > 0.0 ? eigenvalues[out][0] / real_trace[out] : 0.0;
                 const bool have_ratio = eigenvalues[out].size() > 1 && eigenvalues[out][1] > 0.0f;
@@ -1076,7 +1196,7 @@ int main(int argc, char ** argv) {
                 for (float r : real_residual[out]) {
                     if (r > worst) {
                         worst = r;
-                        worst_layer = out + 1;
+                        worst_layer = sel[out];
                     }
                 }
             }
@@ -1109,6 +1229,7 @@ int main(int argc, char ** argv) {
     prov.neg_file    = params.cvector_negative_file;
     prov.method      = use_pca ? "pca" : "mean";
     prov.pos_mode    = pos_mode_name(spec.mode);
+    prov.layers      = format_layer_list(sel);
     prov.pos_start   = spec.start;
     prov.pos_end     = spec.end;
     prov.n_pairs     = ctx_train.n_pairs;
@@ -1119,7 +1240,7 @@ int main(int argc, char ** argv) {
     prov.n_pca_iterations = params.n_pca_iterations;
     prov.n_layers    = n_layers;
     prov.n_embd      = n_embd;
-    prov.layer_first = 1;
+    prov.layer_first = sel.front();
 
     // hashes of the *effective* prompt sets (after escape processing and blank-line skipping)
     prov.pos_sha256 = sha256_of_string([&] {

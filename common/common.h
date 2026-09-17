@@ -851,6 +851,11 @@ struct common_params {
     int  cvector_null_perms   = 0;  // if >0, run this many pairing-breaking permutations to calibrate the spectrum
     bool cvector_stats        = false; // print per-layer norms / eigenvalues
     bool cvector_no_hash      = false; // skip SHA-256 hashing of the model file when writing provenance
+    // which layers to reduce and emit, as comma-separated inclusive ranges, e.g. "1-8" or "1-8,58-59".
+    // empty means every captured layer. reduction is per layer and each layer costs the same, so
+    // restricting this is the main lever on runtime; unemitted layers are simply absent from the
+    // output file, which the loader treats as zero.
+    std::string cvector_layers = "";
 
     bool spm_infill = false; // suffix/prefix/middle pattern for infill
 

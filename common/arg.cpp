@@ -4314,6 +4314,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_CVECTOR_GENERATOR}));
     add_opt(common_arg(
+        {"--layers"}, "SPEC",
+        "restrict the reduction and the output file to SPEC, a comma-separated list of inclusive\n"
+        "ranges, e.g. '1-8' or '1-8,58-59' (default: every captured layer)\n"
+        "Reduction cost is per layer and identical for each, so this is the main lever on runtime;\n"
+        "layers left out are simply absent from the file, which the loader treats as a zero vector,\n"
+        "so a partial set applies cleanly at inference. Use this to put bands that need different\n"
+        "scales into separate files, since --control-vector-scaled takes one scale per file.",
+        [](common_params & params, const std::string & value) {
+            params.cvector_layers = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CVECTOR_GENERATOR}));
+    add_opt(common_arg(
         {"--output-format"}, "{md,jsonl}",
         "output format for batched-bench results (default: md)",
         [](common_params & params, const std::string & value) {
