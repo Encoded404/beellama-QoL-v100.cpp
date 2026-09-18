@@ -56,6 +56,11 @@ struct llama_cparams {
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
+    // [n_layer()] extract the K/V rows that each selected layer writes to its KV
+    // cache. used to record a frozen target model's attention inputs so a draft
+    // head can be trained against them offline.
+    std::vector<bool> kv_dump_layers;
+
     enum llama_context_type ctx_type;
     enum llama_rope_scaling_type rope_scaling_type;
     enum llama_pooling_type pooling_type;

@@ -1543,6 +1543,44 @@ float * llama_context::get_embeddings_layer_inp(uint32_t lid) {
     return embd_layer_inp[lid].data;
 }
 
+float * llama_context::get_kv_dump_k(size_t i) {
+    output_reorder();
+
+    if (i >= kv_dump_k.size() || !kv_dump_k[i].has_data()) {
+        return nullptr;
+    }
+
+    return kv_dump_k[i].data;
+}
+
+float * llama_context::get_kv_dump_v(size_t i) {
+    output_reorder();
+
+    if (i >= kv_dump_v.size() || !kv_dump_v[i].has_data()) {
+        return nullptr;
+    }
+
+    return kv_dump_v[i].data;
+}
+
+size_t llama_context::get_kv_dump_n_layers() const {
+    return kv_dump_layers.size();
+}
+
+int32_t llama_context::get_kv_dump_layer(size_t i) const {
+    GGML_ASSERT(i < kv_dump_layers.size());
+
+    return kv_dump_layers[i];
+}
+
+uint32_t llama_context::get_kv_dump_n_embd_k(size_t i) const {
+    return model.hparams.n_embd_k_gqa(get_kv_dump_layer(i));
+}
+
+uint32_t llama_context::get_kv_dump_n_embd_v(size_t i) const {
+    return model.hparams.n_embd_v_gqa(get_kv_dump_layer(i));
+}
+
 llama_token llama_context::get_sampled_token_ith(int32_t idx) {
     output_reorder();
 
@@ -1738,6 +1776,47 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     cparams.embeddings_layer_inp[lid] = enable;
 
     // note: without this reserve, the draft acceptance drops to zero. not sure why - this is unexpected
+    sched_need_reserve = true;
+}
+
+void llama_context::set_kv_dump_layers(const std::vector<int32_t> & layers) {
+    const auto & hparams = model.hparams;
+
+    std::vector<int32_t> selected;
+    selected.reserve(layers.size());
+
+    for (int32_t il : layers) {
+        if (il < 0 || il >= (int32_t) hparams.n_layer()) {
+            throw std::runtime_error(format("%s: layer %d out of range [0, %d)",
+                        __func__, il, (int32_t) hparams.n_layer()));
+        }
+
+        if (std::find(selected.begin(), selected.end(), il) != selected.end()) {
+            continue;
+        }
+
+        selected.push_back(il);
+    }
+
+    std::sort(selected.begin(), selected.end());
+
+    cparams.kv_dump_layers.assign(hparams.n_layer(), false);
+    for (int32_t il : selected) {
+        cparams.kv_dump_layers[il] = true;
+
+        if (!hparams.has_kv(il)) {
+            LLAMA_LOG_WARN("%s: layer %d does not compute its own K/V (it reuses an earlier layer); nothing will be dumped for it\n",
+                    __func__, il);
+        }
+    }
+
+    kv_dump_layers = selected;
+    kv_dump_k.assign(selected.size(), buffer_view<float>{nullptr, 0});
+    kv_dump_v.assign(selected.size(), buffer_view<float>{nullptr, 0});
+
+    LLAMA_LOG_INFO("%s: selected %zu layer(s) for K/V dumping\n", __func__, selected.size());
+
+    // the new outputs change the graph and the host buffers must be re-sized
     sched_need_reserve = true;
 }
 
@@ -2126,6 +2205,9 @@ int llama_context::encode(const llama_batch & batch_inp) {
         GGML_ASSERT(n_tokens*n_embd <= (int64_t) embd_nextn.size);
         ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data, 0, n_tokens*n_embd*sizeof(float));
     }
+
+    // extract the per-layer K/V rows selected for dumping
+    extract_kv_dump(res, 0, n_tokens);
 
     // TODO: hacky solution
     if (model.arch == LLM_ARCH_T5 && t_embd) {
@@ -2525,6 +2607,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
 
+        extract_kv_dump(res, n_tokens_prev, ubatch.n_tokens);
+
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
         {
@@ -2668,6 +2752,12 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         }
     }
 
+    size_t kv_dump_float_count = 0;
+
+    for (int32_t il : kv_dump_layers) {
+        kv_dump_float_count += ((size_t) hparams.n_embd_k_gqa(il) + (size_t) hparams.n_embd_v_gqa(il)) * n_batch;
+    }
+
     // Allocate backend sampling output buffers if there are backend samplers configured.
     const bool has_sampling = !sampling.samplers.empty();
     if (has_sampling) {
@@ -2682,7 +2772,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
     const size_t new_size  =
-        (logits.size + embd.size + embd_nextn.size + embd_layer_inp_float_count + backend_float_count) * sizeof(float) +
+        (logits.size + embd.size + embd_nextn.size + embd_layer_inp_float_count + kv_dump_float_count + backend_float_count) * sizeof(float) +
         (                                                                         backend_token_count) * sizeof(llama_token);
 
     // alloc only when more than the current capacity is required
@@ -2702,6 +2792,10 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             embd_nextn.data = nullptr;
             for (auto & layer_inp : embd_layer_inp) {
                 layer_inp = {nullptr, 0};
+            }
+            for (size_t i = 0; i < kv_dump_k.size(); ++i) {
+                kv_dump_k[i] = {nullptr, 0};
+                kv_dump_v[i] = {nullptr, 0};
             }
         }
 
@@ -2741,6 +2835,16 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         } else {
             embd_layer_inp[il] = buffer_view<float>{nullptr, 0};
         }
+    }
+
+    for (size_t i = 0; i < kv_dump_layers.size(); ++i) {
+        const int32_t il = kv_dump_layers[i];
+
+        kv_dump_k[i] = buffer_view<float>{(float *) (base + offset), (size_t) hparams.n_embd_k_gqa(il) * n_batch};
+        offset += kv_dump_k[i].size * sizeof(float);
+
+        kv_dump_v[i] = buffer_view<float>{(float *) (base + offset), (size_t) hparams.n_embd_v_gqa(il) * n_batch};
+        offset += kv_dump_v[i].size * sizeof(float);
     }
 
     if (has_sampling) {
@@ -2821,6 +2925,51 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
         GGML_ASSERT(backend != nullptr);
         ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
+    }
+}
+
+void llama_context::extract_kv_dump(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
+    if (kv_dump_layers.empty() || n_tokens == 0) {
+        return;
+    }
+
+    for (size_t i = 0; i < kv_dump_layers.size(); ++i) {
+        const int il = kv_dump_layers[i];
+
+        for (int which = 0; which < 2; ++which) {
+            ggml_tensor * t = which == 0 ? res->get_kv_dump_k(il) : res->get_kv_dump_v(il);
+            buffer_view<float> & buf = which == 0 ? kv_dump_k[i] : kv_dump_v[i];
+
+            // the layer did not emit this tensor (for example it caches K only,
+            // or it reuses an earlier layer's K/V)
+            if (t == nullptr || !buf.has_data()) {
+                continue;
+            }
+
+            GGML_ASSERT(t->type == GGML_TYPE_F32);
+
+            // the host buffer is sized from n_embd_k/v_gqa(il); a layer whose
+            // cached K/V is not that wide (an MLA-style latent cache, say) is
+            // reported rather than silently mis-packed
+            const size_t n_floats   = ggml_nelements(t);
+            const size_t row_floats = buf.size / cparams.n_batch;
+
+            if (n_floats != n_tokens*row_floats) {
+                LLAMA_LOG_ERROR("%s: layer %d: %s holds %zu floats for %zu tokens, expected %zu per token; "
+                        "skipping the K/V dump for this layer\n",
+                        __func__, il, which == 0 ? "K" : "V", n_floats, n_tokens, row_floats);
+                continue;
+            }
+
+            const size_t dst_offset = token_offset * row_floats;
+
+            GGML_ASSERT(dst_offset + n_floats <= buf.size);
+
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+            GGML_ASSERT(backend != nullptr);
+
+            ggml_backend_tensor_get_async(backend, t, buf.data + dst_offset, 0, n_floats*sizeof(float));
+        }
     }
 }
 
@@ -4927,6 +5076,40 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
+}
+
+void llama_set_kv_dump_layers(llama_context * ctx, const int32_t * layers, size_t n_layers) {
+    const std::vector<int32_t> selected(layers, layers + n_layers);
+
+    ctx->set_kv_dump_layers(selected);
+}
+
+size_t llama_get_kv_dump_n_layers(llama_context * ctx) {
+    return ctx->get_kv_dump_n_layers();
+}
+
+int32_t llama_get_kv_dump_layer(llama_context * ctx, size_t i) {
+    return ctx->get_kv_dump_layer(i);
+}
+
+uint32_t llama_get_kv_dump_n_embd_k(llama_context * ctx, size_t i) {
+    return ctx->get_kv_dump_n_embd_k(i);
+}
+
+uint32_t llama_get_kv_dump_n_embd_v(llama_context * ctx, size_t i) {
+    return ctx->get_kv_dump_n_embd_v(i);
+}
+
+float * llama_get_kv_dump_k(llama_context * ctx, size_t i) {
+    ctx->synchronize();
+
+    return ctx->get_kv_dump_k(i);
+}
+
+float * llama_get_kv_dump_v(llama_context * ctx, size_t i) {
+    ctx->synchronize();
+
+    return ctx->get_kv_dump_v(i);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

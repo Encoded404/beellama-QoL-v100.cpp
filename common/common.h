@@ -726,6 +726,10 @@ struct common_params {
     std::string dump_outdir = ".";  // directory for the per-document .npz dump files
     std::string dump_format = "plain"; // extra arrays per token: "plain" (ids+labels),
                                        // "roles" (+roles int32), "turns" (+roles, turn_id)
+    std::string dump_kv_layers = "";   // per-layer KV rows to dump: "" (none), a comma-separated
+                                       // list of layer indices, or "all"
+    std::string dump_dtype = "f32";    // on-disk dtype for the hidden/KV arrays: "f32" or "f16"
+    bool        dump_hidden = true;    // dump the target hidden state (llama_get_embeddings_nextn)
 
     // server params
     int32_t port                = 8080;          // server listens on this network port

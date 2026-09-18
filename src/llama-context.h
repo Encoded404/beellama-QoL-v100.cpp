@@ -93,6 +93,15 @@ struct llama_context {
 
     float * get_embeddings_layer_inp(uint32_t lid);
 
+    // i-th layer selected via set_kv_dump_layers, in ascending layer order
+    float * get_kv_dump_k(size_t i);
+    float * get_kv_dump_v(size_t i);
+
+    size_t   get_kv_dump_n_layers() const;
+    int32_t  get_kv_dump_layer(size_t i) const;
+    uint32_t get_kv_dump_n_embd_k(size_t i) const;
+    uint32_t get_kv_dump_n_embd_v(size_t i) const;
+
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
 
@@ -118,6 +127,7 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+    void set_kv_dump_layers(const std::vector<int32_t> & layers);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -239,6 +249,10 @@ private:
     // from backend into host-side embd_layer_inp buffers
     void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
 
+    // async-copy the K/V rows of every layer selected by cparams.kv_dump_layers
+    // from backend into the host-side kv_dump_k / kv_dump_v buffers
+    void extract_kv_dump(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+
     //
     // graph
     //
@@ -308,6 +322,12 @@ private:
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
+
+    // layers selected for K/V dumping, ascending, and their host buffers
+    // each buffer holds [n_batch][n_embd_k_gqa(il)] / [n_batch][n_embd_v_gqa(il)]
+    std::vector<int32_t>            kv_dump_layers;
+    std::vector<buffer_view<float>> kv_dump_k;
+    std::vector<buffer_view<float>> kv_dump_v;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

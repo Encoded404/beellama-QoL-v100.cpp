@@ -1721,6 +1721,12 @@ void llm_graph_result::reset() {
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
 
+    t_kv_dump_k.resize(LLAMA_MAX_LAYERS + 1);
+    std::fill(t_kv_dump_k.begin(), t_kv_dump_k.end(), nullptr);
+
+    t_kv_dump_v.resize(LLAMA_MAX_LAYERS + 1);
+    std::fill(t_kv_dump_v.begin(), t_kv_dump_v.end(), nullptr);
+
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -1762,6 +1768,16 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     }
     if (t_h_nextn != nullptr) {
         ggml_set_output(t_h_nextn);
+    }
+    for (auto * tensor : t_kv_dump_k) {
+        if (tensor != nullptr) {
+            ggml_set_output(tensor);
+        }
+    }
+    for (auto * tensor : t_kv_dump_v) {
+        if (tensor != nullptr) {
+            ggml_set_output(tensor);
+        }
     }
     {
         const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
@@ -3007,6 +3023,47 @@ ggml_tensor * llm_graph_context::build_attn_bias_tail(
     return ggml_permute(ctx0, tail, 1, 2, 0, 3);
 }
 
+bool llm_graph_context::wants_kv_dump(int il) const {
+    return il >= 0 && il < (int) cparams.kv_dump_layers.size() && cparams.kv_dump_layers[il];
+}
+
+void llm_graph_context::capture_kv_dump(ggml_tensor * k_cur, ggml_tensor * v_cur, int il) const {
+    if (!wants_kv_dump(il) || n_tokens <= 0) {
+        return;
+    }
+
+    // reshape to one row per token with the remaining dims contiguous - the
+    // layout the dump arrays are read back in
+    const auto to_rows = [&](ggml_tensor * cur, const char * tag) -> ggml_tensor * {
+        if (cur == nullptr) {
+            return nullptr;
+        }
+        if (cur->ne[2] != n_tokens || cur->ne[3] != 1) {
+            LLAMA_LOG_ERROR("%s: layer %d: unexpected %s shape [%d, %d, %d, %d] for %d tokens; "
+                    "skipping the K/V dump for this layer\n",
+                    __func__, il, tag,
+                    (int) cur->ne[0], (int) cur->ne[1], (int) cur->ne[2], (int) cur->ne[3], (int) n_tokens);
+            return nullptr;
+        }
+        if (cur->type != GGML_TYPE_F32) {
+            cur = ggml_cast(ctx0, cur, GGML_TYPE_F32);
+        }
+
+        // the row view is a new node, so it has to be part of the graph -
+        // otherwise the scheduler has nothing to allocate or compute
+        ggml_tensor * rows = ggml_reshape_2d(ctx0, ggml_cont(ctx0, cur), cur->ne[0]*cur->ne[1], n_tokens);
+        ggml_build_forward_expand(gf, rows);
+
+        return rows;
+    };
+
+    GGML_ASSERT((size_t) il < res->t_kv_dump_k.size());
+    GGML_ASSERT((size_t) il < res->t_kv_dump_v.size());
+
+    res->t_kv_dump_k[il] = to_rows(k_cur, "K");
+    res->t_kv_dump_v[il] = to_rows(v_cur, "V");
+}
+
 ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * q,
          ggml_tensor * k,
@@ -3345,6 +3402,9 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = k_cur;
     ggml_tensor * v = v_cur;
 
+    // no cache on this path - capture the K/V the layer attends over
+    capture_kv_dump(k_cur, v_cur, il);
+
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
@@ -3637,6 +3697,9 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v_tail_written = nullptr;
     const bool compact_tail = mctx_cur->has_compact_tail();
 
+    // capture the rows that will be stored, after any cache-domain transform
+    capture_kv_dump(k_cur, v_cur, il);
+
     // store to KV cache
     {
         const auto & k_idxs = inp->get_k_idxs();
@@ -3898,6 +3961,9 @@ ggml_tensor * llm_graph_context::build_attn(
     {
         const auto & k_idxs = inp->get_k_idxs();
 
+        // this layer caches K only and derives V from it - capture K alone
+        capture_kv_dump(k_cur, nullptr, il);
+
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
     }
 
@@ -3956,6 +4022,9 @@ ggml_tensor * llm_graph_context::build_attn(
     // store to KV cache
     {
         const auto & k_idxs = inp->get_k_idxs_mla();
+
+        // this layer caches K only and derives V from it - capture K alone
+        capture_kv_dump(k_cur, nullptr, il);
 
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
     }
@@ -4080,6 +4149,9 @@ ggml_tensor * llm_graph_context::build_attn(
     if (v_cur) {
         ggml_build_forward_expand(gf, v_cur);
     }
+
+    // capture the rows that will be stored, after any cache-domain transform
+    capture_kv_dump(k_cur, v_cur, il);
 
     ggml_tensor * k_tail_written = nullptr;
     ggml_tensor * v_tail_written = nullptr;
@@ -4325,6 +4397,9 @@ ggml_tensor * llm_graph_context::build_attn(
     // optionally store to KV cache
     if (k_cur) {
         const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
+
+        // this layer caches K only and derives V from it - capture K alone
+        capture_kv_dump(k_cur, nullptr, il);
 
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
     }

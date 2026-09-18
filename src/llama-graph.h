@@ -955,6 +955,7 @@ struct llm_graph_params {
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
+            cparams.kv_dump_layers          == other.cparams.kv_dump_layers          &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
             arch  == other.arch  &&
             gtype == other.gtype &&
@@ -983,6 +984,11 @@ public:
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
+
+    // per-layer K/V rows written to the KV cache, only when cparams.kv_dump_layers
+    // selects the layer - null otherwise
+    ggml_tensor * get_kv_dump_k(int il) const { return t_kv_dump_k[il]; }
+    ggml_tensor * get_kv_dump_v(int il) const { return t_kv_dump_v[il]; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -1018,6 +1024,11 @@ public:
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
     std::vector<ggml_tensor *> t_layer_inp;
+
+    // indexed by layer, sized [LLAMA_MAX_LAYERS + 1] like t_layer_inp
+    // rows are [n_embd_k_gqa(il), n_tokens] and [n_embd_v_gqa(il), n_tokens]
+    std::vector<ggml_tensor *> t_kv_dump_k;
+    std::vector<ggml_tensor *> t_kv_dump_v;
 
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_sampled_probs;
@@ -1259,6 +1270,22 @@ struct llm_graph_context {
     //
     // attention
     //
+
+    // true when cparams.kv_dump_layers selects layer il for K/V dumping
+    bool wants_kv_dump(int il) const;
+
+    // Expose the K/V rows that layer il hands to its KV cache (or directly to
+    // attention, when the layer runs without a cache) as graph outputs, so they
+    // can be copied to the host after the decode.
+    //
+    // The values are exactly the ones that end up stored - post-rope K, post-norm
+    // V, before any quantization implied by the cache type. This is called from
+    // the generic build_attn() paths, so any architecture that routes its
+    // attention through them can be dumped.
+    //
+    // Pass v_cur = nullptr for layers that do not store a separate V (MLA-style
+    // layers cache K only and derive V from it).
+    void capture_kv_dump(ggml_tensor * k_cur, ggml_tensor * v_cur, int il) const;
 
     ggml_tensor * build_attn_mha(
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]

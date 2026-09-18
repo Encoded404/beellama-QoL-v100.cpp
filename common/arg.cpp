@@ -5358,6 +5358,33 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.dump_format = value;
         }
     ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_DUMP_FORMAT"));
+    add_opt(common_arg(
+        {"--dump-hidden"},
+        {"--no-dump-hidden"},
+        string_format("dump the model's hidden state for every token (default: %s)\n"
+            "  the state comes from llama_get_embeddings_nextn(), so the architecture must expose it",
+            params.dump_hidden ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.dump_hidden = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_DUMP_HIDDEN"));
+    add_opt(common_arg(
+        {"--dump-kv-layers"}, "L0,L1,...|all",
+        "dump the K/V rows that the listed layers write to their KV cache (default: none)\n"
+        "  each selected layer adds two arrays per document: k_l<il> and v_l<il>,\n"
+        "  one row per token holding the post-rope K and the post-norm V as cached\n"
+        "  pass 'all' to select every layer; an empty value disables the K/V dump",
+        [](common_params & params, const std::string & value) {
+            params.dump_kv_layers = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_DUMP_KV_LAYERS"));
+    add_opt(common_arg(
+        {"--dump-dtype"}, "{f32,f16}",
+        string_format("on-disk dtype of the hidden and K/V dump arrays (default: %s)", params.dump_dtype.c_str()),
+        [](common_params & params, const std::string & value) {
+            params.dump_dtype = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_DUMP_DTYPE"));
 
     return ctx_arg;
 }

@@ -119,6 +119,38 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
 //
+// per-layer KV dumping
+//
+// When enabled, each decode copies the rows that the selected layers hand to
+// their KV cache into host buffers: one row per token in the batch, holding the
+// post-rope K and the post-norm V in the cache's own layout (but before any
+// quantization implied by the cache type). Those rows are the attention inputs a
+// shared-KV draft head consumes (for example the Gemma 4 MTP assistant), so a
+// frozen target can be recorded once and replayed offline by a trainer.
+//
+// layers is a list of layer indices; they are validated against the model and
+// de-duplicated, and the selection is kept in ascending order. An empty list
+// disables dumping.
+LLAMA_API void llama_set_kv_dump_layers(struct llama_context * ctx, const int32_t * layers, size_t n_layers);
+
+// Number of layers currently selected for KV dumping.
+LLAMA_API size_t llama_get_kv_dump_n_layers(struct llama_context * ctx);
+
+// Layer index of the i-th selected layer, in ascending order.
+LLAMA_API int32_t llama_get_kv_dump_layer(struct llama_context * ctx, size_t i);
+
+// Per-token row width of the dumped K and V for the i-th selected layer.
+LLAMA_API uint32_t llama_get_kv_dump_n_embd_k(struct llama_context * ctx, size_t i);
+LLAMA_API uint32_t llama_get_kv_dump_n_embd_v(struct llama_context * ctx, size_t i);
+
+// Host buffers holding n_tokens rows of n_embd_k/v floats for the i-th selected
+// layer, in batch token order. Valid until the next decode.
+// Returns nullptr for a layer that does not emit the requested tensor - V is
+// absent for layers that cache K only and derive V from it.
+LLAMA_API float * llama_get_kv_dump_k(struct llama_context * ctx, size_t i);
+LLAMA_API float * llama_get_kv_dump_v(struct llama_context * ctx, size_t i);
+
+//
 // model/context data extraction
 //
 
