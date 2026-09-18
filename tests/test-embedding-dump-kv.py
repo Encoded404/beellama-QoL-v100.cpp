@@ -178,6 +178,22 @@ def main() -> None:
         "dequantized q8_0 must track the f32 output"
     )
 
+    # --- resume ---------------------------------------------------------------
+    # a long dump has to be restartable, so a re-run with --skip-existing must
+    # leave the documents that are already on disk untouched
+    resume = work / "resume"
+    before = {f.name: (f.stat().st_mtime_ns, f.stat().st_size)
+              for f in dump_ok(dump, model, corpus, resume, ["--dump-kv-layers", "0", "-b", "64"])}
+
+    proc = run_dump(dump, model, corpus, resume,
+                    ["--dump-kv-layers", "0", "-b", "64", "--skip-existing"])
+    assert proc.returncode == 0, f"resume run failed:\n{proc.stdout}\n{proc.stderr}"
+    assert "skipped" in proc.stdout + proc.stderr, "a resume run must report what it skipped"
+
+    after = {f.name: (f.stat().st_mtime_ns, f.stat().st_size)
+             for f in sorted(resume.glob("*.npz"))}
+    assert after == before, "an existing dump must not be rewritten when --skip-existing is set"
+
     # --- rejected input ------------------------------------------------------
     bad = run_dump(dump, model, corpus, work / "bad", ["--dump-kv-layers", "4096", "-b", "64"])
     assert bad.returncode != 0, "an out-of-range layer index must be rejected"

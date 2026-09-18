@@ -576,7 +576,23 @@ int main(int argc, char ** argv) {
 
     const llama_token eos_token = llama_vocab_eos(vocab);
 
+    size_t n_skipped = 0;
+
     for (size_t doc_idx = 0; doc_idx < docs.size(); ++doc_idx) {
+        // document N always maps to the same file, so --skip-existing resumes an
+        // interrupted run instead of redoing it.
+        // note: build the path as a std::string - a fixed-size buffer silently
+        // truncates a long --output-dir and writes the archive elsewhere
+        char base[32];
+        snprintf(base, sizeof(base), "%06zu.npz", doc_idx);
+
+        const std::string fpath = params.dump_outdir + "/" + base;
+
+        if (params.dump_skip_existing && fs::exists(fpath)) {
+            ++n_skipped;
+            continue;
+        }
+
         const auto & msgs = docs[doc_idx];
 
         // apply the chat template (adds generation prompt; tokenization happens next)
@@ -778,13 +794,6 @@ int main(int argc, char ** argv) {
             entries.push_back({ "turn_id", std::move(npy_turn) });
         }
 
-        // note: build the path as a std::string - a fixed-size buffer silently
-        // truncates a long --output-dir and writes the archive elsewhere
-        char base[32];
-        snprintf(base, sizeof(base), "%06zu.npz", doc_idx);
-
-        const std::string fpath = params.dump_outdir + "/" + base;
-
         auto npz = make_npz(entries);
 
         if (!write_file(fpath, npz)) {
@@ -795,6 +804,11 @@ int main(int argc, char ** argv) {
         LOG_INF("%s: doc %zu: wrote %s (%lld tokens, %lld KiB)\n",
                 __func__, doc_idx, fpath.c_str(), (long long) n_total,
                 (long long) (npz.size() / 1024));
+    }
+
+    if (n_skipped > 0) {
+        LOG_INF("%s: skipped %zu of %zu documents that were already dumped\n",
+                __func__, n_skipped, docs.size());
     }
 
     llama_batch_free(batch);

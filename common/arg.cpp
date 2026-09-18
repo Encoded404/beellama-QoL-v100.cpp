@@ -5379,6 +5379,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_DUMP_KV_LAYERS"));
     add_opt(common_arg(
+        {"--skip-existing"},
+        {"--no-skip-existing"},
+        string_format("skip documents whose output file already exists (default: %s)\n"
+            "  document N always maps to the same file, so re-running with this set\n"
+            "  resumes an interrupted dump instead of starting over\n"
+            "  note: the check is by file name only, so resuming with different dump\n"
+            "  options leaves a directory mixing both sets of arrays",
+            params.dump_skip_existing ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.dump_skip_existing = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_DUMP_SKIP_EXISTING"));
+    add_opt(common_arg(
         {"--dump-dtype"}, "{f32,f16,q8_0}",
         string_format("on-disk dtype of the hidden and K/V dump arrays (default: %s)\n"
             "  q8_0 matches the block format a q8_0 KV cache stores and is written as two\n"

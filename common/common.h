@@ -730,6 +730,7 @@ struct common_params {
                                        // list of layer indices, or "all"
     std::string dump_dtype = "f16";    // on-disk dtype for the hidden/KV arrays: "f32", "f16" or "q8_0"
     bool        dump_hidden = true;    // dump the target hidden state (llama_get_embeddings_nextn)
+    bool        dump_skip_existing = false; // skip documents whose .npz already exists (resume a long run)
 
     // server params
     int32_t port                = 8080;          // server listens on this network port
