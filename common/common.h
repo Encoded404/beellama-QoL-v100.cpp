@@ -729,6 +729,7 @@ struct common_params {
     std::string dump_kv_layers = "";   // per-layer KV rows to dump: "" (none), a comma-separated
                                        // list of layer indices, or "all"
     std::string dump_dtype = "f16";    // on-disk dtype for the hidden/KV arrays: "f32", "f16" or "q8_0"
+    std::string dump_hidden_dtype = ""; // dtype for the hidden state alone; "" follows dump_dtype
     bool        dump_hidden = true;    // dump the target hidden state (llama_get_embeddings_nextn)
     bool        dump_skip_existing = false; // skip documents whose .npz already exists (resume a long run)
 

@@ -16,6 +16,11 @@ The checks below are self-contained and need no reference implementation:
   post-rope K must therefore differ between them, while V, which is never
   rotated, must be bit-identical. That is what distinguishes the cache
   representation from the raw projections.
+
+The hidden-state dump is not covered here: the fixture model has no MTP head, so
+it does not expose the post-final-norm hidden state at all (the tool fails loudly
+in that case). The shared float-array writer it uses is exercised for every
+supported dtype through the K/V arrays.
 """
 
 import argparse

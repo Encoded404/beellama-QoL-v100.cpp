@@ -5402,6 +5402,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.dump_dtype = value;
         }
     ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_DUMP_DTYPE"));
+    add_opt(common_arg(
+        {"--dump-hidden-dtype"}, "{f32,f16,q8_0}",
+        "on-disk dtype of the hidden-state array alone (default: follow --dump-dtype)\n"
+        "  the captured K/V is the representation a KV cache holds, so matching a q8_0\n"
+        "  cache with q8_0 storage reflects what the model really reads. the hidden\n"
+        "  state is not part of the cache and stays exact at serving, so quantizing it\n"
+        "  only adds error that serving does not have - keep it at f16",
+        [](common_params & params, const std::string & value) {
+            params.dump_hidden_dtype = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_DUMP_HIDDEN_DTYPE"));
 
     return ctx_arg;
 }

@@ -473,10 +473,22 @@ int main(int argc, char ** argv) {
         LOG_ERR("%s: invalid --dump-format '%s' (expected plain, roles or turns)\n", __func__, params.dump_format.c_str());
         return 1;
     }
-    if (params.dump_dtype != "f32" && params.dump_dtype != "f16" && params.dump_dtype != "q8_0") {
+    const auto valid_dtype = [](const std::string & d) {
+        return d == "f32" || d == "f16" || d == "q8_0";
+    };
+
+    if (!valid_dtype(params.dump_dtype)) {
         LOG_ERR("%s: invalid --dump-dtype '%s' (expected f32, f16 or q8_0)\n", __func__, params.dump_dtype.c_str());
         return 1;
     }
+    if (!params.dump_hidden_dtype.empty() && !valid_dtype(params.dump_hidden_dtype)) {
+        LOG_ERR("%s: invalid --dump-hidden-dtype '%s' (expected f32, f16 or q8_0)\n", __func__, params.dump_hidden_dtype.c_str());
+        return 1;
+    }
+
+    // the hidden state is not part of the KV cache and stays exact at serving, so
+    // by default it follows the general dtype rather than being quantized with it
+    const std::string hidden_dtype = params.dump_hidden_dtype.empty() ? params.dump_dtype : params.dump_hidden_dtype;
 
     // nextn hidden states require per-token (unpooled) output
     params.embedding   = false;
@@ -746,7 +758,7 @@ int main(int argc, char ** argv) {
         std::vector<std::pair<std::string, std::vector<uint8_t>>> entries;
 
         if (params.dump_hidden) {
-            if (!add_float_array(entries, params.dump_dtype, "hidden", n_total, n_embd_out, hidden.data())) {
+            if (!add_float_array(entries, hidden_dtype, "hidden", n_total, n_embd_out, hidden.data())) {
                 return 1;
             }
         }
