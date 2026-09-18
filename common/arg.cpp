@@ -5379,8 +5379,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_DUMP_KV_LAYERS"));
     add_opt(common_arg(
-        {"--dump-dtype"}, "{f32,f16}",
-        string_format("on-disk dtype of the hidden and K/V dump arrays (default: %s)", params.dump_dtype.c_str()),
+        {"--dump-dtype"}, "{f32,f16,q8_0}",
+        string_format("on-disk dtype of the hidden and K/V dump arrays (default: %s)\n"
+            "  q8_0 matches the block format a q8_0 KV cache stores and is written as two\n"
+            "  arrays per value: an int8 payload plus its per-32-value f16 scales in\n"
+            "  '<name>_scales' (dequantize with qs * scales.repeat(32, axis=-1))",
+            params.dump_dtype.c_str()),
         [](common_params & params, const std::string & value) {
             params.dump_dtype = value;
         }

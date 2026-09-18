@@ -184,21 +184,91 @@ static bool write_file(const std::string & path, const std::vector<uint8_t> & da
     return written == data.size();
 }
 
-// Serialize a float array using the requested dump dtype. The dump targets a
-// training corpus that is typically much larger than the model, so the dtype is
-// selectable: f16 halves the on-disk size at a negligible cost for activations.
-static std::vector<uint8_t> make_npy_floats(
+// Serialize one float array into `entries` using the requested dump dtype.
+//
+// The dump is normally far larger than the model, so the dtype is the main
+// lever on disk usage: f16 halves f32 at a negligible cost for activations, and
+// q8_0 is roughly half of f16 again.
+//
+// q8_0 uses ggml's own block format, which is what a q8_0 KV cache stores, so
+// the values are bit-identical to the ones a deployment would actually read.
+// numpy has no block-quantized dtype, so it is written as two plain arrays: the
+// int8 payload named <name>, plus the per-32-value f16 scales named
+// <name>_scales. Dequantize with `qs * scales.repeat(32, axis=-1)`.
+//
+// Returns false if the array cannot be represented in the requested dtype.
+static bool add_float_array(
+        std::vector<std::pair<std::string, std::vector<uint8_t>>> & entries,
         const std::string & dtype,
-        const std::vector<int64_t> & shape,
-        const float * data,
-        size_t n) {
-    if (dtype == "f16") {
-        std::vector<ggml_fp16_t> half(n);
-        ggml_fp32_to_fp16_row(data, half.data(), (int64_t) n);
-        return make_npy("<f2", shape, half.data(), n * sizeof(ggml_fp16_t));
+        const std::string & name,
+        int64_t n_rows,
+        int64_t n_per_row,
+        const float * data) {
+    const int64_t n = n_rows*n_per_row;
+
+    if (dtype == "q8_0") {
+        const int64_t blck  = ggml_blck_size(GGML_TYPE_Q8_0);
+        const int64_t bsize = (int64_t) ggml_type_size(GGML_TYPE_Q8_0);
+
+        if (n_per_row % blck != 0) {
+            LOG_ERR("%s: '%s' has %lld values per row, which q8_0 blocks of %lld cannot represent; "
+                    "use f16 or f32 for this array\n",
+                    __func__, name.c_str(), (long long) n_per_row, (long long) blck);
+            return false;
+        }
+
+        // ggml's block layout: a f16 scale followed by the 8-bit quants
+        if (bsize != (int64_t) sizeof(ggml_fp16_t) + blck) {
+            LOG_ERR("%s: unexpected q8_0 block size %lld\n", __func__, (long long) bsize);
+            return false;
+        }
+
+        const int64_t n_scales_row = n_per_row / blck;
+        const int64_t n_blocks     = n_rows * n_scales_row;
+
+        std::vector<uint8_t> raw(n_blocks * bsize);
+
+        const size_t written = ggml_quantize_chunk(
+                GGML_TYPE_Q8_0, data, raw.data(), 0, n_rows, n_per_row, nullptr);
+
+        if (written != raw.size()) {
+            LOG_ERR("%s: quantizing '%s' to q8_0 wrote %zu of %zu bytes\n",
+                    __func__, name.c_str(), written, raw.size());
+            return false;
+        }
+
+        std::vector<int8_t>      qs(n);
+        std::vector<ggml_fp16_t> scales(n_blocks);
+
+        for (int64_t b = 0; b < n_blocks; ++b) {
+            const uint8_t * blk = raw.data() + b*bsize;
+
+            memcpy(&scales[b], blk, sizeof(ggml_fp16_t));
+            memcpy(qs.data() + b*blck, blk + sizeof(ggml_fp16_t), blck);
+        }
+
+        entries.push_back({ name,
+                make_npy("|i1", { n_rows, n_per_row },    qs.data(),     qs.size()) });
+        entries.push_back({ name + "_scales",
+                make_npy("<f2", { n_rows, n_scales_row }, scales.data(), scales.size()*sizeof(ggml_fp16_t)) });
+
+        return true;
     }
 
-    return make_npy("<f4", shape, data, n * sizeof(float));
+    if (dtype == "f16") {
+        std::vector<ggml_fp16_t> half(n);
+        ggml_fp32_to_fp16_row(data, half.data(), n);
+
+        entries.push_back({ name,
+                make_npy("<f2", { n_rows, n_per_row }, half.data(), half.size()*sizeof(ggml_fp16_t)) });
+
+        return true;
+    }
+
+    entries.push_back({ name,
+            make_npy("<f4", { n_rows, n_per_row }, data, (size_t) n*sizeof(float)) });
+
+    return true;
 }
 
 // Parse a --dump-kv-layers spec: "" or "none" (nothing), "all", or a
@@ -403,8 +473,8 @@ int main(int argc, char ** argv) {
         LOG_ERR("%s: invalid --dump-format '%s' (expected plain, roles or turns)\n", __func__, params.dump_format.c_str());
         return 1;
     }
-    if (params.dump_dtype != "f32" && params.dump_dtype != "f16") {
-        LOG_ERR("%s: invalid --dump-dtype '%s' (expected f32 or f16)\n", __func__, params.dump_dtype.c_str());
+    if (params.dump_dtype != "f32" && params.dump_dtype != "f16" && params.dump_dtype != "q8_0") {
+        LOG_ERR("%s: invalid --dump-dtype '%s' (expected f32, f16 or q8_0)\n", __func__, params.dump_dtype.c_str());
         return 1;
     }
 
@@ -660,8 +730,9 @@ int main(int argc, char ** argv) {
         std::vector<std::pair<std::string, std::vector<uint8_t>>> entries;
 
         if (params.dump_hidden) {
-            entries.push_back({ "hidden",
-                    make_npy_floats(params.dump_dtype, { n_total, n_embd_out }, hidden.data(), hidden.size()) });
+            if (!add_float_array(entries, params.dump_dtype, "hidden", n_total, n_embd_out, hidden.data())) {
+                return 1;
+            }
         }
 
         if (n_kv > 0) {
@@ -677,13 +748,17 @@ int main(int argc, char ** argv) {
 
                 if (!kv_k[i].empty()) {
                     GGML_ASSERT(kv_k[i].size() == (size_t) n_total*nk);
-                    entries.push_back({ "k_l" + std::to_string(il),
-                            make_npy_floats(params.dump_dtype, { n_total, nk }, kv_k[i].data(), kv_k[i].size()) });
+                    if (!add_float_array(entries, params.dump_dtype, "k_l" + std::to_string(il),
+                                n_total, nk, kv_k[i].data())) {
+                        return 1;
+                    }
                 }
                 if (!kv_v[i].empty()) {
                     GGML_ASSERT(kv_v[i].size() == (size_t) n_total*nv);
-                    entries.push_back({ "v_l" + std::to_string(il),
-                            make_npy_floats(params.dump_dtype, { n_total, nv }, kv_v[i].data(), kv_v[i].size()) });
+                    if (!add_float_array(entries, params.dump_dtype, "v_l" + std::to_string(il),
+                                n_total, nv, kv_v[i].data())) {
+                        return 1;
+                    }
                 }
             }
 

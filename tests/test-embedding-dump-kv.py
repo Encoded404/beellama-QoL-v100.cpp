@@ -77,7 +77,9 @@ def main() -> None:
     corpus.write_text("".join(json.dumps(d) + "\n" for d in CORPUS), encoding="utf-8")
 
     # --- one layer, one batch -------------------------------------------------
-    big = dump_ok(dump, model, corpus, work / "big", ["--dump-kv-layers", "0", "-b", "64"])
+    # f32 for the reference runs, so the comparisons below are on exact values
+    big = dump_ok(dump, model, corpus, work / "big",
+                  ["--dump-kv-layers", "0", "-b", "64", "--dump-dtype", "f32"])
     ref = np.load(big[0])
 
     for key in ("k_l0", "v_l0", "kv_layers", "input_ids", "labels"):
@@ -102,7 +104,8 @@ def main() -> None:
 
     # --- chunk invariance ----------------------------------------------------
     # the same document split into much smaller batches must produce bit-identical rows
-    small = dump_ok(dump, model, corpus, work / "small", ["--dump-kv-layers", "0", "-b", "8"])
+    small = dump_ok(dump, model, corpus, work / "small",
+                    ["--dump-kv-layers", "0", "-b", "8", "--dump-dtype", "f32"])
     chunked = np.load(small[0])
 
     for key in ("k_l0", "v_l0", "input_ids", "labels"):
@@ -143,6 +146,10 @@ def main() -> None:
     )
 
     # --- dtype ---------------------------------------------------------------
+    # f16 is the default - the dump is the bulk of the disk cost
+    default = np.load(dump_ok(dump, model, corpus, work / "default", ["--dump-kv-layers", "0", "-b", "64"])[0])
+    assert default["k_l0"].dtype == np.float16, "the default dump dtype should be f16"
+
     half = dump_ok(dump, model, corpus, work / "f16",
                    ["--dump-kv-layers", "0", "-b", "64", "--dump-dtype", "f16"])
     h = np.load(half[0])
@@ -151,6 +158,24 @@ def main() -> None:
     assert h["k_l0"].shape == ref["k_l0"].shape, "the dtype must not change the shape"
     assert np.abs(h["k_l0"].astype(np.float64) - ref["k_l0"].astype(np.float64)).max() < 5e-2, (
         "f16 output must stay close to the f32 output"
+    )
+
+    # q8_0 uses ggml's block format and is written as an int8 payload plus the
+    # per-32-value f16 scales
+    q = np.load(dump_ok(dump, model, corpus, work / "q8_0",
+                        ["--dump-kv-layers", "0", "-b", "64", "--dump-dtype", "q8_0"])[0])
+
+    assert q["k_l0"].dtype == np.int8, f"expected an int8 payload, got {q['k_l0'].dtype}"
+    assert q["k_l0_scales"].dtype == np.float16, f"expected f16 scales, got {q['k_l0_scales'].dtype}"
+
+    width = ref["k_l0"].shape[1]
+    assert q["k_l0"].shape == (n_tok, width), "the q8_0 payload must keep the shape"
+    assert q["k_l0_scales"].shape == (n_tok, width // 32), "q8_0 needs one scale per 32 values"
+
+    deq = q["k_l0"].astype(np.float64) * np.repeat(q["k_l0_scales"].astype(np.float64), 32, axis=1)
+    amax = np.abs(ref["k_l0"]).max()
+    assert np.abs(deq - ref["k_l0"].astype(np.float64)).max() < amax / 100.0, (
+        "dequantized q8_0 must track the f32 output"
     )
 
     # --- rejected input ------------------------------------------------------
