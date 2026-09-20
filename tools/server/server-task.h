@@ -4,6 +4,9 @@
 #include "llama.h"
 #include "server-loop-guard.h"
 
+#include <algorithm>
+#include <iterator>
+#include <limits>
 #include <string>
 #include <functional>
 #include <unordered_set>
@@ -652,10 +655,75 @@ struct server_task_result_apply_lora : server_task_result {
     virtual json to_json() override;
 };
 
+// A forced max-step cadence is due once the next batch would start further than
+// max_step past the newest durable checkpoint, which keeps coverage independent of
+// where message boundaries happen to fall. 0 disables the cadence.
+static inline bool server_prompt_checkpoint_max_step_due(
+        int64_t n_tokens_start,
+        int64_t n_tokens_last_checkpoint,
+        int32_t checkpoint_max_step) {
+    return checkpoint_max_step > 0 &&
+            n_tokens_start >= n_tokens_last_checkpoint + checkpoint_max_step;
+}
+
+// Choose which checkpoint to drop when the per-slot cap is reached. The earliest
+// and latest anchors are preserved and the densest interior region is thinned, so
+// the retained set keeps the broadest coverage of the prompt instead of discarding
+// the oldest prefix first. Requires a non-empty list.
+template <typename list_t>
+static auto server_prompt_evict_checkpoint(list_t & checkpoints) {
+    auto evict = checkpoints.begin();
+
+    if (checkpoints.size() <= 2) {
+        return evict;
+    }
+
+    auto prev = checkpoints.begin();
+    auto cur  = std::next(prev);
+    auto next = std::next(cur);
+
+    int64_t smallest_span = std::numeric_limits<int64_t>::max();
+
+    for (; next != checkpoints.end(); ++prev, ++cur, ++next) {
+        const int64_t span = next->n_tokens - prev->n_tokens;
+        if (span < smallest_span) {
+            smallest_span = span;
+            evict = cur;
+        }
+    }
+
+    return evict;
+}
+
+// Highest durable checkpoint whose captured prefix is entirely inside the common
+// prefix and still leaves at least one token to evaluate. Durable KVarN
+// checkpoints additionally have to sit on a complete descriptor group.
+// Returns checkpoints.end() when nothing is reusable.
+template <typename list_t>
+static auto server_prompt_find_reusable_checkpoint(
+        list_t & checkpoints,
+        int64_t   n_tokens_lcp,
+        int64_t   n_tokens_new,
+        int32_t   alignment) {
+    const int64_t step = alignment > 0 ? alignment : 1;
+
+    auto it = std::find_if(checkpoints.rbegin(), checkpoints.rend(), [&](const auto & checkpoint) {
+        return checkpoint.n_tokens > 0 &&
+                checkpoint.n_tokens <= n_tokens_lcp &&
+                checkpoint.n_tokens <  n_tokens_new &&
+                checkpoint.n_tokens %  step == 0;
+    });
+
+    return it == checkpoints.rend() ? checkpoints.end() : std::prev(it.base());
+}
+
 struct server_prompt {
     server_tokens tokens;
 
     std::list<common_prompt_checkpoint> checkpoints;
+
+    using checkpoint_iterator       = std::list<common_prompt_checkpoint>::iterator;
+    using const_checkpoint_iterator = std::list<common_prompt_checkpoint>::const_iterator;
 
     void clear() {
         tokens.clear();
@@ -664,6 +732,14 @@ struct server_prompt {
 
     int n_tokens() const {
         return tokens.size();
+    }
+
+    checkpoint_iterator find_reusable_checkpoint(int64_t n_tokens_lcp, int64_t n_tokens_new, int32_t alignment) {
+        return server_prompt_find_reusable_checkpoint(checkpoints, n_tokens_lcp, n_tokens_new, alignment);
+    }
+
+    const_checkpoint_iterator find_reusable_checkpoint(int64_t n_tokens_lcp, int64_t n_tokens_new, int32_t alignment) const {
+        return server_prompt_find_reusable_checkpoint(checkpoints, n_tokens_lcp, n_tokens_new, alignment);
     }
 
     server_prompt clone() const {

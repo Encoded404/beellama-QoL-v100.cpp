@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <filesystem>
 #include <random>
@@ -318,6 +319,8 @@ struct server_slot {
     int32_t n_prompt_tokens_cache     = 0;
     int32_t n_prompt_tokens_lcp       = 0;
     int32_t n_prompt_tokens_planned   = 0;
+    // pending durable checkpoint at the real common-prefix boundary, -1 when none
+    int32_t n_prompt_tokens_prefix    = -1;
     std::string prompt_cache_source   = "none";
     std::string prompt_cache_reason   = "none";
 
@@ -358,6 +361,7 @@ struct server_slot {
         n_prompt_tokens_cache = 0;
         n_prompt_tokens_lcp = 0;
         n_prompt_tokens_planned = 0;
+        n_prompt_tokens_prefix = -1;
         prompt_cache_source = "none";
         prompt_cache_reason = "memory_cleared";
         spec_ckpt.clear();
@@ -479,6 +483,7 @@ struct server_slot {
         n_prompt_tokens_cache = 0;
         n_prompt_tokens_lcp = 0;
         n_prompt_tokens_planned = 0;
+        n_prompt_tokens_prefix = -1;
         prompt_cache_source = "none";
         prompt_cache_reason = "none";
         last_nl_pos    = 0;
@@ -1541,10 +1546,24 @@ private:
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
         if (params_base.n_ctx_checkpoints > 0) {
-            SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
-                    params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
+            SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d, max spacing = %d\n",
+                    params_base.n_ctx_checkpoints, params_base.checkpoint_min_step, params_base.checkpoint_max_step);
         } else {
             SRV_TRC("%s", "context checkpoints disabled\n");
+        }
+
+        if (params_base.checkpoint_max_step > 0 && params_base.checkpoint_max_step < params_base.checkpoint_min_step) {
+            SRV_WRN("checkpoint-max-step (%d) is below checkpoint-min-step (%d); the min-step rule is relaxed to %d\n",
+                    params_base.checkpoint_max_step, params_base.checkpoint_min_step, params_base.checkpoint_max_step);
+        }
+
+        if (params_base.checkpoint_max_step > 0 && params_base.n_ctx_checkpoints > 0) {
+            const int64_t needed = n_ctx / (int64_t) params_base.checkpoint_max_step + 1;
+            if (needed > params_base.n_ctx_checkpoints) {
+                SRV_WRN("checkpoint-max-step = %d over a %d token context needs about %" PRId64
+                        " checkpoints to cover the prompt, but --ctx-checkpoints is %d; the earliest checkpoints will be evicted first\n",
+                        params_base.checkpoint_max_step, n_ctx, needed, params_base.n_ctx_checkpoints);
+            }
         }
 
         if (!params_base.model_alias.empty()) {
@@ -2685,6 +2704,21 @@ private:
         return true;
     }
 
+    // Whether a saved memory state is valid only at its exact final position.
+    // Removable KV/SWA ranges cover a span, recurrent and hybrid states do not.
+    bool ctx_tgt_state_exact() const {
+        return ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+               ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS;
+    }
+
+    // Sparse checkpoints are dropped once they sit closer than this to a kept
+    // neighbour. A forced max-step cadence must not be contradicted by it.
+    int32_t checkpoint_effective_step() const {
+        return params_base.checkpoint_max_step > 0
+                ? std::min(params_base.checkpoint_min_step, params_base.checkpoint_max_step)
+                : params_base.checkpoint_min_step;
+    }
+
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
@@ -2697,12 +2731,30 @@ private:
             return;
         }
 
+        // re-capturing the same boundary just re-owns an existing checkpoint; the
+        // refreshed id_task keeps it exempt from the min-step prune below
+        const auto existing = std::find_if(
+                slot.prompt.checkpoints.begin(),
+                slot.prompt.checkpoints.end(),
+                [&](const auto & checkpoint) {
+                    return checkpoint.n_tokens == n_tokens_checkpoint && checkpoint.pos_max == pos_max;
+                });
+        if (existing != slot.prompt.checkpoints.end()) {
+            existing->id_task = id_task;
+            return;
+        }
+
         common_prompt_checkpoint cur;
         cur.id_task = id_task;
 
-        // [TAG_CHECKPOINTS_FIX_POS_MIN]
-        // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
-        //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
+        // Recurrent and hybrid states are valid only at the exact position where
+        // they were captured, unlike a removable KV/SWA range.
+        // [TAG_CHECKPOINTS_FIX_POS_MIN] SWA still under-reports the covered range:
+        //    https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
+        if (ctx_tgt_state_exact()) {
+            pos_min = pos_max;
+        }
+
         cur.update_pos(n_tokens_checkpoint, pos_min, pos_max);
 
         constexpr llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
@@ -2719,13 +2771,13 @@ private:
         // state return false and leave the payload empty.
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
-        const int32_t checkpoint_min_step = params_base.checkpoint_min_step;
+        const int32_t prune_step = checkpoint_effective_step();
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         int64_t last = -1;
         for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
-            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + checkpoint_min_step) {
+            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + prune_step) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
@@ -2739,12 +2791,12 @@ private:
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            const auto evict = server_prompt_evict_checkpoint(slot.prompt.checkpoints);
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+                    evict->pos_min, evict->pos_max, evict->n_tokens, (float) evict->size() / 1024 / 1024);
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            slot.prompt.checkpoints.erase(evict);
         }
 
         slot.prompt.checkpoints.push_back(std::move(cur));
@@ -3803,6 +3855,11 @@ private:
 
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
+                            // the lexical common-prefix boundary, captured before any
+                            // durable checkpoint restore moves the resume point earlier
+                            const int       n_past_lcp   = n_past;
+                            const llama_pos pos_next_lcp = pos_next;
+
                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
                             const bool has_new_tokens = (n_past < slot.task->n_tokens());
 
@@ -3909,30 +3966,49 @@ private:
                                                 pos_next, n_past);
                                     } else {
                                         // search for a context checkpoint
-                                        const auto it = std::find_if(
-                                            slot.prompt.checkpoints.rbegin(),
-                                            slot.prompt.checkpoints.rend(),
-                                            [&](const auto & cur) {
-                                                // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
-                                                SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
-                                                // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
-                                                if (cur.pos_max > pos_next) {
-                                                    return false;
-                                                }
-                                                return prompt_reuse_boundary_is_stable(cur.n_tokens) &&
-                                                        (cur.pos_min < pos_min_thold || cur.pos_min == 0);
-                                            }
-                                        );
+                                        auto it = slot.prompt.checkpoints.end();
 
-                                        bool do_reset = it == slot.prompt.checkpoints.rend();
+                                        if (ctx_tgt_state_exact()) {
+                                            // an exact state is valid only where it was captured, so
+                                            // select on the lexical prefix instead of a covered range
+                                            it = slot.prompt.find_reusable_checkpoint(
+                                                    n_past_lcp, slot.task->n_tokens(), prompt_reuse_alignment());
+                                        } else {
+                                            const auto rit = std::find_if(
+                                                slot.prompt.checkpoints.rbegin(),
+                                                slot.prompt.checkpoints.rend(),
+                                                [&](const auto & cur) {
+                                                    // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
+                                                    SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
+                                                    // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
+                                                    if (cur.pos_max > pos_next) {
+                                                        return false;
+                                                    }
+                                                    return prompt_reuse_boundary_is_stable(cur.n_tokens) &&
+                                                            (cur.pos_min < pos_min_thold || cur.pos_min == 0);
+                                                }
+                                            );
+
+                                            if (rit != slot.prompt.checkpoints.rend()) {
+                                                it = std::prev(rit.base());
+                                            }
+                                        }
+
+                                        bool do_reset = it == slot.prompt.checkpoints.end();
 
                                         if (!do_reset) {
                                             do_reset = !restore_checkpoint_transaction(
                                                     slot, *it, ctx_tgt, slot.draft_owns_state ? ctx_dft : nullptr,
                                                     true, slot.draft_owns_state, true);
                                             if (!do_reset) {
-                                                pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
-                                                n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                                if (ctx_tgt_state_exact()) {
+                                                    n_past   = it->n_tokens;
+                                                    pos_next = slot.prompt.tokens.pos_next(n_past);
+                                                } else {
+                                                    pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                                                    n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                                }
+                                                it->id_task = slot.task->id;
                                                 const bool restored_from_ram = slot.prompt_cache_source == "ram";
                                                 slot.prompt_cache_source = restored_from_ram ? "ram" : "checkpoint";
                                                 slot.prompt_cache_reason = restored_from_ram ?
@@ -3957,15 +4033,40 @@ private:
                             }
 
                             {
-                                // erase any checkpoints with pos_max > pos_next
+                                // A checkpoint is valid when every token captured by it is still
+                                // in the common prefix. Do not invalidate later valid checkpoints
+                                // just because an older checkpoint had to be restored.
                                 for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
                                     const auto & cur = *it;
-                                    if (cur.pos_max > pos_next) {
-                                        SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
+                                    if (cur.n_tokens > n_past_lcp) {
+                                        SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, prefix_end = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next_lcp, (float) cur.size() / 1024 / 1024);
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
                                         ++it;
                                     }
+                                }
+                            }
+
+                            // An exact-state checkpoint can be restored well before the actual
+                            // common-prefix boundary. Remember that boundary so the next update
+                            // can capture it before any divergent token is decoded. KVarN can
+                            // only anchor on a complete descriptor group, so snap the boundary
+                            // down and drop it when that lands on the restored checkpoint.
+                            {
+                                const int32_t alignment   = prompt_reuse_alignment();
+                                const int64_t snapped     = n_past_lcp - (n_past_lcp % alignment);
+                                const int64_t prefix_gap  = n_past_lcp - n_past;
+
+                                slot.n_prompt_tokens_prefix =
+                                        ctx_tgt_state_exact() && has_new_tokens &&
+                                        prefix_gap >= checkpoint_effective_step() &&
+                                        snapped > n_past
+                                            ? snapped
+                                            : -1;
+
+                                if (slot.n_prompt_tokens_prefix > 0) {
+                                    SLT_TRC(slot, "will capture common-prefix checkpoint at %d (lexical prefix = %d, resumed at %d)\n",
+                                            slot.n_prompt_tokens_prefix, n_past_lcp, n_past);
                                 }
                             }
                         }
@@ -4036,7 +4137,9 @@ private:
                         slot.n_prompt_tokens_cache = int32_t(planned_n_past);
                         slot.prompt.tokens.keep_first(planned_n_past);
                         for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
-                            if (it->pos_max >= planned_p0) {
+                            // same validity rule as the restore path: a checkpoint survives
+                            // while every token it captured is still in the retained prefix
+                            if (it->n_tokens > int64_t(planned_n_past)) {
                                 it = slot.prompt.checkpoints.erase(it);
                             } else {
                                 ++it;
@@ -4074,6 +4177,7 @@ private:
 
                     bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
                     const int32_t checkpoint_min_step = params_base.checkpoint_min_step;
+                    const int32_t checkpoint_max_step = params_base.checkpoint_max_step;
 
                     // make checkpoints only for completion tasks
                     do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
@@ -4135,6 +4239,23 @@ private:
 
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
+
+                    // A restored exact-state checkpoint can sit well before the actual
+                    // common-prefix boundary. Now that the boundary has been decoded,
+                    // capture it before any divergent or new token joins the memory.
+                    // These tokens are already in the memory, so nothing is batched.
+                    if (do_checkpoint &&
+                            slot.n_prompt_tokens_prefix > 0 &&
+                            slot.prompt.n_tokens() == slot.n_prompt_tokens_prefix) {
+                        const auto pos_min_prefix = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+                        const auto pos_max_prefix = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+
+                        if (pos_min_prefix >= 0) {
+                            create_checkpoint(slot, 0, pos_min_prefix, pos_max_prefix);
+                        }
+
+                        slot.n_prompt_tokens_prefix = -1;
+                    }
 
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
@@ -4206,6 +4327,15 @@ private:
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
+
+                    // A forced max-step cadence keeps coverage uniform regardless of where
+                    // message boundaries happen to fall. Spacing lands in
+                    // [max_step, max_step + n_batch) because checkpoints align to batches.
+                    const bool max_step_hit = !slot.prompt.checkpoints.empty() &&
+                            server_prompt_checkpoint_max_step_due(
+                                    n_tokens_start,
+                                    slot.prompt.checkpoints.back().n_tokens,
+                                    checkpoint_max_step);
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
@@ -4221,8 +4351,9 @@ private:
                         slot.init_sampler();
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
-                        // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        // message, we are near the end of the prompt, or a forced max-step
+                        // cadence is due
+                        if (!is_user_start && !near_prompt_end && !max_step_hit) {
                             do_checkpoint = false;
                         }
                     }
@@ -4240,10 +4371,11 @@ private:
                     do_checkpoint = do_checkpoint && !has_mtmd;
                     do_checkpoint = do_checkpoint && n_tokens_cur > 0;
 
-                    // no need to create checkpoints that are too close together, unless it's the last user message
+                    // no need to create checkpoints that are too close together, unless it's
+                    // the last user message or a forced max-step checkpoint is due
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end ||
+                            is_last_user_message || near_prompt_end || max_step_hit ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 

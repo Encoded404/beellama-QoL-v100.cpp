@@ -1990,6 +1990,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"-cmx", "--checkpoint-max-step"}, "N",
+        string_format("force a context checkpoint at least every N tokens, so coverage does not depend on message boundaries (default: %d, 0 = off; must be >= --checkpoint-min-step)", params.checkpoint_max_step),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("checkpoint-max-step must be non-negative");
+            }
+            params.checkpoint_max_step = value;
+        }
+    ).set_env("LLAMA_ARG_CHECKPOINT_MAX_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),

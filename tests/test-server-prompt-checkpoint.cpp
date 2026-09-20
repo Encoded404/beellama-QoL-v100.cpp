@@ -2,6 +2,9 @@
 
 #undef NDEBUG
 #include <cassert>
+#include <initializer_list>
+#include <list>
+#include <vector>
 
 static constexpr size_t KIB = 1024;
 
@@ -38,6 +41,122 @@ static server_prompt make_prompt(const llama_tokens & tokens) {
     server_prompt prompt;
     prompt.tokens = server_tokens(tokens, false);
     return prompt;
+}
+
+static server_prompt make_prompt_with_checkpoints(std::initializer_list<int64_t> n_tokens) {
+    server_prompt prompt = make_prompt({1, 2, 3});
+    for (const int64_t n : n_tokens) {
+        prompt.checkpoints.emplace_back().n_tokens = n;
+    }
+    return prompt;
+}
+
+static std::list<common_prompt_checkpoint> make_checkpoints(std::initializer_list<int64_t> n_tokens) {
+    std::list<common_prompt_checkpoint> checkpoints;
+    for (const int64_t n : n_tokens) {
+        checkpoints.emplace_back().n_tokens = n;
+    }
+    return checkpoints;
+}
+
+static std::vector<int64_t> checkpoint_positions(const std::list<common_prompt_checkpoint> & checkpoints) {
+    std::vector<int64_t> result;
+    for (const auto & checkpoint : checkpoints) {
+        result.push_back(checkpoint.n_tokens);
+    }
+    return result;
+}
+
+static void checkpoint_max_step_cadence_is_off_by_default() {
+    assert(!server_prompt_checkpoint_max_step_due(9000, 100, 0));
+    assert(!server_prompt_checkpoint_max_step_due(9000, 100, -1));
+
+    assert( server_prompt_checkpoint_max_step_due(2048, 0, 2048));
+    assert(!server_prompt_checkpoint_max_step_due(2047, 0, 2048));
+    assert( server_prompt_checkpoint_max_step_due(4096, 2048, 2048));
+    assert(!server_prompt_checkpoint_max_step_due(3000, 2048, 2048));
+}
+
+static void checkpoint_reuse_selection_prefers_latest_valid_boundary() {
+    const auto prompt = make_prompt_with_checkpoints({4096, 12000, 18000});
+
+    const auto pick = [&](int64_t n_tokens_lcp, int64_t n_tokens_new, int32_t alignment) {
+        const auto it = prompt.find_reusable_checkpoint(n_tokens_lcp, n_tokens_new, alignment);
+        return it == prompt.checkpoints.end() ? int64_t(-1) : it->n_tokens;
+    };
+
+    assert(pick(15000, 21000, 1) == 12000);
+    assert(pick(20000, 21000, 1) == 18000);
+
+    // a checkpoint past the lexical common prefix can never be restored
+    assert(pick(4000, 21000, 1) == -1);
+
+    // an identical prompt still has to evaluate one token for logits
+    assert(pick(20000, 20000, 1) == 18000);
+
+    // a zero-length checkpoint is not a usable restore point
+    const auto zero = make_prompt_with_checkpoints({0, 100});
+    const auto zero_it = zero.find_reusable_checkpoint(200, 300, 1);
+    assert(zero_it != zero.checkpoints.end());
+    assert(zero_it->n_tokens == 100);
+
+    const auto empty = make_prompt_with_checkpoints({});
+    assert(empty.find_reusable_checkpoint(200, 300, 1) == empty.checkpoints.end());
+}
+
+static void checkpoint_reuse_selection_respects_descriptor_alignment() {
+    const auto prompt = make_prompt_with_checkpoints({4096, 9000});
+
+    // dense caches may resume anywhere
+    const auto any = prompt.find_reusable_checkpoint(10000, 20000, 1);
+    assert(any != prompt.checkpoints.end());
+    assert(any->n_tokens == 9000);
+
+    // KVarN can only resume on a complete descriptor group, so the 9000 token
+    // checkpoint is skipped in favour of the aligned 4096 one
+    const auto aligned = prompt.find_reusable_checkpoint(10000, 20000, 128);
+    assert(aligned != prompt.checkpoints.end());
+    assert(aligned->n_tokens == 4096);
+
+    // nothing at all when only the unaligned boundary would qualify
+    const auto unaligned_only = make_prompt_with_checkpoints({9000});
+    assert(unaligned_only.find_reusable_checkpoint(10000, 20000, 128) ==
+            unaligned_only.checkpoints.end());
+}
+
+static void checkpoint_eviction_preserves_prompt_anchors() {
+    {
+        auto checkpoints = make_checkpoints({100, 300, 600, 900});
+        const auto evict = server_prompt_evict_checkpoint(checkpoints);
+
+        // the densest interior region is thinned, not the oldest anchor
+        assert(evict->n_tokens == 300);
+
+        checkpoints.erase(evict);
+        assert(checkpoint_positions(checkpoints) == std::vector<int64_t>({100, 600, 900}));
+    }
+
+    {
+        // a cluster near the start must not cost us the newest anchor
+        auto checkpoints = make_checkpoints({6400, 6500, 6600, 12000});
+        const auto evict = server_prompt_evict_checkpoint(checkpoints);
+
+        assert(evict->n_tokens == 6500);
+
+        checkpoints.erase(evict);
+        assert(checkpoint_positions(checkpoints) == std::vector<int64_t>({6400, 6600, 12000}));
+    }
+
+    {
+        // a cap of two has no interior to thin, so the oldest entry goes
+        auto checkpoints = make_checkpoints({100, 900});
+        assert(server_prompt_evict_checkpoint(checkpoints)->n_tokens == 100);
+    }
+
+    {
+        auto checkpoints = make_checkpoints({100});
+        assert(server_prompt_evict_checkpoint(checkpoints)->n_tokens == 100);
+    }
 }
 
 static common_memory_seq_rm_result test_seq_rm_suffix(
@@ -429,6 +548,10 @@ int main() {
     restore_transaction_validation_failures_are_atomic();
     restore_transaction_validation_failure_identifies_prepare_leg();
     speculative_rollback_checkpoint_boundary();
+    checkpoint_max_step_cadence_is_off_by_default();
+    checkpoint_reuse_selection_prefers_latest_valid_boundary();
+    checkpoint_reuse_selection_respects_descriptor_alignment();
+    checkpoint_eviction_preserves_prompt_anchors();
     checkpoint_failed_target_save_cannot_reuse_stale_bytes();
     speculative_draft_rollback_uses_draft_axis_and_recovers();
     server_unsupported_removal_falls_back_to_full_reprocess();
