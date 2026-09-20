@@ -55,9 +55,14 @@ ggml_cuda_fattn_kvarn_capabilities ggml_cuda_fattn_kvarn_device_capabilities(int
 #if defined(GGML_USE_MUSA)
     constexpr ggml_cuda_fattn_kvarn_backend backend = GGML_CUDA_FATTN_KVARN_BACKEND_MUSA;
     const bool matrix_mma = false;
+    // MUSA stays portable-native, so no split-decode capability is queried.
+    constexpr bool decode_matrix_mma = false;
 #elif defined(GGML_USE_HIP)
     constexpr ggml_cuda_fattn_kvarn_backend backend = GGML_CUDA_FATTN_KVARN_BACKEND_HIP;
     const bool matrix_mma = amd_wmma_available(device_info.cc) || amd_mfma_available(device_info.cc);
+    // The split decode kernel is ldmatrix/m16n8 based and therefore CUDA-only;
+    // ggml_cuda_fattn_kvarn_select_capabilities ignores this for HIP.
+    constexpr bool decode_matrix_mma = false;
 #else
     constexpr ggml_cuda_fattn_kvarn_backend backend = GGML_CUDA_FATTN_KVARN_BACKEND_CUDA;
     const char * force_portable_capability =
