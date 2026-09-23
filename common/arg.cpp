@@ -5379,6 +5379,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_DUMP_HIDDEN"));
     add_opt(common_arg(
+        {"--dump-hidden-raw"},
+        {"--no-dump-hidden-raw"},
+        string_format("dump the raw last-layer hidden instead of the post-output-norm state (default: %s)\n"
+            "  the post-norm state is the LM-head input and what the reference drafter\n"
+            "  consumes; some drafters are trained on the pre-norm form instead",
+            params.dump_hidden_raw ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.dump_hidden_raw = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_DUMP_HIDDEN_RAW"));
+    add_opt(common_arg(
         {"--dump-kv-layers"}, "L0,L1,...|all",
         "dump the K/V rows that the listed layers write to their KV cache (default: none)\n"
         "  each selected layer adds two arrays per document: k_l<il> and v_l<il>,\n"

@@ -556,6 +556,11 @@ int main(int argc, char ** argv) {
     // (src/models/gemma4.cpp), which is what the MTP drafter consumes as inp_h.
     if (params.dump_hidden) {
         llama_set_embeddings_nextn(ctx, true, /*masked=*/ false);
+
+        if (params.dump_hidden_raw) {
+            llama_set_embeddings_nextn_raw(ctx, true);
+            LOG_INF("%s: dumping the raw pre-norm last-layer hidden\n", __func__);
+        }
     }
 
     // chat templates (jinja) from the model's GGUF metadata

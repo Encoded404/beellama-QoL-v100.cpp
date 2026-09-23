@@ -97,6 +97,12 @@ LLAMA_API llama_kv_memory_stats llama_get_kv_memory_stats(const struct llama_con
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
 LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
 
+// Select which hidden state llama_get_embeddings_nextn() returns. false (the
+// default) is the post-output-norm hidden, i.e. the LM-head input, which is what
+// the reference drafter consumes. true is the raw last-layer hidden before that
+// norm, for drafters trained against the pre-norm form.
+LLAMA_API void llama_set_embeddings_nextn_raw(struct llama_context * ctx, bool value);
+
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
 // chain multiple trained NextN heads. Default 0 (first head).

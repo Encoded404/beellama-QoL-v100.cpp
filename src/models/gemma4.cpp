@@ -402,16 +402,23 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     }
     cur = inpL;
 
+    // the last layer's hidden before the final norm: some drafters are trained on
+    // this raw form rather than on the LM-head input
+    ggml_tensor * h_raw = cur;
+
     cur = build_norm(cur,
             model.output_norm, nullptr,
             LLM_NORM_RMS, -1);
 
-    // Expose the post-output-norm hidden state (the LM-head input feature) so that
-    // MTP draft contexts can read it via llama_get_embeddings_nextn_ith() as the
-    // recurrent h input. This matches the reference (transformers/vLLM/SGLang),
-    // which feeds the drafter the target's post-final-norm hidden state.
-    cb(cur, "h_nextn", -1);
-    res->t_h_nextn = cur;
+    // Expose the hidden state a draft context reads via
+    // llama_get_embeddings_nextn_ith() as its recurrent h input. By default this
+    // is the post-output-norm hidden (the LM-head input), which is what the
+    // reference (transformers/vLLM/SGLang) feeds the drafter; the pre-norm form
+    // is available for drafters trained against it.
+    ggml_tensor * h_out = cparams.embeddings_nextn_raw ? h_raw : cur;
+
+    cb(h_out, "h_nextn", -1);
+    res->t_h_nextn = h_out;
 
     if (!cparams.embeddings_nextn_masked && inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);

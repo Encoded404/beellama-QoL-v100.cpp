@@ -954,6 +954,7 @@ struct llm_graph_params {
         return
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
+            cparams.embeddings_nextn_raw    == other.cparams.embeddings_nextn_raw    &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.kv_dump_layers          == other.cparams.kv_dump_layers          &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
