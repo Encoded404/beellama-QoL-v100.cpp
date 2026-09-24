@@ -332,6 +332,19 @@ llama_context::llama_context(
     cparams.embeddings              = params.embeddings;
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
+
+    // the K/V dump records the rows as the cache stores them by default; recording
+    // the model basis is opt-in and off the usual path, so it costs nothing unset
+    cparams.kv_dump_pre_rotation    = false;
+
+    const char * LLAMA_DUMP_KV_PRE_ROTATION = getenv("LLAMA_DUMP_KV_PRE_ROTATION");
+    if (LLAMA_DUMP_KV_PRE_ROTATION != nullptr && LLAMA_DUMP_KV_PRE_ROTATION[0] != '\0' &&
+            strcmp(LLAMA_DUMP_KV_PRE_ROTATION, "0") != 0) {
+        cparams.kv_dump_pre_rotation = true;
+
+        LLAMA_LOG_WARN("%s: recording K/V dumps from before the cache-domain transform (model basis)\n", __func__);
+    }
+
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
@@ -1823,6 +1836,21 @@ void llama_context::set_kv_dump_layers(const std::vector<int32_t> & layers) {
     LLAMA_LOG_INFO("%s: selected %zu layer(s) for K/V dumping\n", __func__, selected.size());
 
     // the new outputs change the graph and the host buffers must be re-sized
+    sched_need_reserve = true;
+}
+
+void llama_context::set_kv_dump_pre_rotation(bool value) {
+    if (cparams.kv_dump_pre_rotation == value) {
+        return;
+    }
+
+    cparams.kv_dump_pre_rotation = value;
+
+    LLAMA_LOG_INFO("%s: K/V dump records the %s\n", __func__, value ?
+            "model basis (from before the cache-domain transform)" :
+            "stored rows (after the cache-domain transform)");
+
+    // the captured tensors change, which can change how the graph is scheduled
     sched_need_reserve = true;
 }
 
@@ -5092,6 +5120,10 @@ void llama_set_kv_dump_layers(llama_context * ctx, const int32_t * layers, size_
     const std::vector<int32_t> selected(layers, layers + n_layers);
 
     ctx->set_kv_dump_layers(selected);
+}
+
+void llama_set_kv_dump_pre_rotation(llama_context * ctx, bool value) {
+    ctx->set_kv_dump_pre_rotation(value);
 }
 
 size_t llama_get_kv_dump_n_layers(llama_context * ctx) {

@@ -543,6 +543,17 @@ int main(int argc, char ** argv) {
             return 1;
         }
 
+        // a quantized cache type rotates K/V before storing them, and the trainer
+        // or draft head this dump feeds reads the model basis, so it has to be
+        // asked for explicitly
+        if (params.dump_kv_pre_rotation) {
+            llama_set_kv_dump_pre_rotation(ctx, true);
+
+            LOG_INF("%s: recording the K/V rows from the model basis, before any cache-domain transform\n", __func__);
+        } else {
+            LOG_INF("%s: recording the K/V rows as stored by the KV cache\n", __func__);
+        }
+
         for (size_t i = 0; i < llama_get_kv_dump_n_layers(ctx); ++i) {
             LOG_INF("%s: dumping layer %d: %u K + %u V floats per token\n", __func__,
                     llama_get_kv_dump_layer(ctx, i),
@@ -797,6 +808,13 @@ int main(int argc, char ** argv) {
 
             entries.push_back({ "kv_layers",
                     make_npy("<i4", { (int64_t) kv_meta.size() }, kv_meta.data(), kv_meta.size()*sizeof(int32_t)) });
+
+            // record which basis the K/V arrays above are in, so a reader never has
+            // to guess whether the cache type transformed them: 0 = as stored by the
+            // cache, 1 = model basis, from before the cache-domain transform
+            const int32_t kv_basis = params.dump_kv_pre_rotation ? 1 : 0;
+            entries.push_back({ "kv_basis",
+                    make_npy("<i4", { 1 }, &kv_basis, sizeof(kv_basis)) });
         }
 
         entries.push_back({ "input_ids", make_npy("<i4", { n_total }, input_ids.data(), input_ids.size() * sizeof(int32_t)) });

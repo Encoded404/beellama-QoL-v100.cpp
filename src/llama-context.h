@@ -129,6 +129,7 @@ struct llama_context {
     void set_embeddings_nextn_raw(bool value);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_kv_dump_layers(const std::vector<int32_t> & layers);
+    void set_kv_dump_pre_rotation(bool value);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);

@@ -139,6 +139,16 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 // disables dumping.
 LLAMA_API void llama_set_kv_dump_layers(struct llama_context * ctx, const int32_t * layers, size_t n_layers);
 
+// Select which basis the K/V dump records. false (the default) records the rows as
+// they are stored, i.e. after any cache-domain transform. A quantized cache type
+// rotates K/V into a basis that is cheaper to quantize; that rotation cancels out
+// at attention time because the query is rotated with it, so the stored rows are
+// correct for inspecting a cache, but they are not the rows a trainer or a draft
+// head consumes. true records the model basis, i.e. the same rows from before the
+// rotation. Layers whose attention route does not transform K/V are unaffected
+// either way. Also settable with LLAMA_DUMP_KV_PRE_ROTATION.
+LLAMA_API void llama_set_kv_dump_pre_rotation(struct llama_context * ctx, bool value);
+
 // Number of layers currently selected for KV dumping.
 LLAMA_API size_t llama_get_kv_dump_n_layers(struct llama_context * ctx);
 

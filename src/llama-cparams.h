@@ -62,6 +62,15 @@ struct llama_cparams {
     // head can be trained against them offline.
     std::vector<bool> kv_dump_layers;
 
+    // record the rows above before the cache-domain transform instead of after it.
+    // a quantized cache type rotates K/V into a basis that is cheaper to quantize;
+    // the rotation cancels out at attention time because the query is rotated with
+    // it, so the stored rows are the right thing to record for inspecting a cache
+    // but are not the rows a trainer or a draft head consumes. false (the default)
+    // records the stored rows; true records the model basis. has no effect on
+    // layers whose attention route does not transform K/V.
+    bool kv_dump_pre_rotation = false;
+
     enum llama_context_type ctx_type;
     enum llama_rope_scaling_type rope_scaling_type;
     enum llama_pooling_type pooling_type;

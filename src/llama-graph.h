@@ -1280,13 +1280,20 @@ struct llm_graph_context {
     // can be copied to the host after the decode.
     //
     // The values are exactly the ones that end up stored - post-rope K, post-norm
-    // V, before any quantization implied by the cache type. This is called from
-    // the generic build_attn() paths, so any architecture that routes its
-    // attention through them can be dumped.
+    // V, after any cache-domain transform the cache type applies (a quantized
+    // cache type rotates K/V, see cparams.kv_dump_pre_rotation) and before the
+    // quantization itself. This is called from the generic build_attn() paths, so
+    // any architecture that routes its attention through them can be dumped.
     //
     // Pass v_cur = nullptr for layers that do not store a separate V (MLA-style
     // layers cache K only and derive V from it).
-    void capture_kv_dump(ggml_tensor * k_cur, ggml_tensor * v_cur, int il) const;
+    //
+    // k_pre/v_pre are the same rows from before that transform, and may be left
+    // null when the route does not transform K/V. They are only read when
+    // cparams.kv_dump_pre_rotation is set, so a run that records nothing pays
+    // nothing.
+    void capture_kv_dump(ggml_tensor * k_cur, ggml_tensor * v_cur, int il,
+                         ggml_tensor * k_pre = nullptr, ggml_tensor * v_pre = nullptr) const;
 
     ggml_tensor * build_attn_mha(
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]

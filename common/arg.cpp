@@ -5393,12 +5393,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--dump-kv-layers"}, "L0,L1,...|all",
         "dump the K/V rows that the listed layers write to their KV cache (default: none)\n"
         "  each selected layer adds two arrays per document: k_l<il> and v_l<il>,\n"
-        "  one row per token holding the post-rope K and the post-norm V as cached\n"
+        "  one row per token holding the post-rope K and the post-norm V as stored,\n"
+        "  i.e. after any cache-domain transform the cache type applies\n"
+        "  (--dump-kv-pre-rotation records the model basis instead)\n"
         "  pass 'all' to select every layer; an empty value disables the K/V dump",
         [](common_params & params, const std::string & value) {
             params.dump_kv_layers = value;
         }
     ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_DUMP_KV_LAYERS"));
+    add_opt(common_arg(
+        {"--dump-kv-pre-rotation"},
+        {"--no-dump-kv-pre-rotation"},
+        string_format("record the K/V rows from before the cache-domain transform\n"
+            "  (default: %s)\n"
+            "  a quantized --cache-type-k/v rotates K/V into a basis that is\n"
+            "  cheaper to quantize; the rotation cancels out at attention time, so\n"
+            "  the stored rows are right for inspecting a cache, but they are not\n"
+            "  the rows a trainer or a draft head consumes. enable this to record\n"
+            "  the model basis instead",
+            params.dump_kv_pre_rotation ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.dump_kv_pre_rotation = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_DUMP_KV_PRE_ROTATION"));
     add_opt(common_arg(
         {"--skip-existing"},
         {"--no-skip-existing"},

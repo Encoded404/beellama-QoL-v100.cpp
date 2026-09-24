@@ -732,6 +732,7 @@ struct common_params {
     std::string dump_hidden_dtype = ""; // dtype for the hidden state alone; "" follows dump_dtype
     bool        dump_hidden = true;    // dump the target hidden state (llama_get_embeddings_nextn)
     bool        dump_hidden_raw = false; // expose the raw pre-norm last-layer hidden instead
+    bool        dump_kv_pre_rotation = false; // record the K/V rows from before the cache-domain transform
     bool        dump_skip_existing = false; // skip documents whose .npz already exists (resume a long run)
 
     // server params

@@ -3027,9 +3027,26 @@ bool llm_graph_context::wants_kv_dump(int il) const {
     return il >= 0 && il < (int) cparams.kv_dump_layers.size() && cparams.kv_dump_layers[il];
 }
 
-void llm_graph_context::capture_kv_dump(ggml_tensor * k_cur, ggml_tensor * v_cur, int il) const {
+void llm_graph_context::capture_kv_dump(
+        ggml_tensor * k_cur, ggml_tensor * v_cur, int il,
+        ggml_tensor * k_pre, ggml_tensor * v_pre) const {
     if (!wants_kv_dump(il) || n_tokens <= 0) {
         return;
+    }
+
+    // a quantized cache type rotates K/V into a basis that is cheaper to quantize.
+    // the rotation cancels out at attention time - the query is rotated with it -
+    // so the stored rows are the right thing to record for inspecting a cache, but
+    // they are not the rows a trainer or a draft head consumes. the caller hands
+    // over the same rows from before the rotation for that case, and only for the
+    // routes that apply one.
+    if (cparams.kv_dump_pre_rotation) {
+        if (k_pre != nullptr) {
+            k_cur = k_pre;
+        }
+        if (v_pre != nullptr) {
+            v_cur = v_pre;
+        }
     }
 
     // reshape to one row per token with the remaining dims contiguous - the
@@ -3677,6 +3694,11 @@ ggml_tensor * llm_graph_context::build_attn(
                 inp->self_kvarn_rot_512, q_cur->ne[0]) != nullptr);
     }
 
+    // the dump records the rows as stored; keep the same rows from before the
+    // rotation available in case the model basis is asked for instead
+    ggml_tensor * k_pre = k_cur;
+    ggml_tensor * v_pre = v_cur;
+
     if (inp->self_k_rot) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
         k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
@@ -3698,7 +3720,7 @@ ggml_tensor * llm_graph_context::build_attn(
     const bool compact_tail = mctx_cur->has_compact_tail();
 
     // capture the rows that will be stored, after any cache-domain transform
-    capture_kv_dump(k_cur, v_cur, il);
+    capture_kv_dump(k_cur, v_cur, il, k_pre, v_pre);
 
     // store to KV cache
     {
@@ -4126,6 +4148,11 @@ ggml_tensor * llm_graph_context::build_attn(
                 inp->self_kvarn_rot_512, q_cur->ne[0]) != nullptr);
     }
 
+    // the dump records the rows as stored; keep the same rows from before the
+    // rotation available in case the model basis is asked for instead
+    ggml_tensor * k_pre = k_cur;
+    ggml_tensor * v_pre = v_cur;
+
     if (k_rot) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, k_rot);
         if (k_cur) {
@@ -4151,7 +4178,7 @@ ggml_tensor * llm_graph_context::build_attn(
     }
 
     // capture the rows that will be stored, after any cache-domain transform
-    capture_kv_dump(k_cur, v_cur, il);
+    capture_kv_dump(k_cur, v_cur, il, k_pre, v_pre);
 
     ggml_tensor * k_tail_written = nullptr;
     ggml_tensor * v_tail_written = nullptr;
@@ -4376,6 +4403,10 @@ ggml_tensor * llm_graph_context::build_attn(
 
     auto * k_rot = is_swa ? inp->self_k_rot_swa : inp->self_k_rot;
 
+    // the dump records the rows as stored; keep the same rows from before the
+    // rotation available in case the model basis is asked for instead
+    ggml_tensor * k_pre = k_cur;
+
     if (k_rot) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, k_rot);
         if (k_cur) {
@@ -4399,7 +4430,7 @@ ggml_tensor * llm_graph_context::build_attn(
         const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
 
         // this layer caches K only and derives V from it - capture K alone
-        capture_kv_dump(k_cur, nullptr, il);
+        capture_kv_dump(k_cur, nullptr, il, k_pre, nullptr);
 
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
     }
