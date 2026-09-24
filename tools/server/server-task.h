@@ -655,9 +655,20 @@ struct server_task_result_apply_lora : server_task_result {
     virtual json to_json() override;
 };
 
+// Anchor for the forced max-step cadence: the newest durable checkpoint when one
+// exists, otherwise the start of the prompt. Anchoring an empty list at 0 lets the
+// cadence seed the first checkpoint on its own; without it the earliest checkpoint
+// would still depend on a detected message boundary or the prompt-end fallback, and
+// everything before that boundary would stay unchecked.
+template <typename list_t>
+static inline int64_t server_prompt_checkpoint_max_step_anchor(const list_t & checkpoints) {
+    return checkpoints.empty() ? 0 : checkpoints.back().n_tokens;
+}
+
 // A forced max-step cadence is due once the next batch would start further than
-// max_step past the newest durable checkpoint, which keeps coverage independent of
-// where message boundaries happen to fall. 0 disables the cadence.
+// max_step past the anchor (see server_prompt_checkpoint_max_step_anchor), which
+// keeps coverage independent of where message boundaries happen to fall. 0 disables
+// the cadence.
 static inline bool server_prompt_checkpoint_max_step_due(
         int64_t n_tokens_start,
         int64_t n_tokens_last_checkpoint,

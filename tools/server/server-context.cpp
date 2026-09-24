@@ -4331,11 +4331,12 @@ private:
                     // A forced max-step cadence keeps coverage uniform regardless of where
                     // message boundaries happen to fall. Spacing lands in
                     // [max_step, max_step + n_batch) because checkpoints align to batches.
-                    const bool max_step_hit = !slot.prompt.checkpoints.empty() &&
-                            server_prompt_checkpoint_max_step_due(
-                                    n_tokens_start,
-                                    slot.prompt.checkpoints.back().n_tokens,
-                                    checkpoint_max_step);
+                    // An empty list anchors at the start of the prompt, so the cadence can
+                    // seed the first checkpoint instead of waiting for a message boundary.
+                    const bool max_step_hit = server_prompt_checkpoint_max_step_due(
+                            n_tokens_start,
+                            server_prompt_checkpoint_max_step_anchor(slot.prompt.checkpoints),
+                            checkpoint_max_step);
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;

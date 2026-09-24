@@ -77,6 +77,30 @@ static void checkpoint_max_step_cadence_is_off_by_default() {
     assert(!server_prompt_checkpoint_max_step_due(3000, 2048, 2048));
 }
 
+static void checkpoint_max_step_cadence_seeds_the_first_checkpoint() {
+    const std::list<common_prompt_checkpoint> empty;
+
+    // an empty list anchors at the start of the prompt so the cadence can seed the
+    // first checkpoint; the first batch still has nothing to capture
+    assert(server_prompt_checkpoint_max_step_anchor(empty) == 0);
+    assert(!server_prompt_checkpoint_max_step_due(
+            0, server_prompt_checkpoint_max_step_anchor(empty), 4096));
+    assert(server_prompt_checkpoint_max_step_due(
+            4096, server_prompt_checkpoint_max_step_anchor(empty), 4096));
+
+    // once a checkpoint exists the cadence measures from the newest one
+    const auto checkpoints = make_checkpoints({2000});
+    assert(server_prompt_checkpoint_max_step_anchor(checkpoints) == 2000);
+    assert(!server_prompt_checkpoint_max_step_due(
+            4000, server_prompt_checkpoint_max_step_anchor(checkpoints), 4096));
+    assert(server_prompt_checkpoint_max_step_due(
+            6096, server_prompt_checkpoint_max_step_anchor(checkpoints), 4096));
+
+    // the cadence stays off when disabled, even with an empty list
+    assert(!server_prompt_checkpoint_max_step_due(
+            99999, server_prompt_checkpoint_max_step_anchor(empty), 0));
+}
+
 static void checkpoint_reuse_selection_prefers_latest_valid_boundary() {
     const auto prompt = make_prompt_with_checkpoints({4096, 12000, 18000});
 
@@ -549,6 +573,7 @@ int main() {
     restore_transaction_validation_failure_identifies_prepare_leg();
     speculative_rollback_checkpoint_boundary();
     checkpoint_max_step_cadence_is_off_by_default();
+    checkpoint_max_step_cadence_seeds_the_first_checkpoint();
     checkpoint_reuse_selection_prefers_latest_valid_boundary();
     checkpoint_reuse_selection_respects_descriptor_alignment();
     checkpoint_eviction_preserves_prompt_anchors();
