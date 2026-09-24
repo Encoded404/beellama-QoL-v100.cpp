@@ -149,6 +149,12 @@ LLAMA_API void llama_set_kv_dump_layers(struct llama_context * ctx, const int32_
 // either way. Also settable with LLAMA_DUMP_KV_PRE_ROTATION.
 LLAMA_API void llama_set_kv_dump_pre_rotation(struct llama_context * ctx, bool value);
 
+// Which basis the K/V dump currently records: false for the rows as the cache
+// stores them, true for the model basis. Set by llama_set_kv_dump_pre_rotation()
+// or LLAMA_DUMP_KV_PRE_ROTATION. A consumer that labels a dump should read this
+// instead of assuming which switch was used.
+LLAMA_API bool llama_get_kv_dump_pre_rotation(struct llama_context * ctx);
+
 // Number of layers currently selected for KV dumping.
 LLAMA_API size_t llama_get_kv_dump_n_layers(struct llama_context * ctx);
 

@@ -130,6 +130,7 @@ struct llama_context {
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_kv_dump_layers(const std::vector<int32_t> & layers);
     void set_kv_dump_pre_rotation(bool value);
+    bool get_kv_dump_pre_rotation() const;
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -255,6 +256,19 @@ private:
     // from backend into the host-side kv_dump_k / kv_dump_v buffers
     void extract_kv_dump(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
 
+    // append this ubatch's graph input tokens, embeddings and published nextn
+    // hidden to the directory named by LLAMA_DUMP_INP_EMBD, when that is set
+    void dump_graph_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+
+    // append this ubatch's per-layer Q, attention output and K/V for every layer
+    // selected by cparams.kv_dump_layers to the directory named by
+    // LLAMA_DUMP_ATTN_IO, when that is set
+    void dump_attn_io(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+
+    // record the basis the K/V in the dump directories are in, so a reader never
+    // has to guess whether the cache type transformed them
+    void write_dump_basis() const;
+
     //
     // graph
     //
@@ -330,6 +344,14 @@ private:
     std::vector<int32_t>            kv_dump_layers;
     std::vector<buffer_view<float>> kv_dump_k;
     std::vector<buffer_view<float>> kv_dump_v;
+
+    // when non-empty (LLAMA_DUMP_INP_EMBD), graph input tokens, embeddings and the
+    // published nextn hidden are appended here, one file trio per architecture
+    std::string inp_dump_dir;
+
+    // when non-empty (LLAMA_DUMP_ATTN_IO), per-layer Q, attention output and K/V
+    // are appended here, one file set per layer and architecture
+    std::string attn_io_dump_dir;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

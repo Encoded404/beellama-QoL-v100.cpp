@@ -1727,6 +1727,12 @@ void llm_graph_result::reset() {
     t_kv_dump_v.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_kv_dump_v.begin(), t_kv_dump_v.end(), nullptr);
 
+    t_attn_dump_q.resize(LLAMA_MAX_LAYERS + 1);
+    std::fill(t_attn_dump_q.begin(), t_attn_dump_q.end(), nullptr);
+
+    t_attn_dump_out.resize(LLAMA_MAX_LAYERS + 1);
+    std::fill(t_attn_dump_out.begin(), t_attn_dump_out.end(), nullptr);
+
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -1775,6 +1781,16 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
         }
     }
     for (auto * tensor : t_kv_dump_v) {
+        if (tensor != nullptr) {
+            ggml_set_output(tensor);
+        }
+    }
+    for (auto * tensor : t_attn_dump_q) {
+        if (tensor != nullptr) {
+            ggml_set_output(tensor);
+        }
+    }
+    for (auto * tensor : t_attn_dump_out) {
         if (tensor != nullptr) {
             ggml_set_output(tensor);
         }
@@ -3081,6 +3097,67 @@ void llm_graph_context::capture_kv_dump(
     res->t_kv_dump_v[il] = to_rows(v_cur, "V");
 }
 
+void llm_graph_context::capture_attn_dump_q(ggml_tensor * q_cur, int il, ggml_tensor * q_pre) const {
+    if (!cparams.attn_io_dump || !wants_kv_dump(il) || q_cur == nullptr || n_tokens <= 0) {
+        return;
+    }
+
+    // see cparams.kv_dump_pre_rotation: keep the Q in the same basis as the K/V
+    // recorded for this layer, so the two can be checked against each other
+    if (cparams.kv_dump_pre_rotation && q_pre != nullptr) {
+        q_cur = q_pre;
+    }
+
+    // Q is [n_embd_head_k, n_head, n_tokens]
+    if (q_cur->ne[2] != n_tokens || q_cur->ne[3] != 1) {
+        LLAMA_LOG_ERROR("%s: layer %d: unexpected Q shape [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "] "
+                "for %" PRId64 " tokens; skipping the Q dump for this layer\n",
+                __func__, il, q_cur->ne[0], q_cur->ne[1], q_cur->ne[2], q_cur->ne[3], n_tokens);
+        return;
+    }
+
+    ggml_tensor * cur = q_cur->type == GGML_TYPE_F32 ? q_cur : ggml_cast(ctx0, q_cur, GGML_TYPE_F32);
+
+    ggml_tensor * rows = ggml_reshape_2d(ctx0, ggml_cont(ctx0, cur), cur->ne[0]*cur->ne[1], n_tokens);
+    ggml_build_forward_expand(gf, rows);
+
+    GGML_ASSERT((size_t) il < res->t_attn_dump_q.size());
+    res->t_attn_dump_q[il] = rows;
+}
+
+void llm_graph_context::capture_attn_dump_out(ggml_tensor * out_stored, int il, ggml_tensor * out_model) const {
+    if (!cparams.attn_io_dump || !wants_kv_dump(il) || out_stored == nullptr || n_tokens <= 0) {
+        return;
+    }
+
+    // see cparams.kv_dump_pre_rotation: the stored rows are the attention output
+    // as the cache holds it, before the V un-rotation, and the model basis is the
+    // same rows after it
+    ggml_tensor * cur = cparams.kv_dump_pre_rotation && out_model != nullptr ? out_model : out_stored;
+
+    // the attention output is [n_embd_head_v*n_head_v, n_tokens]; carry it to the
+    // same one-row-per-token layout the K/V dump uses
+    if (cur->ne[2] != n_tokens || cur->ne[3] != 1) {
+        if (cur->ne[1]*cur->ne[2]*cur->ne[3] != n_tokens) {
+            LLAMA_LOG_ERROR("%s: layer %d: unexpected attention output shape [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "] "
+                    "for %" PRId64 " tokens; skipping the attention output dump for this layer\n",
+                    __func__, il, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3], n_tokens);
+            return;
+        }
+        cur = ggml_reshape_3d(ctx0, cur, cur->ne[0], 1, n_tokens);
+    }
+
+    if (cur->type != GGML_TYPE_F32) {
+        cur = ggml_cast(ctx0, cur, GGML_TYPE_F32);
+    }
+
+    ggml_tensor * rows = ggml_reshape_2d(ctx0, ggml_cont(ctx0, cur), cur->ne[0]*cur->ne[1], n_tokens);
+    ggml_build_forward_expand(gf, rows);
+
+    GGML_ASSERT((size_t) il < res->t_attn_dump_out.size());
+    res->t_attn_dump_out[il] = rows;
+}
+
 ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * q,
          ggml_tensor * k,
@@ -3419,10 +3496,14 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = k_cur;
     ggml_tensor * v = v_cur;
 
-    // no cache on this path - capture the K/V the layer attends over
+    // no cache on this path - capture the K/V the layer attends over, and the Q
+    // and attention output alongside it. this route transforms neither, so both
+    // bases coincide and no alternative tensor has to be offered.
     capture_kv_dump(k_cur, v_cur, il);
+    capture_attn_dump_q(q_cur, il);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    capture_attn_dump_out(cur, il);
     cb(cur, "kqv_out", il);
 
     if (wo) {
@@ -3696,6 +3777,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // the dump records the rows as stored; keep the same rows from before the
     // rotation available in case the model basis is asked for instead
+    ggml_tensor * q_pre = q_cur;
     ggml_tensor * k_pre = k_cur;
     ggml_tensor * v_pre = v_cur;
 
@@ -3721,6 +3803,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // capture the rows that will be stored, after any cache-domain transform
     capture_kv_dump(k_cur, v_cur, il, k_pre, v_pre);
+    capture_attn_dump_q(q_cur, il, q_pre);
 
     // store to KV cache
     {
@@ -3900,6 +3983,10 @@ ggml_tensor * llm_graph_context::build_attn(
     }
     cb(cur, "kqv_out", il);
 
+    // the attention output is un-rotated below - keep the stored side of that so
+    // the dump can record either basis
+    ggml_tensor * out_stored = cur;
+
     if (use_kvarn_rotated_domain) {
         GGML_ASSERT(cur->type == GGML_TYPE_F32);
         GGML_ASSERT(kvarn_rot != nullptr);
@@ -3907,6 +3994,8 @@ ggml_tensor * llm_graph_context::build_attn(
     } else if (inp->self_v_rot) {
         cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
     }
+
+    capture_attn_dump_out(out_stored, il, cur);
 
     if (wo) {
         if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
@@ -4150,6 +4239,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // the dump records the rows as stored; keep the same rows from before the
     // rotation available in case the model basis is asked for instead
+    ggml_tensor * q_pre = q_cur;
     ggml_tensor * k_pre = k_cur;
     ggml_tensor * v_pre = v_cur;
 
@@ -4179,6 +4269,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // capture the rows that will be stored, after any cache-domain transform
     capture_kv_dump(k_cur, v_cur, il, k_pre, v_pre);
+    capture_attn_dump_q(q_cur, il, q_pre);
 
     ggml_tensor * k_tail_written = nullptr;
     ggml_tensor * v_tail_written = nullptr;
@@ -4363,6 +4454,10 @@ ggml_tensor * llm_graph_context::build_attn(
     }
     cb(cur, "kqv_out", il);
 
+    // the attention output is un-rotated below - keep the stored side of that so
+    // the dump can record either basis
+    ggml_tensor * out_stored = cur;
+
     if (use_kvarn_rotated_domain) {
         GGML_ASSERT(cur->type == GGML_TYPE_F32);
         GGML_ASSERT(kvarn_rot != nullptr);
@@ -4370,6 +4465,8 @@ ggml_tensor * llm_graph_context::build_attn(
     } else if (v_rot) {
         cur = llama_mul_mat_hadamard(ctx0, cur, v_rot);
     }
+
+    capture_attn_dump_out(out_stored, il, cur);
 
     if (wo) {
         cur = build_lora_mm(wo, cur, wo_s);

@@ -979,6 +979,7 @@ public:
     virtual ~llm_graph_result() = default;
 
     ggml_tensor * get_inp_tokens()  const { return t_inp_tokens; }
+    ggml_tensor * get_inp_embd()    const { return t_inp_embd; }
     ggml_tensor * get_logits()      const { return t_logits; }
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
@@ -990,6 +991,11 @@ public:
     // selects the layer - null otherwise
     ggml_tensor * get_kv_dump_k(int il) const { return t_kv_dump_k[il]; }
     ggml_tensor * get_kv_dump_v(int il) const { return t_kv_dump_v[il]; }
+
+    // per-layer Q and attention output, only when cparams.attn_io_dump is set and
+    // cparams.kv_dump_layers selects the layer - null otherwise
+    ggml_tensor * get_attn_dump_q(int il) const { return t_attn_dump_q[il]; }
+    ggml_tensor * get_attn_dump_out(int il) const { return t_attn_dump_out[il]; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -1030,6 +1036,11 @@ public:
     // rows are [n_embd_k_gqa(il), n_tokens] and [n_embd_v_gqa(il), n_tokens]
     std::vector<ggml_tensor *> t_kv_dump_k;
     std::vector<ggml_tensor *> t_kv_dump_v;
+
+    // indexed by layer like t_kv_dump_k; rows are [n_embd_head_k*n_head, n_tokens]
+    // (Q) and the same shape for the attention output before the output projection
+    std::vector<ggml_tensor *> t_attn_dump_q;
+    std::vector<ggml_tensor *> t_attn_dump_out;
 
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_sampled_probs;
@@ -1294,6 +1305,19 @@ struct llm_graph_context {
     // nothing.
     void capture_kv_dump(ggml_tensor * k_cur, ggml_tensor * v_cur, int il,
                          ggml_tensor * k_pre = nullptr, ggml_tensor * v_pre = nullptr) const;
+
+    // Record the Q layer il computes, and the attention output it produces, as
+    // graph outputs. Used to check the dumped K/V against the model's own
+    // attention: softmax(Q*K*scale) * V must reproduce the output. No-op unless
+    // cparams.attn_io_dump is set and the layer is selected for dumping.
+    //
+    // q_pre is the same Q from before the cache-domain transform, and out_model
+    // the attention output from after the V un-rotation. When
+    // cparams.kv_dump_pre_rotation is set they are preferred, so every recorded
+    // tensor in a dump is in the model basis. Leave them null on routes that do
+    // not transform Q/V.
+    void capture_attn_dump_q  (ggml_tensor * q_cur,      int il, ggml_tensor * q_pre     = nullptr) const;
+    void capture_attn_dump_out(ggml_tensor * out_stored, int il, ggml_tensor * out_model = nullptr) const;
 
     ggml_tensor * build_attn_mha(
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]

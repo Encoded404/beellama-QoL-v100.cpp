@@ -548,7 +548,11 @@ int main(int argc, char ** argv) {
         // asked for explicitly
         if (params.dump_kv_pre_rotation) {
             llama_set_kv_dump_pre_rotation(ctx, true);
+        }
 
+        // read the basis back instead of trusting the flag above: the environment
+        // can have set it too, and the arrays must be labelled with what they are
+        if (llama_get_kv_dump_pre_rotation(ctx)) {
             LOG_INF("%s: recording the K/V rows from the model basis, before any cache-domain transform\n", __func__);
         } else {
             LOG_INF("%s: recording the K/V rows as stored by the KV cache\n", __func__);
@@ -812,7 +816,7 @@ int main(int argc, char ** argv) {
             // record which basis the K/V arrays above are in, so a reader never has
             // to guess whether the cache type transformed them: 0 = as stored by the
             // cache, 1 = model basis, from before the cache-domain transform
-            const int32_t kv_basis = params.dump_kv_pre_rotation ? 1 : 0;
+            const int32_t kv_basis = llama_get_kv_dump_pre_rotation(ctx) ? 1 : 0;
             entries.push_back({ "kv_basis",
                     make_npy("<i4", { 1 }, &kv_basis, sizeof(kv_basis)) });
         }

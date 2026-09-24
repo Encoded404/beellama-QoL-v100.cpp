@@ -332,19 +332,6 @@ llama_context::llama_context(
     cparams.embeddings              = params.embeddings;
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
-
-    // the K/V dump records the rows as the cache stores them by default; recording
-    // the model basis is opt-in and off the usual path, so it costs nothing unset
-    cparams.kv_dump_pre_rotation    = false;
-
-    const char * LLAMA_DUMP_KV_PRE_ROTATION = getenv("LLAMA_DUMP_KV_PRE_ROTATION");
-    if (LLAMA_DUMP_KV_PRE_ROTATION != nullptr && LLAMA_DUMP_KV_PRE_ROTATION[0] != '\0' &&
-            strcmp(LLAMA_DUMP_KV_PRE_ROTATION, "0") != 0) {
-        cparams.kv_dump_pre_rotation = true;
-
-        LLAMA_LOG_WARN("%s: recording K/V dumps from before the cache-domain transform (model basis)\n", __func__);
-    }
-
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
@@ -709,6 +696,117 @@ llama_context::llama_context(
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
         }
+    }
+
+    // the graph dumps are opt-in and off the usual path: each one costs a
+    // synchronize plus a host copy per ubatch, and writes to disk
+    {
+        const char * LLAMA_DUMP_INP_EMBD = getenv("LLAMA_DUMP_INP_EMBD");
+        if (LLAMA_DUMP_INP_EMBD != nullptr && LLAMA_DUMP_INP_EMBD[0] != '\0') {
+            inp_dump_dir = LLAMA_DUMP_INP_EMBD;
+
+            LLAMA_LOG_WARN("%s: appending graph inputs for %s to %s\n",
+                    __func__, model.arch_name().c_str(), inp_dump_dir.c_str());
+        }
+
+        // same, for the per-layer Q and attention output of the K/V-dumped layers
+        const char * LLAMA_DUMP_ATTN_IO = getenv("LLAMA_DUMP_ATTN_IO");
+        if (LLAMA_DUMP_ATTN_IO != nullptr && LLAMA_DUMP_ATTN_IO[0] != '\0') {
+            attn_io_dump_dir = LLAMA_DUMP_ATTN_IO;
+            cparams.attn_io_dump = true;
+
+            LLAMA_LOG_WARN("%s: appending per-layer Q/attention output for %s to %s\n",
+                    __func__, model.arch_name().c_str(), attn_io_dump_dir.c_str());
+        }
+
+        // LLAMA_DUMP_KV_LAYERS carries the same layer selection the embedding-dump
+        // tool sets through llama_set_kv_dump_layers, so a speculative run can
+        // record the target and the draft model without either binary cooperating.
+        // Layers outside this model are ignored, so one list can serve both models.
+        const char * LLAMA_DUMP_KV_LAYERS = getenv("LLAMA_DUMP_KV_LAYERS");
+        if (LLAMA_DUMP_KV_LAYERS != nullptr && LLAMA_DUMP_KV_LAYERS[0] != '\0') {
+            const std::string spec = LLAMA_DUMP_KV_LAYERS;
+
+            std::vector<int32_t> layers;
+            for (size_t pos = 0; pos <= spec.size(); ) {
+                const size_t comma = spec.find(',', pos);
+                const std::string tok = spec.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+
+                if (!tok.empty()) {
+                    size_t used = 0;
+                    long il = -1;
+                    try {
+                        il = std::stol(tok, &used);
+                    } catch (const std::exception &) {
+                        used = 0;
+                    }
+
+                    if (used != tok.size()) {
+                        LLAMA_LOG_WARN("%s: LLAMA_DUMP_KV_LAYERS: '%s' is not a layer index; ignoring it\n",
+                                __func__, tok.c_str());
+                    } else if (il < 0 || il >= (int32_t) model.hparams.n_layer()) {
+                        LLAMA_LOG_WARN("%s: LLAMA_DUMP_KV_LAYERS: layer %ld is outside this model's [0, %d); ignoring it\n",
+                                __func__, il, (int32_t) model.hparams.n_layer());
+                    } else {
+                        layers.push_back((int32_t) il);
+                    }
+                }
+
+                if (comma == std::string::npos) {
+                    break;
+                }
+                pos = comma + 1;
+            }
+
+            if (!layers.empty()) {
+                try {
+                    set_kv_dump_layers(layers);
+                } catch (const std::exception & e) {
+                    LLAMA_LOG_ERROR("%s: LLAMA_DUMP_KV_LAYERS failed: %s\n", __func__, e.what());
+                }
+
+                // the Q and attention output come from the same selection: with no
+                // directory for them this path would write nothing at all, so say
+                // that instead of failing silently
+                if (attn_io_dump_dir.empty()) {
+                    LLAMA_LOG_ERROR("%s: LLAMA_DUMP_KV_LAYERS is set but LLAMA_DUMP_ATTN_IO is not; "
+                            "this path records the K/V together with the Q and attention output, "
+                            "so nothing will be written. use llama-embedding-dump for a K/V-only dump\n", __func__);
+                } else {
+                    cparams.attn_io_dump = true;
+
+                    LLAMA_LOG_WARN("%s: recording %zu layer(s) of %s (K/V, Q, attention output)\n",
+                            __func__, layers.size(), model.arch_name().c_str());
+                }
+            }
+        }
+
+        // the per-layer dump is driven by the layer selection, so one without the
+        // other records nothing
+        if (cparams.attn_io_dump && kv_dump_layers.empty()) {
+            LLAMA_LOG_ERROR("%s: LLAMA_DUMP_ATTN_IO is set but no layers are selected "
+                    "(LLAMA_DUMP_KV_LAYERS); nothing will be recorded\n", __func__);
+        }
+
+        // record the model basis instead of the rows as the cache stores them
+        const char * LLAMA_DUMP_KV_PRE_ROTATION = getenv("LLAMA_DUMP_KV_PRE_ROTATION");
+        if (LLAMA_DUMP_KV_PRE_ROTATION != nullptr && LLAMA_DUMP_KV_PRE_ROTATION[0] != '\0' &&
+                strcmp(LLAMA_DUMP_KV_PRE_ROTATION, "0") != 0) {
+            cparams.kv_dump_pre_rotation = true;
+
+            LLAMA_LOG_WARN("%s: recording dumps from before the cache-domain transform (model basis)\n", __func__);
+
+            // the option moves the rows a rotation produced; a KVarN cache stores
+            // records of its own, and the dump records those as they are
+            if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
+                LLAMA_LOG_ERROR("%s: LLAMA_DUMP_KV_PRE_ROTATION has no effect on a KVarN cache; "
+                        "the recorded K/V stay in the cache's record domain\n", __func__);
+            }
+        }
+
+        // the dumps append rather than truncate, so a stale or missing directory is
+        // easy to misread: state the basis, and complain when it cannot be written
+        write_dump_basis();
     }
 
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
@@ -1854,6 +1952,10 @@ void llama_context::set_kv_dump_pre_rotation(bool value) {
     sched_need_reserve = true;
 }
 
+bool llama_context::get_kv_dump_pre_rotation() const {
+    return cparams.kv_dump_pre_rotation;
+}
+
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
@@ -2242,6 +2344,10 @@ int llama_context::encode(const llama_batch & batch_inp) {
 
     // extract the per-layer K/V rows selected for dumping
     extract_kv_dump(res, 0, n_tokens);
+
+    dump_graph_inputs(res, 0, n_tokens);
+
+    dump_attn_io(res, 0, n_tokens);
 
     // TODO: hacky solution
     if (model.arch == LLM_ARCH_T5 && t_embd) {
@@ -2643,6 +2749,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         extract_kv_dump(res, n_tokens_prev, ubatch.n_tokens);
 
+        dump_graph_inputs(res, n_tokens_prev, ubatch.n_tokens);
+
+        dump_attn_io(res, n_tokens_prev, ubatch.n_tokens);
+
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
         {
@@ -3003,6 +3113,170 @@ void llama_context::extract_kv_dump(const llm_graph_result * res, size_t token_o
             GGML_ASSERT(backend != nullptr);
 
             ggml_backend_tensor_get_async(backend, t, buf.data + dst_offset, 0, n_floats*sizeof(float));
+        }
+    }
+}
+
+// Record the basis the K/V in the attn-io dump directory are in. The rows can be
+// the ones the cache stores, which a quantized cache type rotates for
+// quantization, or the model basis (LLAMA_DUMP_KV_PRE_ROTATION). Files append
+// across runs, so a reader that does not know which one it is looking at can
+// compare two dumps that were never comparable.
+void llama_context::write_dump_basis() const {
+    if (attn_io_dump_dir.empty()) {
+        return;
+    }
+
+    const std::string path = attn_io_dump_dir + "/kv_basis.txt";
+
+    if (FILE * f = fopen(path.c_str(), "w")) {
+        fprintf(f, "%s\n", cparams.kv_dump_pre_rotation ? "model" : "stored");
+        fclose(f);
+    } else {
+        LLAMA_LOG_ERROR("%s: cannot write %s; is %s a writable directory?\n",
+                __func__, path.c_str(), attn_io_dump_dir.c_str());
+    }
+}
+
+void llama_context::dump_graph_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
+    if (inp_dump_dir.empty() || n_tokens == 0) {
+        return;
+    }
+
+    ggml_tensor * t_tokens = res->get_inp_tokens();
+    ggml_tensor * t_embd   = res->get_inp_embd();
+    ggml_tensor * t_nextn  = res->get_h_nextn();
+
+    if (t_tokens == nullptr && t_embd == nullptr && t_nextn == nullptr) {
+        return;
+    }
+
+    // the graph outputs are copied asynchronously, and these inputs may still be
+    // in flight, so settle the queue before reading them back synchronously
+    synchronize();
+
+    // files are namespaced by architecture: a speculative run records both the
+    // target and the draft model, and they must not share a file
+    const std::string tag = model.arch_name();
+
+    const auto append = [&](const std::string & name, const void * data, size_t n_bytes) {
+        const std::string path = inp_dump_dir + "/" + name + "." + tag + ".bin";
+
+        if (FILE * f = fopen(path.c_str(), "ab")) {
+            fwrite(data, 1, n_bytes, f);
+            fclose(f);
+        } else {
+            LLAMA_LOG_ERROR("%s: cannot append to %s\n", __func__, path.c_str());
+        }
+    };
+
+    if (t_tokens != nullptr) {
+        const size_t n = std::min<size_t>(ggml_nelements(t_tokens), n_tokens);
+
+        std::vector<llama_token> buf(n);
+
+        ggml_backend_tensor_get(t_tokens, buf.data(), 0, n*sizeof(llama_token));
+
+        append("inp_tokens", buf.data(), n*sizeof(llama_token));
+    }
+
+    if (t_embd != nullptr) {
+        // t_inp_embd is [n_embd_inp, n_tokens]: for a draft model this is the
+        // hidden state handed over by the target, for a regular model it is the
+        // scaled input embedding
+        const size_t n_embd = t_embd->ne[0];
+        const size_t n      = std::min<size_t>(t_embd->ne[1], n_tokens);
+
+        std::vector<float> buf(n_embd*n);
+
+        ggml_backend_tensor_get(t_embd, buf.data(), 0, n_embd*n*sizeof(float));
+
+        append("inp_embd", buf.data(), n_embd*n*sizeof(float));
+
+        // one line per ubatch, so the reader can reconstruct the row order
+        if (FILE * m = fopen((inp_dump_dir + "/inp_meta.txt").c_str(), "a")) {
+            fprintf(m, "%s %zu %zu %zu\n", tag.c_str(), n_embd, n, token_offset);
+            fclose(m);
+        } else {
+            LLAMA_LOG_ERROR("%s: cannot append to %s/inp_meta.txt\n", __func__, inp_dump_dir.c_str());
+        }
+    }
+
+    // the hidden state this graph publishes for a nextn/draft model: for a target
+    // it is what the spec hook hands over, for a draft it is its own chained
+    // output. Recording both sides of the hand-off is the point.
+    if (t_nextn != nullptr) {
+        const size_t n_embd = t_nextn->ne[0];
+        const size_t n      = std::min<size_t>(t_nextn->ne[1], n_tokens);
+
+        std::vector<float> buf(n_embd*n);
+
+        ggml_backend_tensor_get(t_nextn, buf.data(), 0, n_embd*n*sizeof(float));
+
+        append("nextn_hidden", buf.data(), n_embd*n*sizeof(float));
+
+        if (FILE * m = fopen((inp_dump_dir + "/nextn_meta.txt").c_str(), "a")) {
+            fprintf(m, "%s %zu %zu %zu\n", tag.c_str(), n_embd, n, token_offset);
+            fclose(m);
+        } else {
+            LLAMA_LOG_ERROR("%s: cannot append to %s/nextn_meta.txt\n", __func__, inp_dump_dir.c_str());
+        }
+    }
+}
+
+void llama_context::dump_attn_io(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
+    if (attn_io_dump_dir.empty() || n_tokens == 0 || kv_dump_layers.empty()) {
+        return;
+    }
+
+    synchronize();
+
+    const std::string tag = model.arch_name();
+
+    for (size_t i = 0; i < kv_dump_layers.size(); ++i) {
+        const int il = kv_dump_layers[i];
+
+        // the Q the layer computed, the output its attention produced, and the
+        // K/V it handed to the cache (or attended over, when it runs without one)
+        for (int which = 0; which < 4; ++which) {
+            ggml_tensor * t = which == 0 ? res->get_attn_dump_q(il) :
+                              which == 1 ? res->get_attn_dump_out(il) :
+                              which == 2 ? res->get_kv_dump_k(il) :
+                                           res->get_kv_dump_v(il);
+            if (t == nullptr) {
+                continue;
+            }
+
+            static const char * kind_names[4] = { "q_l", "attn_out_l", "k_l", "v_l" };
+
+            const size_t n_floats = ggml_nelements(t);
+            if (n_floats % n_tokens != 0) {
+                LLAMA_LOG_ERROR("%s: layer %d: %zu floats for %zu tokens; skipping\n",
+                        __func__, il, n_floats, n_tokens);
+                continue;
+            }
+            const size_t row = n_floats / n_tokens;
+
+            std::vector<float> buf(n_floats);
+            ggml_backend_tensor_get(t, buf.data(), 0, n_floats*sizeof(float));
+
+            const std::string path = attn_io_dump_dir + "/" + kind_names[which] +
+                    std::to_string(il) + "." + tag + ".bin";
+            if (FILE * f = fopen(path.c_str(), "ab")) {
+                fwrite(buf.data(), sizeof(float), n_floats, f);
+                fclose(f);
+            } else {
+                LLAMA_LOG_ERROR("%s: cannot append to %s\n", __func__, path.c_str());
+            }
+
+            if (which == 0) {
+                if (FILE * m = fopen((attn_io_dump_dir + "/attn_io_meta.txt").c_str(), "a")) {
+                    fprintf(m, "%s %d %zu %zu %zu\n", tag.c_str(), il, row, n_tokens, token_offset);
+                    fclose(m);
+                } else {
+                    LLAMA_LOG_ERROR("%s: cannot append to %s/attn_io_meta.txt\n", __func__, attn_io_dump_dir.c_str());
+                }
+            }
         }
     }
 }
@@ -5124,6 +5398,10 @@ void llama_set_kv_dump_layers(llama_context * ctx, const int32_t * layers, size_
 
 void llama_set_kv_dump_pre_rotation(llama_context * ctx, bool value) {
     ctx->set_kv_dump_pre_rotation(value);
+}
+
+bool llama_get_kv_dump_pre_rotation(llama_context * ctx) {
+    return ctx->get_kv_dump_pre_rotation();
 }
 
 size_t llama_get_kv_dump_n_layers(llama_context * ctx) {

@@ -34,7 +34,12 @@ struct llama_cparams {
 
     bool embeddings;
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
-    bool embeddings_nextn_raw;    // expose the raw last-layer hidden instead of the post-norm state
+    // expose the raw last-layer hidden instead of the post-norm state. gemma4.cpp
+    // reads this on every nextn build, so it has to be deterministic, and every
+    // draft head and recorded corpus so far has been fed the raw form: true keeps
+    // that, while the post-norm LM-head input (what the reference drafter consumes)
+    // is the alternative and would need the corpora re-dumped.
+    bool embeddings_nextn_raw = true;
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
     bool causal_attn;
     bool offload_kqv;
@@ -62,13 +67,21 @@ struct llama_cparams {
     // head can be trained against them offline.
     std::vector<bool> kv_dump_layers;
 
+    // also record the Q each selected layer computes and the attention output it
+    // produces, so the recorded K/V can be checked against the model's own
+    // attention. only reachable from LLAMA_DUMP_ATTN_IO / LLAMA_DUMP_KV_LAYERS,
+    // which record all three together
+    bool attn_io_dump = false;
+
     // record the rows above before the cache-domain transform instead of after it.
-    // a quantized cache type rotates K/V into a basis that is cheaper to quantize;
-    // the rotation cancels out at attention time because the query is rotated with
-    // it, so the stored rows are the right thing to record for inspecting a cache
-    // but are not the rows a trainer or a draft head consumes. false (the default)
-    // records the stored rows; true records the model basis. has no effect on
-    // layers whose attention route does not transform K/V.
+    // a quantized cache type rotates Q, K and V into a basis that is cheaper to
+    // quantize; the rotation cancels out at attention time because the query is
+    // rotated with it, so the stored rows are the right thing to record for
+    // inspecting a cache but are not the rows a trainer or a draft head consumes.
+    // false (the default) records the stored rows; true records the model basis -
+    // Q and K/V from before the rotation and the attention output from after the
+    // un-rotation - so a dump never mixes bases. has no effect on layers whose
+    // attention route does not transform K/V.
     bool kv_dump_pre_rotation = false;
 
     enum llama_context_type ctx_type;
