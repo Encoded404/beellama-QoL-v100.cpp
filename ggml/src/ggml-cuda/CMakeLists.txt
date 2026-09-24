@@ -108,6 +108,11 @@ if (CUDAToolkit_FOUND)
     else()
         list(FILTER GGML_SOURCES_CUDA EXCLUDE REGEX "kvarn(-wht)?[.]cu$")
     endif()
+    # fattn-sm70-d256.cu stays in the source list either way: the route is queried from
+    # the kernel selector, so the file stubs itself out when the option is off.
+    if (GGML_CUDA_SM70_D256)
+        add_compile_definitions(GGML_CUDA_SM70_D256)
+    endif()
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")

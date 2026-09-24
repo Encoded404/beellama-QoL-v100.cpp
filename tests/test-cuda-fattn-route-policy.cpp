@@ -127,6 +127,24 @@ int main(int argc, char ** argv) {
                  cuda_caps.rotated_query_max_portable == UINT32_MAX,
         "Turing-or-newer CUDA must expose independent portable and specialized KVarN capabilities");
 
+    // Volta (sm_70) is the combination that used to be untested: its m8n8k4 fragments
+    // reach the generic-mma and decode-vector routes, but the ldmatrix-fed split-decode
+    // kernel is Turing-only, so decode_split must stay false.
+    const auto volta_cuda_caps = ggml_cuda_fattn_kvarn_select_capabilities({
+        GGML_CUDA_FATTN_KVARN_BACKEND_CUDA, 32, true, false, true, 1024, 48*1024, 4*1024,
+    });
+    ok &= expect(volta_cuda_caps.generic_mma &&
+                 !volta_cuda_caps.decode_split &&
+                 volta_cuda_caps.decode_vector &&
+                 volta_cuda_caps.portable_native &&
+                 volta_cuda_caps.specialized_routes &&
+                 volta_cuda_caps.store_materialize &&
+                 volta_cuda_caps.original_v_domain &&
+                 (volta_cuda_caps.route_families & GGML_CUDA_FATTN_KVARN_FAMILY_DECODE_SPLIT) == 0 &&
+                 volta_cuda_caps.rotated_query_max_specialized == 16 &&
+                 volta_cuda_caps.rotated_query_max_portable == UINT32_MAX,
+        "Volta CUDA must expose generic-mma/decode-vector without the ldmatrix split decode");
+
     const auto pre_turing_cuda_caps = ggml_cuda_fattn_kvarn_select_capabilities({
         GGML_CUDA_FATTN_KVARN_BACKEND_CUDA, 32, false, false, true, 1024, 48*1024, 4*1024,
     });

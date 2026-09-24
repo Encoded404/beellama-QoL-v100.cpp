@@ -10908,6 +10908,32 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Volta D256 split-D prefill trigger geometry (see fattn-sm70-d256.cuh): head_dim
+    // 256, causal mask, and Q length >= 256. The prefill block above stops at nb=64,
+    // which stays on the stock route. Note the route is opt-in until it is validated on
+    // hardware, so exercising it on a V100 requires LLAMA_SM70_D256=1 in the
+    // environment; these shapes are what the split-D kernel is then checked against.
+    for (int kv : { 1024, 2048, }) {
+        for (int nb : { 256, 512, }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 8, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
+
+    // The same trigger geometry across the full KV cache type range the route accepts
+    // (F16 is read directly; everything else goes through the f16 mirror).
+    for (ggml_type type_KV : { GGML_TYPE_Q8_0, GGML_TYPE_Q6_1, GGML_TYPE_Q6_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0,
+                               GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_Q3_1, GGML_TYPE_Q3_0, GGML_TYPE_Q2_1,
+                               GGML_TYPE_Q2_0S, GGML_TYPE_IQ4_NL, GGML_TYPE_BF16 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 8, {4, 1}, 1024, 256, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+    }
+
+    // nr23[1] == 2 makes Q->ne[3] == 2, so the mask has a real batch axis rather than
+    // broadcasting. The route indexes the mask per batch, and every other case here
+    // uses nr23 = {4, 1}, which would not exercise that.
+    for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q4_0 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 8, {4, 2}, 1024, 256, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+    }
+
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {
             if (hsk != 192 && hsk != 320 && hsk != 576 && hsk != hsv) continue;

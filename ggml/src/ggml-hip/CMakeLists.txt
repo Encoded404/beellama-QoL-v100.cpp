@@ -66,6 +66,9 @@ if (GGML_CUDA_KVARN)
 else()
     list(FILTER GGML_SOURCES_ROCM EXCLUDE REGEX "kvarn(-wht)?[.]cu$")
 endif()
+# GGML_CUDA_SM70_D256 is deliberately not forwarded: the split-D prefill kernel is
+# sm_70/NVIDIA-specific, so fattn-sm70-d256.cu compiles its stub branch here and the
+# route never selects on an AMD device.
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")

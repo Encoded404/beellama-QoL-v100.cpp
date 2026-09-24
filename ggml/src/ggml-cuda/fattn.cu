@@ -396,7 +396,9 @@ static ggml_type ggml_cuda_fattn_canonical_kv_type(ggml_type type) {
     return type == GGML_TYPE_F32 ? GGML_TYPE_F16 : type;
 }
 
-static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
+// Non-static so the SM70 D256 split-D route can reuse the exact same type contract
+// instead of duplicating the list; see fattn.cuh.
+bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
     switch (ggml_cuda_fattn_canonical_kv_type(type)) {
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16:
@@ -522,10 +524,11 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 
 // Best FlashAttention kernel for a specific GPU:
 enum best_fattn_kernel {
-    BEST_FATTN_KERNEL_NONE    =   0,
-    BEST_FATTN_KERNEL_TILE    = 200,
-    BEST_FATTN_KERNEL_VEC     = 100,
-    BEST_FATTN_KERNEL_MMA_F16 = 400,
+    BEST_FATTN_KERNEL_NONE      =   0,
+    BEST_FATTN_KERNEL_TILE      = 200,
+    BEST_FATTN_KERNEL_VEC       = 100,
+    BEST_FATTN_KERNEL_MMA_F16   = 400,
+    BEST_FATTN_KERNEL_SM70_D256 = 500, // Volta D256 split-D prefill (fattn-sm70-d256.cuh)
 };
 
 // Internal hint used by the compact exact-tail pass. On pre-Ada tensor-core
@@ -674,6 +677,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     if (volta_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+        // Volta D256 prefill: split-D kernel (fattn-sm70-d256.cuh). Checked before the
+        // VEC/TILE/MMA_F16 decisions so it takes precedence for its target geometry.
+        if (ggml_cuda_sm70_d256_supported(cc, dst)) {
+            return BEST_FATTN_KERNEL_SM70_D256;
+        }
         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
             return BEST_FATTN_KERNEL_VEC;
         }
@@ -760,6 +768,12 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = true;
             need_f16_V = true;
             break;
+        case BEST_FATTN_KERNEL_SM70_D256:
+            // F16 is read directly; every other accepted KV type is materialized into
+            // the f16 mirror by the launcher, same as the stock MMA_F16 route.
+            need_f16_K = true;
+            need_f16_V = true;
+            break;
         case BEST_FATTN_KERNEL_VEC:
             need_f16_K = K->type == GGML_TYPE_F32;
             need_f16_V = V->type == GGML_TYPE_F32;
@@ -786,6 +800,9 @@ static void ggml_cuda_flash_attn_ext_dispatch(ggml_backend_cuda_context & ctx, g
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_SM70_D256:
+            ggml_cuda_flash_attn_ext_sm70_d256(ctx, dst);
             break;
     }
 }

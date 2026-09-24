@@ -183,6 +183,56 @@ does not contain device code for those architectures. Build coverage proves
 that a translation unit accepts a target; it does not prove runtime
 correctness, memory behavior, or performance on that GPU.
 
+### Volta D256 split-D prefill (standard caches)
+
+Separately from KVarN, Volta has its own D256 prefill route for ordinary
+(non-KVarN) K/V caches. The stock `mma_f16` prefill configuration for that
+geometry (`<256,256,32,2>`) holds the complete 256-wide PV accumulator in every
+warp and spills; ptxas reports 496 bytes of stack at the 255-register cap. The
+split-D kernel in `fattn-sm70-d256.cu` pairs two warps on the same Q rows
+instead: the pair splits the KV columns for QK, passes the scores through a
+pair-shared shared-memory tile, and then splits the output dimension for PV so
+each warp accumulates only 128 of the 256 dims. Spill drops to 48 bytes of stack
+at the same register budget. Upstream issue #28037 documents why this is the
+remaining lever on Volta: the gap to Turing and newer is architectural (m8n8k4,
+no `ldmatrix`, no `cp.async`) and cannot be closed by configuration tuning.
+
+The route applies only when every one of these holds: Volta device, `head_dim`
+256 for Q/K/V, causal prefill with `ne01 >= 256`, and no ALiBi, logit softcap,
+or attention sinks. Everything else keeps the existing route, and a KVarN
+FlashAttention op never reaches this code at all because KVarN is resolved
+before the ordinary kernel selection.
+
+**Cache types.** The route accepts the same K/V type contract as the rest of
+the CUDA FlashAttention path, and 256 is a multiple of every accepted block
+size, so the whole quantized range is usable:
+
+- **F16** is read directly from the cache.
+- **Every other accepted type** (Q8_0, Q6_0/Q6_1, Q5_0/Q5_1, Q4_0/Q4_1,
+  Q3_0/Q3_1, Q2_0S/Q2_1, BF16, IQ4_NL, F32) is materialized into the f16 mirror
+  by the launcher, exactly as the stock `mma_f16` route does. K and V may use
+  different types, so `-ctk q4_0 -ctv f16` works.
+- The mirror is transient, sized to the visible `kv_len`, and laid out
+  `[batch][head][kv][D]`. It is not free (~470 MB at a 229k context with a
+  `q4_0` K and 4 KV heads) but the dequantization itself is a small fraction of
+  prefill time, which is why in-kernel quantized loads are not worth it here:
+  a hand-rolled q4-direct variant measured **3.6% slower** at 176k because the
+  narrow per-block loads cost more than the bulk dequant pass they replace.
+
+The 3-way KV split (SplitKV3) is still not part of this route.
+
+The kernel is compiled by `-DGGML_CUDA_SM70_D256=ON` (the default). With the
+option off, `fattn-sm70-d256.cu` stubs itself out and the route never selects.
+
+| Env var | Default | Behavior |
+|---|---|---|
+| `LLAMA_SM70_D256` | unset | **Opt-in while the route is unvalidated on hardware.** Only `1` (or any value other than `0`) enables it; unset or `0` keeps the stock kernel. Once a real V100 passes the correctness gates this flips to opt-out, matching the other Volta tuning knobs. |
+| `LLAMA_SM70_D256_DEBUG` | unset | `1` prints every route decision instead of only the first one |
+
+This route is compile-verified for sm_70 but has not been validated on a real
+V100; treat it as requiring real-device validation, like the other pre-Turing
+entries in the table above. That is why it ships opt-in.
+
 | HIP architecture | Physical wave | Native KVarN route |
 |---|---:|---|
 | RDNA3, RDNA3.5, RDNA4 | 32 | WMMA generic/prefill and occupancy-selected split decode |

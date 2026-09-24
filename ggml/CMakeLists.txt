@@ -206,6 +206,7 @@ option(GGML_CUDA_FA                         "ggml: compile ggml FlashAttention C
 option(GGML_CUDA_FA_ALL_QUANTS              "ggml: compile full K/V cache quant pair matrix for FlashAttention"     OFF)
 option(GGML_CUDA_FA_NO_BF16                 "ggml: exclude BF16 pairs from the FlashAttention vector matrix (BF16 requires sm_80+ hardware)"  OFF)
 option(GGML_CUDA_KVARN                      "ggml: compile CUDA KVarN kernels"                                        ON)
+option(GGML_CUDA_SM70_D256                  "ggml: compile the Volta (sm_70) D256 split-D prefill FlashAttention kernel"  ON)
 unset(GGML_CUDA_KVARN_FA CACHE)
 unset(GGML_CUDA_KVARN_FAST_DECODE_ALL_PAIRS CACHE)
 option(GGML_CUDA_GRAPHS                     "ggml: use CUDA graphs (llama.cpp only)"          ${GGML_CUDA_GRAPHS_DEFAULT})

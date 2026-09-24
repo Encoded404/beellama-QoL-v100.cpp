@@ -336,6 +336,7 @@ guess.
 | `-DGGML_CUDA_FA_ALL_QUANTS=ON` | — | Off | Expands the CUDA vector matrix from 50 to all 169 standard cache pairs and, when `GGML_CUDA_KVARN=ON`, KVarN fast-decode instances from 15 balanced pairs to all 36 ordered bit pairs. Valid KVarN pairs outside the fast matrix use descriptor-native MMA. |
 | `-DGGML_CUDA_FA_NO_BF16=ON` | — | Off | Skips every BF16 CUDA vector pair (BF16 hardware requires sm_80+): 49 pairs instead of 50 by default, 144 instead of 169 with `GGML_CUDA_FA_ALL_QUANTS=ON`. BF16 K/V then reports as uncompiled and KV tails automatically downgrade to F16. |
 | `-DGGML_CUDA_KVARN=ON/OFF` | — | On | Compiles or omits the shared CUDA/HIP KVarN kernels and CUDA native-attention template instances. When enabled, `GGML_CUDA_FA_ALL_QUANTS` selects 15 default or all 36 CUDA fast-decode pairs. CUDA devices without the specialized Turing MMA contract use the portable direct-record route when their warp, thread-block, shared-memory, head-dimension, and tail-type capabilities pass. |
+| `-DGGML_CUDA_SM70_D256=ON/OFF` | — | On | Compiles the Volta (sm_70) D256 split-D prefill FlashAttention kernel. With the option off, `fattn-sm70-d256.cu` is still built but stubs the route out, so the stock prefill kernel is used and no Volta-specific device code is emitted. |
 
 Release packages are built with CUDA 12.4 and 13.3. CUDA 12.4 can emit the
 Maxwell, Pascal, and Volta PTX targets used by the portable KVarN route; CUDA
@@ -370,6 +371,27 @@ behaviors, both off by default where the default is performance-neutral:
   (`q4_0`/`q4_1`/`q5_0`/`q5_1`/`q6_0`/`q6_1`/`q8_0`/`iq4_nl`) so more decode
   streams stay in flight; complex K/IQ vec-dots stay at 4 warps to limit
   register pressure.
+
+## Volta (sm_70) D256 split-D prefill
+
+Volta has a dedicated D256 prefill route for ordinary F16 K/V caches, separate
+from KVarN. It pairs two warps on the same Q rows and splits the output
+dimension so each warp accumulates half of it, which removes most of the
+register spill in the stock `<256,256,32,2>` configuration. See
+`docs/beellama-features.md` for the selection conditions and the design
+rationale.
+
+| Env var | Default | Behavior |
+|---|---|---|
+| `LLAMA_SM70_D256` | unset | Opt-in while the route is unvalidated on hardware: only `1` (or any value other than `0`) enables it, and unset or `0` keeps the stock kernel. This flips to opt-out once a real V100 passes the correctness gates. |
+| `LLAMA_SM70_D256_DEBUG` | unset | `1` prints every route decision (`ACCEPT`/`REJECT` with the reason and the shape) instead of only the first one. |
+
+Build with `-DGGML_CUDA_SM70_D256=OFF` to omit the kernel entirely. The route
+only engages for Volta, `head_dim` 256, causal prefill with `ne01 >= 256`, and
+no ALiBi, logit softcap, or attention sinks. It accepts the same KV cache type
+contract as the rest of the CUDA FlashAttention path: F16 is read directly and
+every other accepted type (Q8_0 down to Q2_0S/Q2_1, BF16, IQ4_NL, F32) is
+materialized into the f16 mirror. K and V may use different types.
 
 ## Migration from earlier versions
 
