@@ -734,6 +734,8 @@ struct common_params {
     bool        dump_hidden_raw = false; // expose the raw pre-norm last-layer hidden instead
     bool        dump_kv_pre_rotation = false; // record the K/V rows from before the cache-domain transform
     bool        dump_skip_existing = false; // skip documents whose .npz already exists (resume a long run)
+    bool        dump_verify_writes = false; // re-read each written .npz from the device and compare it to what was written
+    int32_t     dump_verify_retries = 3;    // write attempts per document before it is removed and reported failed
 
     // server params
     int32_t port                = 8080;          // server listens on this network port

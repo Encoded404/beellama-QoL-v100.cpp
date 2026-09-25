@@ -5430,6 +5430,32 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_DUMP_SKIP_EXISTING"));
     add_opt(common_arg(
+        {"--dump-verify-writes"},
+        {"--no-dump-verify-writes"},
+        string_format("re-read every .npz after writing it and compare the bytes against what\n"
+            "  was written (default: %s)\n"
+            "  the dump otherwise only knows that fwrite returned, and a storage path that\n"
+            "  silently corrupts part of a large write leaves a file that looks written but\n"
+            "  no longer matches its own CRCs. the file is flushed, dropped from the page\n"
+            "  cache and read back, so this tests the bytes that are persisted rather than\n"
+            "  the ones still sitting in cache. a document that fails is rewritten, and\n"
+            "  removed after --dump-verify-retries attempts so a re-run dumps it again\n"
+            "  costs one flush and one read of the dump; nothing at all when disabled",
+            params.dump_verify_writes ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.dump_verify_writes = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_DUMP_VERIFY_WRITES"));
+    add_opt(common_arg(
+        {"--dump-verify-retries"}, "N",
+        string_format("write attempts per dump document before it is removed and reported failed (default: %d)\n"
+            "  only used with --dump-verify-writes",
+            params.dump_verify_retries),
+        [](common_params & params, const std::string & value) {
+            params.dump_verify_retries = std::stoi(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_DUMP_VERIFY_RETRIES"));
+    add_opt(common_arg(
         {"--dump-dtype"}, "{f32,f16,q8_0}",
         string_format("on-disk dtype of the hidden and K/V dump arrays (default: %s)\n"
             "  q8_0 matches the block format a q8_0 KV cache stores and is written as two\n"

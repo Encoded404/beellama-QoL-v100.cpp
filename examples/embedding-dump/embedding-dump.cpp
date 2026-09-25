@@ -18,6 +18,13 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 namespace fs = std::filesystem;
 
 //
@@ -174,14 +181,123 @@ static std::vector<uint8_t> make_npz(
     return out;
 }
 
-static bool write_file(const std::string & path, const std::vector<uint8_t> & data) {
-    FILE * f = fopen(path.c_str(), "wb");
-    if (!f) {
+// Drop a written file from the page cache, so that a readback of it is served by
+// the storage device instead of by the pages the write just filled. A file that
+// was just written is served from memory, which is exactly the copy a storage
+// path that corrupts writes does not touch, so a readback without this would
+// confirm the cache rather than the file.
+static void drop_from_cache(const std::string & path) {
+#if defined(__linux__)
+    const int fd = open(path.c_str(), O_RDONLY);
+    if (fd >= 0) {
+        posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+        close(fd);
+    }
+#else
+    // no portable equivalent exists: on this platform the readback below can be
+    // served from the page cache, which makes the check weaker, so say so
+    (void) path;
+#endif
+}
+
+// Compare a file against the bytes that were supposed to be in it, in chunks so
+// that peak memory does not follow the size of the dump, and report the offset of
+// the first byte that differs.
+static bool file_matches(const std::string & path, const std::vector<uint8_t> & data, size_t * first_bad) {
+    std::vector<uint8_t> chunk(4u << 20);
+
+    FILE * f = fopen(path.c_str(), "rb");
+    if (f == nullptr) {
         return false;
     }
-    const size_t written = fwrite(data.data(), 1, data.size(), f);
+
+    bool ok = true;
+
+    for (size_t off = 0; off < data.size(); off += chunk.size()) {
+        const size_t want = std::min(chunk.size(), data.size() - off);
+
+        if (fread(chunk.data(), 1, want, f) != want || memcmp(data.data() + off, chunk.data(), want) != 0) {
+            ok = false;
+            if (first_bad != nullptr) {
+                *first_bad = off;
+                for (size_t i = 0; i < want; ++i) {
+                    if (data[off + i] != chunk.data()[i]) {
+                        *first_bad = off + i;
+                        break;
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    // a longer file would mean something other than this write is in it
+    if (ok && fgetc(f) != EOF) {
+        ok = false;
+    }
+
     fclose(f);
-    return written == data.size();
+    return ok;
+}
+
+// Write a dump file, optionally proving that the bytes reached the device.
+//
+// Without verification this is the plain fopen/fwrite/fclose it has always been.
+// With it, the file is flushed, dropped from the page cache and read back: a
+// storage path that silently corrupts part of a large write leaves a file that
+// looks written but no longer matches its own CRCs, and only a readback that
+// reaches the device can see that. A mismatch rewrites the file, up to `attempts`.
+//
+// `attempts_used` (optional) reports how many attempts the write took.
+static bool write_file(const std::string & path, const std::vector<uint8_t> & data,
+                       bool verify, int32_t attempts, int32_t * attempts_used = nullptr) {
+    const int32_t tries = verify ? std::max<int32_t>(1, attempts) : 1;
+
+    for (int32_t attempt = 0; attempt < tries; ++attempt) {
+        if (attempts_used != nullptr) {
+            *attempts_used = attempt + 1;
+        }
+
+        FILE * f = fopen(path.c_str(), "wb");
+        if (f == nullptr) {
+            return false;
+        }
+
+        const size_t written = fwrite(data.data(), 1, data.size(), f);
+
+        if (!verify) {
+            fclose(f);
+            return written == data.size();
+        }
+
+        // flush before dropping the pages: a dirty page cannot be evicted, and
+        // the point of the readback is to reach the device
+        fflush(f);
+#if defined(_WIN32)
+        _commit(_fileno(f));
+#else
+        fsync(fileno(f));
+#endif
+        fclose(f);
+
+        if (written != data.size()) {
+            LOG_WRN("%s: %s: short write (%zu of %zu bytes), attempt %d of %d\n",
+                    __func__, path.c_str(), written, data.size(), attempt + 1, tries);
+            continue;
+        }
+
+        drop_from_cache(path);
+
+        size_t first_bad = 0;
+        if (file_matches(path, data, &first_bad)) {
+            return true;
+        }
+
+        LOG_WRN("%s: %s does not match what was written at byte %zu, attempt %d of %d\n",
+                __func__, path.c_str(), first_bad, attempt + 1, tries);
+    }
+
+    return false;
 }
 
 // Serialize one float array into `entries` using the requested dump dtype.
@@ -578,6 +694,17 @@ int main(int argc, char ** argv) {
         }
     }
 
+    if (params.dump_verify_writes) {
+#if defined(__linux__)
+        LOG_INF("%s: verifying every written document by reading it back from the device "
+                "(up to %d attempts)\n", __func__, std::max<int32_t>(1, params.dump_verify_retries));
+#else
+        LOG_WRN("%s: --dump-verify-writes cannot drop the page cache on this platform, so the "
+                "readback may be served from cache and miss a corrupting storage path "
+                "(up to %d attempts)\n", __func__, std::max<int32_t>(1, params.dump_verify_retries));
+#endif
+    }
+
     // chat templates (jinja) from the model's GGUF metadata
     common_chat_templates_ptr tmpls;
     try {
@@ -609,6 +736,11 @@ int main(int argc, char ** argv) {
     const llama_token eos_token = llama_vocab_eos(vocab);
 
     size_t n_skipped = 0;
+
+    // write-verification bookkeeping, reported at the end of the run
+    size_t n_verified = 0;
+    size_t n_retried  = 0;
+    size_t n_failed   = 0;
 
     for (size_t doc_idx = 0; doc_idx < docs.size(); ++doc_idx) {
         // document N always maps to the same file, so --skip-existing resumes an
@@ -835,9 +967,30 @@ int main(int argc, char ** argv) {
 
         auto npz = make_npz(entries);
 
-        if (!write_file(fpath, npz)) {
+        int32_t attempts_used = 1;
+
+        if (!write_file(fpath, npz, params.dump_verify_writes, params.dump_verify_retries, &attempts_used)) {
+            if (params.dump_verify_writes) {
+                // a file that did not verify must not be left behind for
+                // --skip-existing to trust: remove it so that a re-run dumps it
+                std::error_code ec;
+                fs::remove(fpath, ec);
+                LOG_ERR("%s: doc %zu: %s did not verify after %d attempt(s); removed so that a "
+                        "re-run dumps it again\n",
+                        __func__, doc_idx, fpath.c_str(), attempts_used);
+                ++n_failed;
+                continue;
+            }
             LOG_ERR("%s: doc %zu: failed to write %s\n", __func__, doc_idx, fpath.c_str());
             return 1;
+        }
+
+        if (params.dump_verify_writes) {
+            ++n_verified;
+            if (attempts_used > 1) {
+                ++n_retried;
+                LOG_INF("%s: doc %zu: verified on attempt %d\n", __func__, doc_idx, attempts_used);
+            }
         }
 
         LOG_INF("%s: doc %zu: wrote %s (%lld tokens, %lld KiB)\n",
@@ -848,6 +1001,11 @@ int main(int argc, char ** argv) {
     if (n_skipped > 0) {
         LOG_INF("%s: skipped %zu of %zu documents that were already dumped\n",
                 __func__, n_skipped, docs.size());
+    }
+
+    if (params.dump_verify_writes) {
+        LOG_INF("%s: write verification: %zu verified, %zu needed more than one attempt, %zu failed\n",
+                __func__, n_verified, n_retried, n_failed);
     }
 
     llama_batch_free(batch);
