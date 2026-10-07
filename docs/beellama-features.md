@@ -228,12 +228,16 @@ size, so the whole quantized range is usable:
   Q3_0/Q3_1, Q2_0S/Q2_1, BF16, IQ4_NL, F32) is materialized into the f16 mirror
   by the launcher, exactly as the stock `mma_f16` route does. K and V may use
   different types, so `-ctk q4_0 -ctv f16` works.
-- The mirror is transient, sized to the visible `kv_len`, and laid out
-  `[batch][head][kv][D]`. It is not free (~470 MB at a 229k context with a
-  `q4_0` K and 4 KV heads) but the dequantization itself is a small fraction of
-  prefill time, which is why in-kernel quantized loads are not worth it here:
-  a hand-rolled q4-direct variant measured **3.6% slower** at 176k because the
-  narrow per-block loads cost more than the bulk dequant pass they replace.
+- The mirror is transient and sized to the visible `kv_len`. Its axis order is
+  whatever the conversion the stock route picked produced: the strided walk
+  (`to_fp16_nc`) emits a dense `[batch][head][kv][D]` mirror, but the whole-tensor
+  convert is a linear copy that leaves the mirror in the source's memory order. The
+  route therefore takes the mirror's strides from the source tensor, not from its
+  shape. It is not free (~470 MB at a 229k context with a `q4_0` K and 4 KV heads)
+  but the dequantization itself is a small fraction of prefill time, which is why
+  in-kernel quantized loads are not worth it here: a hand-rolled q4-direct variant
+  measured **3.6% slower** at 176k because the narrow per-block loads cost more than
+  the bulk dequant pass they replace.
 
 The 3-way KV split (SplitKV3) is still not part of this route.
 
@@ -248,8 +252,8 @@ option off, `fattn-sm70-d256.cu` stubs itself out and the route never selects.
 The route is validated on a real V100 (Tesla V100-PCIE-32GB, driver
 580.159.04) across `tests/test-backend-ops` `FLASH_ATTN_EXT`: F16 and quantized
 KV caches, grouped-query shapes, multi-head prefill, arbitrary additive masks,
-and every route-triggering geometry in the suite. Two contracts are worth
-knowing about because getting either wrong produces silently wrong prefill
+and every route-triggering geometry in the suite. Three contracts are worth
+knowing about because getting any of them wrong produces silently wrong prefill
 output, not a crash:
 
 - `GGML_OP_FLASH_ATTN_EXT` returns `permute(0, 2, 1, 3)`, so `dst` is
@@ -262,6 +266,16 @@ output, not a crash:
   which the stock kernels publish and the merge consumes. This route does not
   write that meta, so it declines ops that carry `src[8]`; those body passes use
   the stock MMA_F16 route.
+- The f16 K/V mirror is **not** always `[batch][head][kv][D]`, because
+  `ggml_is_contiguously_allocated()` compares the tensor's extent rather than its
+  axis order: it is true for any gapless tensor, including the permuted KV cache
+  view llama.cpp builds for FlashAttention, whose `nb[1]` spans all KV heads and
+  whose `nb[2]` is one row. `launch_fattn` converts that case with the whole-tensor
+  path and rescales the source strides into f16; taking the mirror strides from the
+  shape instead reads it transposed and turns prefill into noise. The suite covers
+  it with a `permute={0,2,1,3}`, `kv_view=0`, `D=256` quantized case; without it the
+  bug is invisible because every other harness K/V is either F16 or a view that
+  takes the `to_fp16_nc` branch.
 
 | HIP architecture | Physical wave | Native KVarN route |
 |---|---:|---|
