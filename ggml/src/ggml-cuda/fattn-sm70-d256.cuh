@@ -107,7 +107,7 @@ void sm70_d256_splitd_kernel(
         const half  * __restrict__ K,      // [D][kv_len][heads_kv][batch] f16
         const half  * __restrict__ V,      // [D][kv_len][heads_kv][batch] f16
         const half  * __restrict__ mask,   // [kv_len][q_len] f16, additive
-        float       * __restrict__ dst,    // [D][q_len][heads_q][batch] f32
+        float       * __restrict__ dst,    // [D][heads_q][q_len][batch] f32 (note: not the Q layout)
         const int64_t q_row_stride,        // strides in float2 units
         const int64_t q_head_stride,
         const int64_t q_batch_stride,
@@ -121,8 +121,8 @@ void sm70_d256_splitd_kernel(
         const int64_t mask_batch_stride,   // stride between mask batches, in half units
         const int     mask_n_batch,        // mask batch count; the mask broadcasts when 1
         const int   * __restrict__ kv_max, // [mask batch][Q tile] exclusive KV supremum, or nullptr
-        const int64_t dst_row_stride,      // strides in float2 units
-        const int64_t dst_head_stride,
+        const int64_t dst_row_stride,      // strides in float2 units; dst is head-inner, so the
+        const int64_t dst_head_stride,     // caller passes nb[2] and nb[1] here, not nb[1] and nb[2]
         const int64_t dst_batch_stride,
         const int   q_len,
         const int   kv_len,

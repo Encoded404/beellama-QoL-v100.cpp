@@ -288,7 +288,12 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
             mask->nb[1] / (int64_t) sizeof(half),
             mask->nb[3] / (int64_t) sizeof(half), mask_n_batch,
             use_kv_max ? kv_max_alloc.ptr : nullptr,
-            dst->nb[1] / (int64_t) sizeof(float2), dst->nb[2] / (int64_t) sizeof(float2), dst->nb[3] / (int64_t) sizeof(float2),
+            // dst is not laid out like Q: ggml_flash_attn_ext returns permute(0, 2, 1, 3), so the
+            // result is [D][heads_q][q_len][batch] while Q is [D][q_len][heads_q][batch]. The row
+            // stride therefore lives in nb[2] and the head stride in nb[1] - the opposite of Q.
+            // They only coincide when heads_q == 1, so mixing them up is invisible on single-head
+            // shapes and scrambles the output on every real model.
+            dst->nb[2] / (int64_t) sizeof(float2), dst->nb[1] / (int64_t) sizeof(float2), dst->nb[3] / (int64_t) sizeof(float2),
             q_len, kv_len, gqa, scale);
     CUDA_CHECK(cudaGetLastError());
 }
