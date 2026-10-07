@@ -383,7 +383,7 @@ rationale.
 
 | Env var | Default | Behavior |
 |---|---|---|
-| `LLAMA_SM70_D256` | unset | Opt-in while the route is unvalidated on hardware: only `1` (or any value other than `0`) enables it, and unset or `0` keeps the stock kernel. This flips to opt-out once a real V100 passes the correctness gates. |
+| `LLAMA_SM70_D256` | unset | Opt-in: only `1` (or any value other than `0`) enables it, and unset or `0` keeps the stock kernel. It stays opt-in because it is at best at parity with the stock route on a V100 today; it is no longer unvalidated there (the `FLASH_ATTN_EXT` suite passes on a Tesla V100-PCIE-32GB). |
 | `LLAMA_SM70_D256_DEBUG` | unset | `1` prints every route decision (`ACCEPT`/`REJECT` with the reason and the shape) instead of only the first one. |
 
 Build with `-DGGML_CUDA_SM70_D256=OFF` to omit the kernel entirely. The route

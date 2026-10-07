@@ -242,12 +242,26 @@ option off, `fattn-sm70-d256.cu` stubs itself out and the route never selects.
 
 | Env var | Default | Behavior |
 |---|---|---|
-| `LLAMA_SM70_D256` | unset | **Opt-in while the route is unvalidated on hardware.** Only `1` (or any value other than `0`) enables it; unset or `0` keeps the stock kernel. Once a real V100 passes the correctness gates this flips to opt-out, matching the other Volta tuning knobs. |
+| `LLAMA_SM70_D256` | unset | **Opt-in.** Only `1` (or any value other than `0`) enables it; unset or `0` keeps the stock kernel. It stays opt-in because it is at best at parity with the stock route on a V100 today, not because it is unvalidated: it now passes the `FLASH_ATTN_EXT` correctness suite on a Tesla V100-PCIE-32GB (see below). |
 | `LLAMA_SM70_D256_DEBUG` | unset | `1` prints every route decision instead of only the first one |
 
-This route is compile-verified for sm_70 but has not been validated on a real
-V100; treat it as requiring real-device validation, like the other pre-Turing
-entries in the table above. That is why it ships opt-in.
+The route is validated on a real V100 (Tesla V100-PCIE-32GB, driver
+580.159.04) across `tests/test-backend-ops` `FLASH_ATTN_EXT`: F16 and quantized
+KV caches, grouped-query shapes, multi-head prefill, arbitrary additive masks,
+and every route-triggering geometry in the suite. Two contracts are worth
+knowing about because getting either wrong produces silently wrong prefill
+output, not a crash:
+
+- `GGML_OP_FLASH_ATTN_EXT` returns `permute(0, 2, 1, 3)`, so `dst` is
+  `[D][heads_q][q_len][batch]` while `Q` is `[D][q_len][heads_q][batch]`. For
+  `dst`, `nb[2]` is the query-row stride and `nb[1]` is the head stride — the
+  opposite of `Q`. The two coincide when `heads_q == 1`, so a swap is invisible
+  on single-head shapes and scrambles every row on real models.
+- Exact-tail FlashAttention (`dst->src[5..11]`) runs its packed body as a
+  normal FlashAttention op with a per-(row, head) max/sum meta in `src[8]`,
+  which the stock kernels publish and the merge consumes. This route does not
+  write that meta, so it declines ops that carry `src[8]`; those body passes use
+  the stock MMA_F16 route.
 
 | HIP architecture | Physical wave | Native KVarN route |
 |---|---:|---|
