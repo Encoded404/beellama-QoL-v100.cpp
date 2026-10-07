@@ -119,6 +119,17 @@ bool ggml_cuda_sm70_d256_supported(const int cc, const ggml_tensor * dst) {
         sm70_d256_probe("REJECT: no mask / sinks / small batch", cc, dst);
         return false;
     }
+    // The exact-tail path (dst->src[5..11]) runs its packed body through this op with the
+    // per-(row, head) max/sum meta attached as src[8] and folds the body result into the
+    // tail pass. The stock kernels publish that meta; this kernel computes the same row
+    // max/sum but does not write it, so the tail pass would read uninitialized weights.
+    // Those body passes keep the stock route (the outer tail op is dispatched before this
+    // route is consulted at all), which costs the tail path the split-D kernel but keeps
+    // it correct.
+    if (dst->src[8] != nullptr) {
+        sm70_d256_probe("REJECT: exact-tail body meta (src[8])", cc, dst);
+        return false;
+    }
     // Same mask contract the exact-tail body pass uses. The mask must be F16 (the stock
     // kernel asserts the same) and its batch axis must broadcast or match exactly.
     if (mask->type != GGML_TYPE_F16 ||
