@@ -4,7 +4,7 @@ project("ggml" C CXX ASM)
 
 ### GGML Version
 set(GGML_VERSION_MAJOR 0)
-set(GGML_VERSION_MINOR 23)
+set(GGML_VERSION_MINOR 26)
 set(GGML_VERSION_PATCH 0)
 set(GGML_VERSION_BASE "${GGML_VERSION_MAJOR}.${GGML_VERSION_MINOR}.${GGML_VERSION_PATCH}")
 
@@ -197,6 +197,7 @@ set(GGML_BLAS_VENDOR ${GGML_BLAS_VENDOR_DEFAULT} CACHE STRING
 option(GGML_LLAMAFILE                       "ggml: use LLAMAFILE"                             ${GGML_LLAMAFILE_DEFAULT})
 
 option(GGML_CUDA                            "ggml: use CUDA"                                  OFF)
+set   (GGML_CUDA_CCCL_VERSION "" CACHE STRING "ggml: CCCL git tag to fetch, empty to use the version bundled with the installed CUDA Toolkit")
 option(GGML_MUSA                            "ggml: use MUSA"                                  OFF)
 option(GGML_CUDA_FORCE_MMQ                  "ggml: use mmq kernels instead of cuBLAS"         OFF)
 option(GGML_CUDA_FORCE_CUBLAS               "ggml: always use cuBLAS instead of mmq kernels"  OFF)
@@ -207,6 +208,8 @@ option(GGML_CUDA_FA_ALL_QUANTS              "ggml: compile full K/V cache quant 
 option(GGML_CUDA_FA_NO_BF16                 "ggml: exclude BF16 pairs from the FlashAttention vector matrix (BF16 requires sm_80+ hardware)"  OFF)
 option(GGML_CUDA_KVARN                      "ggml: compile CUDA KVarN kernels"                                        ON)
 option(GGML_CUDA_SM70_D256                  "ggml: compile the Volta (sm_70) D256 split-D prefill FlashAttention kernel"  ON)
+# Empty means Bee's balanced default matrix; custom pairs and `all` use upstream's selector.
+set(GGML_CUDA_FA_QUANTS "" CACHE STRING "ggml: FlashAttention K-V type combinations, all or type_K-type_V list (empty: balanced default)")
 unset(GGML_CUDA_KVARN_FA CACHE)
 unset(GGML_CUDA_KVARN_FAST_DECODE_ALL_PAIRS CACHE)
 option(GGML_CUDA_GRAPHS                     "ggml: use CUDA graphs (llama.cpp only)"          ${GGML_CUDA_GRAPHS_DEFAULT})

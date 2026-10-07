@@ -290,6 +290,8 @@ static ggml_backend_buffer_type_t ggml_backend_meta_buft_simple_buft(ggml_backen
 
 static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size);
 
+static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_backend_buffer_type_t buft, ggml_tensor ** tensors, int n_tensors);
+
 static size_t ggml_backend_meta_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
     size_t max_alignment = 1;
@@ -331,12 +333,14 @@ static bool ggml_backend_meta_buffer_type_is_host(ggml_backend_buffer_type_t buf
 }
 
 static const struct ggml_backend_buffer_type_i ggml_backend_meta_buffer_type_iface = {
-    /* .get_name         = */ ggml_backend_meta_buffer_type_get_name,
-    /* .alloc_buffer     = */ ggml_backend_meta_buffer_type_alloc_buffer,
-    /* .get_alignment    = */ ggml_backend_meta_buffer_type_get_alignment,
-    /* .get_max_size     = */ ggml_backend_meta_buffer_type_get_max_size,
-    /* .get_alloc_size   = */ ggml_backend_meta_buffer_type_get_alloc_size,
-    /* .is_host          = */ ggml_backend_meta_buffer_type_is_host,
+    /* .get_name            = */ ggml_backend_meta_buffer_type_get_name,
+    /* .alloc_buffer        = */ ggml_backend_meta_buffer_type_alloc_buffer,
+    /* .alloc_buffer_n      = */ ggml_backend_meta_buffer_type_alloc_buffer_n,
+    /* .get_alignment       = */ ggml_backend_meta_buffer_type_get_alignment,
+    /* .get_max_size        = */ ggml_backend_meta_buffer_type_get_max_size,
+    /* .get_alloc_size      = */ ggml_backend_meta_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n    = */ NULL,
+    /* .is_host             = */ ggml_backend_meta_buffer_type_is_host,
 };
 
 bool ggml_backend_buft_is_meta(ggml_backend_buffer_type_t buft) {
@@ -1003,6 +1007,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                     ggml_backend_meta_get_split_state(tensor->src[i], /*assume_sync =*/ true) :
                     ggml_backend_meta_get_split_state(
                             buf_ctx, stc, tensor->src[i], /*assume_sync =*/ true);
+            // A zero-row logits tensor has no split state. The sampler may pad
+            // it with one dummy row; that row consists entirely of padding and
+            // must be identical on every device.
+            if (tensor->op == GGML_OP_PAD && i == 0 && ggml_nelements(tensor->src[i]) == 0) {
+                src_ss[i] = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+            }
             GGML_ASSERT(src_ss[i].axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
         }
 
@@ -1367,11 +1377,6 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(
         ggml_context          * simple_ctx = stc.ctxs[j].get();
         ggml_backend_buffer_t   simple_buf = buf_ctx->bufs[j].get();
 
-        if ((simple_buf != nullptr) && ggml_backend_buffer_is_multi_buffer(simple_buf)) {
-            // see https://github.com/ggml-org/llama.cpp/issues/22197
-            GGML_ABORT("multi buffers are not supported by the meta backend");
-        }
-
         if (split_dim >= 0 && split_dim < GGML_MAX_DIMS) {
             // TODO: the following assert fails for llama-parallel even though the results are correct:
             // GGML_ASSERT(ggml_is_contiguously_allocated(tensor));
@@ -1420,16 +1425,27 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(
                 }
             }
         }
+        // TODO: revisit once the graph allocator has been refactored, see https://github.com/ggml-org/llama.cpp/pull/25051#issuecomment-4842873396
+        ggml_backend_buffer_t init_buf = simple_buf;
         if (!bufferless && t_ij->view_src != nullptr) {
             t_ij->data = (char *) t_ij->view_src->data + t_ij->view_offs;
+            // views inherit the source slice's concrete sub-buffer (issue 22197)
+            if (tensor->view_src != nullptr && ggml_backend_buffer_is_meta(tensor->view_src->buffer)
+                    && t_ij->view_src->buffer != nullptr) {
+                t_ij->buffer = t_ij->view_src->buffer;
+                init_buf     = t_ij->view_src->buffer;
+            }
         } else if (!bufferless && simple_buf != nullptr) {
+            if (ggml_backend_buffer_is_multi_buffer(simple_buf)) {
+                GGML_ABORT("multi buffers are not supported by the meta backend");
+            }
             t_ij->data = (char *) ggml_backend_buffer_get_base(simple_buf)
                 + size_t(tensor->data) - size_t(ggml_backend_buffer_get_base(owner_buffer));
         }
 
-        if (simple_buf) {
+        if (init_buf) {
             // the backend that owns the buffer will set .extra
-            ggml_backend_buffer_init_tensor(simple_buf, t_ij);
+            ggml_backend_buffer_init_tensor(init_buf, t_ij);
         } else {
             t_ij->extra = tensor->extra;
         }
@@ -1890,7 +1906,7 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
     return ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, buf_ctx, max_size);
 }
 
-struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft) {
+static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_backend_buffer_type_t buft, ggml_tensor ** tensors, int n_tensors) {
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
 
     // Speculative graphs can create more than 16 transient views per source
@@ -1902,13 +1918,13 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
     // layer are created for the conv-state snapshot copies). Size the headroom accordingly.
     constexpr size_t compute_headroom = 128;
     const ggml_init_params params_static = {
-        /*.mem_size   =*/ ggml_get_mem_size(ctx),
+        /*.mem_size   =*/ n_tensors * ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
     const ggml_init_params params_compute = {
         // Alignment can consume the final slot; reserve one full header.
-        /*.mem_size   =*/ compute_headroom*ggml_get_mem_size(ctx) + ggml_tensor_overhead(),
+        /*.mem_size   =*/ compute_headroom * n_tensors * ggml_tensor_overhead() + ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
@@ -1924,7 +1940,8 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
             new ggml_backend_meta_buffer_context(stc_static, stc_compute, bufs);
 
     ggml_backend_buffer_t meta_buf = ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, meta_buf_ctx, 0);
-    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+    for (int i = 0; i < n_tensors; i++) {
+        ggml_tensor * t = tensors[i];
         t->buffer = meta_buf;
         ggml_backend_meta_buffer_init_tensor_impl(
                 meta_buf_ctx->stc_static, t, meta_buf,
@@ -2634,20 +2651,22 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             if (node->flags & GGML_TENSOR_FLAG_COMPUTE) {
                 continue;
             }
-            ggml_tensor * node_zero = get_node_aux(node);
-            node_zero->op = GGML_OP_SCALE; // FIXME 0.0f * NaN == NaN
-            node_zero->src[0] = node;
-            ggml_set_op_params_f32(node_zero, 0, 0.0f);
-            node_zero->data = node->data;
-            node_zero->buffer = node->buffer;
-            node_zero->flags |= GGML_TENSOR_FLAG_COMPUTE;
+            if (ggml_nelements(node) > 0) {
+                ggml_tensor * node_zero = get_node_aux(node);
+                node_zero->op = GGML_OP_FILL;
+                node_zero->src[0] = node; // only used for the shape, the data is not read
+                ggml_set_op_params_f32(node_zero, 0, 0.0f);
+                node_zero->data = node->data;
+                node_zero->buffer = node->buffer;
+                node_zero->flags |= GGML_TENSOR_FLAG_COMPUTE;
 
-            step_cgraphs[j] = get_cgraph_aux();
-            step_cgraphs[j]->nodes[0] = node_zero;
-            step_cgraphs[j]->n_nodes = 1;
-            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, step_cgraphs[j]);
-            if (status != GGML_STATUS_SUCCESS) {
-                return status;
+                step_cgraphs[j] = get_cgraph_aux();
+                step_cgraphs[j]->nodes[0] = node_zero;
+                step_cgraphs[j]->n_nodes = 1;
+                const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, step_cgraphs[j]);
+                if (status != GGML_STATUS_SUCCESS) {
+                    return status;
+                }
             }
         }
         std::fill(step_cgraphs.begin(), step_cgraphs.end(), nullptr);

@@ -2,7 +2,7 @@
 
 #include "common.cuh"
 #include "fattn-common.cuh" // FATTN_KQ_MAX_OFFSET, SOFTMAX_FTZ_THRESHOLD
-#include "fattn-swizzle.cuh" // smem load helpers; also pulls in mma.cuh
+#include "mma.cuh" // mma tiles and shared-memory ldmatrix helpers (upstream folded the smem-swizzle header into mma.cuh)
 
 // Volta (SM70) D256 split-D prefill FlashAttention.
 //
@@ -273,9 +273,9 @@ void sm70_d256_splitd_kernel(
 #pragma unroll
             for (int g = 0; g < kQkGroups; ++g) {
                 QkB K_A;
-                ggml_cuda_fattn_smem_swizzle::load_ldmatrix<kStrideK_h2, false>(
-                        K_A, (const half2 *) smem_K,
-                        n_warp * kQkColsPerWarp + g * kKvPerMma, 4 * k);
+                ggml_cuda_mma::load_ldmatrix(
+                        K_A, (const half2 *) smem_K + (n_warp * kQkColsPerWarp + g * kKvPerMma) * kStrideK_h2 + 4 * k,
+                        kStrideK_h2);
                 mma(KQ_C[g], Q_reg[k], K_A);
             }
         }
@@ -357,8 +357,9 @@ void sm70_d256_splitd_kernel(
 #pragma unroll
             for (int d = 0; d < kPvDimTiles; ++d) {
                 PvB V_B;
-                ggml_cuda_fattn_smem_swizzle::load_ldmatrix<kStrideK_h2, false>(
-                        V_B, (const half2 *) smem_V, k * kKvPerMma, n_warp * (kOwnedDims / 2) + 4 * d);
+                ggml_cuda_mma::load_ldmatrix(
+                        V_B, (const half2 *) smem_V + (k * kKvPerMma) * kStrideK_h2 + (n_warp * (kOwnedDims / 2) + 4 * d),
+                        kStrideK_h2);
                 mma(VKQ_C[d], P_reg[k], V_B);
             }
         }

@@ -844,6 +844,11 @@ int main(int argc, char ** argv) {
         cb_data.cols     = &cols;
 
         llama_memory_clear(llama_get_memory(ctx), true);
+        // TODO(merge): upstream v0.4.8 moved this eval to the new batch API
+        // (common_batch_get_one + llama_process). The surrounding code here is the
+        // fork's own and does not use common_batch yet, and llama_decode() with
+        // llama_batch_get_one() is still exported as a transition helper upstream,
+        // so this keeps compiling. Migrate when the tool is ported.
         if (llama_decode(ctx, llama_batch_get_one(const_cast<llama_token *>(tokens.data()), tokens.size()))) {
             fprintf(stderr, "%s: failed to eval\n", __func__);
             return false;

@@ -96,38 +96,36 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 //
 // returns at least 1 token, up to idxs.size()
 //
-std::vector<llama_token> common_sampler_sample_and_accept_n(
-        struct common_sampler * gsmpl,
-        struct llama_context  * ctx,
-        const std::vector<int> & idxs,
-        const llama_tokens    & draft,
-        bool                    grammar_first = false,
-        const common_sampler_accept_callback & on_accept = {});
-
 // MARS (margin-aware relaxed verification) configuration.
-// A draft token that does not match the target's sampled pick is accepted
-// anyway when it ranks within `topk` of the *raw* target logits and its raw
-// logit ratio vs the raw top-1 is >= `theta`. Lossy: the output distribution
-// deviates from plain target sampling.
+// A drafted token that the verifier would reject is accepted anyway when it sits
+// within `topk` of the *raw* target logits and its raw logit margin vs the raw
+// top-1 is at least `theta` (temperature-invariant). Lossy by design: the output
+// distribution then deviates from plain target sampling. With `enabled = false`
+// acceptance is unchanged and the target distribution is preserved exactly.
 struct common_sampler_mars_config {
     bool    enabled = false;
     float   theta   = 0.9f;
     int32_t topk    = 2;
 };
 
-// Flat verify with optional MARS relaxation. When `mars.enabled` and the
-// target context exposes backend-computed MARS stats (llama_get_mars_stats_ith)
-// those are used; otherwise the check falls back to scanning the raw logits
-// via llama_get_logits_ith.
 std::vector<llama_token> common_sampler_sample_and_accept_n(
         struct common_sampler * gsmpl,
         struct llama_context  * ctx,
         const std::vector<int> & idxs,
         const llama_tokens    & draft,
-        bool                    grammar_first,
-        const common_sampler_mars_config & mars,
-        const common_sampler_accept_callback & on_accept,
-        std::vector<int32_t> & accepted_path);
+        bool                    grammar_first = false,
+        const common_sampler_mars_config & mars = {},
+        const common_sampler_accept_callback & on_accept = {});
+
+// as above, but verifies by rejection sampling; draft_q holds the draft's candidates per token.
+// When `mars.enabled` and the exact test rejects a drafted token, the token is still accepted
+// if it clears the raw-logit margin rule (lossy: the target distribution is then not preserved).
+std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(
+        struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs,
+        const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q,
+        bool grammar_first = false, const common_sampler_mars_config & mars = {},
+        const common_sampler_accept_callback & on_accept = {});
+
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(
