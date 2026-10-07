@@ -113,7 +113,8 @@ bool ggml_cuda_sm70_d256_supported(const int cc, const ggml_tensor * dst) {
         sm70_d256_probe("REJECT: head_dim != 256", cc, dst);
         return false;
     }
-    // Causal prefill only; decode, MTP and small batches stay on the stock path.
+    // Prefill only: decode, MTP and small batches stay on the stock path. The kernel
+    // handles arbitrary additive masks, not just causal ones.
     if (mask == nullptr || sinks != nullptr || Q->ne[1] < kMinQLen) {
         sm70_d256_probe("REJECT: no mask / sinks / small batch", cc, dst);
         return false;
@@ -245,9 +246,38 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
         smem_raised = true;
     }
 
-    const dim3 grid((unsigned) ((q_len + kBlockM - 1) / kBlockM), (unsigned) batch, (unsigned) Q->ne[2]);
+    const int  ntiles_q = (q_len + kBlockM - 1) / kBlockM;
+    const dim3 grid((unsigned) ntiles_q, (unsigned) batch, (unsigned) Q->ne[2]);
     // (warp_size, nwarps): the ggml_cuda_mma tile helpers use threadIdx.x as the lane.
     const dim3 block(32, kThreads / 32);
+
+    // Optional KV tile bound: the same on-GPU mask scan launch_fattn runs for the
+    // tile/vec routes (fattn-common.cuh, flash_attn_mask_to_KV_max). Every KV block at
+    // or above the result is masked out for all rows of its Q tile, so the kernel can
+    // stop there instead of walking the whole cache. The scan starts at the newest KV
+    // tile and walks down to the first one holding a visible column, so it reads only
+    // the all-masked tiles it then lets the kernel skip. A mask layout or length the
+    // scan cannot handle leaves the bound null and the kernel scans every KV block,
+    // which is always correct.
+    const int mask_n_batch = (int) mask->ne[3];
+
+    ggml_cuda_pool_alloc<int> kv_max_alloc(ctx.pool());
+    const bool use_kv_max =
+        K->ne[1] % FATTN_KQ_STRIDE == 0 &&                  // 256-column scan tiles
+        mask->nb[0] == sizeof(half) &&                      // columns contiguous in half
+        mask->nb[1] % (int64_t) sizeof(half2) == 0 &&       // rows half2-aligned
+        mask->nb[3] % (int64_t) sizeof(half2) == 0 &&       // mask batches half2-aligned
+        (int64_t) ntiles_q * kBlockM <= mask->ne[1];        // scanned rows inside the mask
+    if (use_kv_max) {
+        kv_max_alloc.alloc((size_t) ntiles_q * mask_n_batch);
+        const dim3 blocks_num_KV_max((unsigned) ntiles_q, (unsigned) mask_n_batch, 1);
+        const dim3 block_dim_KV_max(FATTN_KQ_STRIDE/2, 1, 1);
+        ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<kBlockM>,
+            ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, stream),
+            (const half2 *) mask->data, kv_max_alloc.ptr, (int) (K->ne[1] / FATTN_KQ_STRIDE),
+            mask->nb[1] / (int64_t) sizeof(half2), mask->nb[3] / (int64_t) sizeof(half2));
+        CUDA_CHECK(cudaGetLastError());
+    }
 
     sm70_d256_splitd_kernel<<<grid, block, kSmemBytes, stream>>>(
             (const float *) Q->data, kv.data, vv.data,
@@ -256,7 +286,8 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
             kv.row_stride, kv.head_stride, kv.batch_stride,
             vv.row_stride, vv.head_stride, vv.batch_stride,
             mask->nb[1] / (int64_t) sizeof(half),
-            mask->nb[3] / (int64_t) sizeof(half), (int) mask->ne[3],
+            mask->nb[3] / (int64_t) sizeof(half), mask_n_batch,
+            use_kv_max ? kv_max_alloc.ptr : nullptr,
             dst->nb[1] / (int64_t) sizeof(float2), dst->nb[2] / (int64_t) sizeof(float2), dst->nb[3] / (int64_t) sizeof(float2),
             q_len, kv_len, gqa, scale);
     CUDA_CHECK(cudaGetLastError());

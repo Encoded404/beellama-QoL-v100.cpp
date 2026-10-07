@@ -8060,6 +8060,54 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// `test_flash_attn_ext` with a causal mask instead of the random additive mask the base
+// class uses (init_tensor_kq_mask).
+//
+// The distinction matters for kernels that derive a KV tile bound from the mask, such as
+// the Volta D256 split-D prefill route (fattn-sm70-d256.cuh): a random mask has visible
+// entries almost everywhere, so the scanned bound stays at the full KV length and no tile
+// is ever skipped. With a causal mask the earlier Q tiles have fully masked trailing KV
+// tiles, which is both the production case and the only case where a bound that is too
+// small drops visible KV columns and changes the output.
+struct test_flash_attn_ext_causal_mask : public test_flash_attn_ext {
+    test_flash_attn_ext_causal_mask(int64_t hsk, int64_t hsv, int64_t nh, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb,
+            bool mask, bool sinks, float max_bias, float logit_softcap, ggml_prec prec,
+            ggml_type type_K, ggml_type type_V, std::array<int32_t, 4> permute = {0, 1, 2, 3},
+            bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0)
+        : test_flash_attn_ext(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec,
+                             type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max) {}
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + " causal_mask=1";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") != 0) {
+                continue;
+            }
+            // Q row iq sees KV column ikv iff ikv <= iq + (kv - nb): zero when visible,
+            // -INFINITY when masked, the same convention init_tensor_kq_mask uses for the
+            // masked blocks.
+            const int64_t n_kv = t->ne[0];
+            const int64_t n_q  = t->ne[1];
+
+            std::vector<ggml_fp16_t> values(ggml_nelements(t));
+            for (int64_t is = 0; is < t->ne[3]; ++is) {
+                for (int64_t iq = 0; iq < n_q; ++iq) {
+                    for (int64_t ikv = 0; ikv < n_kv; ++ikv) {
+                        values[(is*n_q + iq)*n_kv + ikv] = ggml_fp32_to_fp16(
+                                ikv <= iq + (n_kv - n_q) ? 0.0f : -INFINITY);
+                    }
+                }
+            }
+            ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(values[0]));
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -10909,10 +10957,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // Volta D256 split-D prefill trigger geometry (see fattn-sm70-d256.cuh): head_dim
-    // 256, causal mask, and Q length >= 256. The prefill block above stops at nb=64,
-    // which stays on the stock route. Note the route is opt-in until it is validated on
-    // hardware, so exercising it on a V100 requires LLAMA_SM70_D256=1 in the
-    // environment; these shapes are what the split-D kernel is then checked against.
+    // 256, any additive mask, and Q length >= 256. The prefill block above stops at
+    // nb=64, which stays on the stock route. Note the route is opt-in until it is
+    // validated on hardware, so exercising it on a V100 requires LLAMA_SM70_D256=1 in
+    // the environment; these shapes are what the split-D kernel is then checked against.
+    //
+    // The masks these cases use are random additive masks, so they only cover the
+    // "kernel must not assume causality" half of the contract; they have visible entries
+    // almost everywhere and therefore never let a mask-derived KV bound skip a tile.
+    // The causal-mask cases below cover the other half.
     for (int kv : { 1024, 2048, }) {
         for (int nb : { 256, 512, }) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 8, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
@@ -10933,6 +10986,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q4_0 }) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 8, {4, 2}, 1024, 256, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
     }
+
+    // Causal masks: what the route sees in production, and the only shape for which the
+    // trailing KV tiles of the earlier Q tiles are fully masked, i.e. the only shape
+    // where a mask-derived KV bound actually skips work. A bound that is too large only
+    // costs time; one that is too small silently drops visible KV columns and fails here.
+    // nb == kv is a fresh prefill (no history), kv > nb is a prefill into an existing
+    // cache, which moves the causal offset.
+    for (int nb : { 512, 1024 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_causal_mask(256, 256, 8, {4, 1}, nb, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_causal_mask(256, 256, 8, {4, 1}, 2048, 1024, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {

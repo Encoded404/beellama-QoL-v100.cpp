@@ -120,6 +120,7 @@ void sm70_d256_splitd_kernel(
         const int64_t mask_stride,         // stride between Q rows, in half units
         const int64_t mask_batch_stride,   // stride between mask batches, in half units
         const int     mask_n_batch,        // mask batch count; the mask broadcasts when 1
+        const int   * __restrict__ kv_max, // [mask batch][Q tile] exclusive KV supremum, or nullptr
         const int64_t dst_row_stride,      // strides in float2 units
         const int64_t dst_head_stride,
         const int64_t dst_batch_stride,
@@ -174,15 +175,21 @@ void sm70_d256_splitd_kernel(
     }
 
     // ------------------------------------------------------------ KV tile bounds
-    const int q_row_max = q_tile0 + kBlockM - 1;
-    // Visible KV columns for the last Q row of this CTA: causal boundary.
-    int kv_visible = kv_len;
-    {
-        const int last = q_row_max < q_len - 1 ? q_row_max : q_len - 1;
-        const int bound = kv_len - q_len + last + 1; // kv_offset + q_row + 1
-        kv_visible = bound < kv_len ? (bound > 0 ? bound : 0) : kv_len;
+    // The FA op carries no causality guarantee: the additive mask is authoritative
+    // (test-backend-ops and custom callers use arbitrary masks). The launcher derives a
+    // per-Q-tile KV supremum from the mask with the same on-GPU scan launch_fattn runs
+    // for the tile/vec routes (flash_attn_mask_to_KV_max): every KV block at or above the
+    // result is masked out for all rows of this tile, so stopping there cannot change the
+    // output. Without a supremum (mask layout the scan cannot handle) every KV block is
+    // processed and the mask zeroes the excluded columns.
+    int kv_eff = kv_len;
+    if (kv_max != nullptr) {
+        // Same broadcast rule the mask tile below uses.
+        const int mb     = batch % mask_n_batch;
+        const int kv_sup = kv_max[mb * gridDim.x + blockIdx.x];
+        kv_eff = kv_sup < kv_len ? (kv_sup > 0 ? kv_sup : 0) : kv_len;
     }
-    const int n_block_max = (kv_visible + kBlockN - 1) / kBlockN;
+    const int n_block_max = (kv_eff + kBlockN - 1) / kBlockN;
 
     // PV accumulator: thread `lane` owns output row (pair_row0 + lane).
     PvC VKQ_C[kPvDimTiles];
@@ -383,7 +390,7 @@ void sm70_d256_splitd_kernel(
         q_row_stride, q_head_stride, q_batch_stride,
         k_row_stride, k_head_stride, k_batch_stride,
         v_row_stride, v_head_stride, v_batch_stride,
-        mask_stride, mask_batch_stride, mask_n_batch,
+        mask_stride, mask_batch_stride, mask_n_batch, kv_max,
         dst_row_stride, dst_head_stride, dst_batch_stride,
         q_len, kv_len, gqa, scale);
     NO_DEVICE_CODE;

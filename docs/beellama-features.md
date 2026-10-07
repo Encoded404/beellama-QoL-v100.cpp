@@ -198,10 +198,26 @@ remaining lever on Volta: the gap to Turing and newer is architectural (m8n8k4,
 no `ldmatrix`, no `cp.async`) and cannot be closed by configuration tuning.
 
 The route applies only when every one of these holds: Volta device, `head_dim`
-256 for Q/K/V, causal prefill with `ne01 >= 256`, and no ALiBi, logit softcap,
-or attention sinks. Everything else keeps the existing route, and a KVarN
+256 for Q/K/V, prefill with `ne01 >= 256`, and no ALiBi, logit softcap, or
+attention sinks. Everything else keeps the existing route, and a KVarN
 FlashAttention op never reaches this code at all because KVarN is resolved
 before the ordinary kernel selection.
+
+**Mask handling.** The op carries no causality guarantee, so the additive mask is
+authoritative and the kernel works for any mask. To avoid walking the whole cache for
+every Q tile, the launcher scans the mask on the GPU for a per-(Q tile, sequence) KV
+supremum and stops at it, reusing the same `flash_attn_mask_to_KV_max` pass the stock
+tile and vector routes run; every KV block at or above the supremum is masked out for
+all rows of its tile, so skipping it cannot change the output. When the mask does not
+match what that scan needs (a KV length that is not a multiple of 256, a mask that is
+not row-contiguous in half elements, or a tile whose rows would run past the mask), the
+bound is dropped and the kernel scans every KV block, which is always correct.
+
+The skip is only as large as the mask allows. For a causal mask with `q_len` Q rows and
+`kv_len` KV columns it recovers roughly `50% * q_len / kv_len` of the KV block visits,
+so a fresh equal-length prefill regains about half of them, while a prefill into a long
+existing cache gains very little. That is a property of the mask, not of the bound: with
+history present, the newest KV columns are visible to every Q row.
 
 **Cache types.** The route accepts the same K/V type contract as the rest of
 the CUDA FlashAttention path, and 256 is a multiple of every accepted block

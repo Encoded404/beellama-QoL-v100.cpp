@@ -387,11 +387,14 @@ rationale.
 | `LLAMA_SM70_D256_DEBUG` | unset | `1` prints every route decision (`ACCEPT`/`REJECT` with the reason and the shape) instead of only the first one. |
 
 Build with `-DGGML_CUDA_SM70_D256=OFF` to omit the kernel entirely. The route
-only engages for Volta, `head_dim` 256, causal prefill with `ne01 >= 256`, and
+only engages for Volta, `head_dim` 256, prefill with `ne01 >= 256`, and
 no ALiBi, logit softcap, or attention sinks. It accepts the same KV cache type
 contract as the rest of the CUDA FlashAttention path: F16 is read directly and
 every other accepted type (Q8_0 down to Q2_0S/Q2_1, BF16, IQ4_NL, F32) is
-materialized into the f16 mirror. K and V may use different types.
+materialized into the f16 mirror. K and V may use different types. The additive
+mask is authoritative, so any mask is correct: the KV tile bound comes from the
+same on-GPU mask scan the stock tile and vector routes use, with a full-scan
+fallback when that scan does not apply.
 
 ## Migration from earlier versions
 
