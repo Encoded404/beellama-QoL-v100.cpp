@@ -179,15 +179,24 @@ struct sm70_d256_kv_view {
     int64_t batch_stride;
 };
 
-// Materialize one K/V tensor the way launch_fattn does for the stock mma_f16 route:
-// a whole-tensor convert when the allocation is contiguous, otherwise the strided
-// to_fp16_nc walk. Both branches emit [batch][head][kv][D], so the resulting strides
-// are derived from the tensor shape rather than from whichever branch ran.
+// Materialize one K/V tensor the way launch_fattn does for the stock mma_f16 route,
+// including the strides it then hands to the kernel. The two branches do not agree on
+// the mirror layout:
+//
+//  - contiguous allocation: a whole-tensor linear convert, so the mirror keeps the
+//    source's memory order and the strides are the source strides rescaled from the
+//    source block size to half. ggml_is_contiguously_allocated() only compares the
+//    extent, so it also holds for gapless permuted tensors - the KV cache view
+//    llama.cpp builds is exactly that (kv minor, head stride one row) - and its mirror
+//    is then not kv major, unlike the nc branch below.
+//  - otherwise: the strided to_fp16_nc walk, which always emits [batch][head][kv][D]
+//    dense, so there the strides do follow from the shape.
 static sm70_d256_kv_view sm70_d256_kv_f16(
         const ggml_tensor * t, const uintptr_t mirror, const cudaStream_t stream) {
     sm70_d256_kv_view view;
 
     if (t->type == GGML_TYPE_F16) {
+        // No conversion: the kernel reads the tensor in place through its own strides.
         view.data         = (const half *) t->data;
         view.row_stride   = t->nb[1] / (int64_t) sizeof(half2);
         view.head_stride  = t->nb[2] / (int64_t) sizeof(half2);
@@ -197,23 +206,33 @@ static sm70_d256_kv_view sm70_d256_kv_f16(
 
     GGML_ASSERT(mirror != 0);
     half * const dst = (half *) mirror;
+    const size_t bs = ggml_blck_size(t->type);
+    const size_t ts = ggml_type_size(t->type);
+    view.data = dst;
+
     if (ggml_is_contiguously_allocated(t)) {
         to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(t->type);
         GGML_ASSERT(to_fp16 != nullptr);
         to_fp16((const char *) t->data, dst, ggml_nelements(t), stream);
+
+        // One source block holds bs values and becomes bs halfs, so the byte strides
+        // scale by bs*sizeof(half)/ts and the mirror keeps the source's axis order.
+        const int64_t num = (int64_t) bs * (int64_t) sizeof(half);
+        const int64_t den = (int64_t) ts * (int64_t) sizeof(half2);
+        view.row_stride   = (int64_t) t->nb[1] * num / den;
+        view.head_stride  = (int64_t) t->nb[2] * num / den;
+        view.batch_stride = (int64_t) t->nb[3] * num / den;
     } else {
-        const size_t ts = ggml_type_size(t->type);
         GGML_ASSERT(t->nb[0] == ts);
         to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(t->type);
         GGML_ASSERT(to_fp16 != nullptr);
         to_fp16((const char *) t->data, dst, t->ne[0], t->ne[1], t->ne[2], t->ne[3],
                 t->nb[1] / ts, t->nb[2] / ts, t->nb[3] / ts, stream);
-    }
 
-    view.data         = dst;
-    view.row_stride   = t->ne[0] / 2;
-    view.head_stride  = t->ne[1] * t->ne[0] / 2;
-    view.batch_stride = t->ne[2] * t->ne[1] * t->ne[0] / 2;
+        view.row_stride   = t->ne[0] / 2;
+        view.head_stride  = t->ne[1] * t->ne[0] / 2;
+        view.batch_stride = t->ne[2] * t->ne[1] * t->ne[0] / 2;
+    }
     return view;
 }
 

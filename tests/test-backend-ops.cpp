@@ -11320,6 +11320,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, false));
 
+    // D256 in the layout the FA graph actually builds: the KV cache is dense
+    // [D][n_head_kv][n_kv] and is permuted to [D][n_kv][n_head_kv], so it is gapless
+    // (kv-minor) rather than dense in ne order. launch_fattn converts those with the
+    // whole-tensor path and rescales the source strides, so a kernel fed the shape's
+    // strides instead reads the mirror transposed. Geometry as llama.cpp hands it over
+    // for D256 prefill.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 16, {2, 1}, 512, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
+
     // FLASH_ATTN_EXT MMA: non-pow2 head size and MLA K/V view.
     test_cases.emplace_back(new test_flash_attn_ext(192, 128, 8, {8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
