@@ -446,6 +446,19 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_key<uint32_t>   (enum llm_kv kid, uint32_t & result,    bool required);
     template bool llama_model_loader::get_key<std::string>(enum llm_kv kid, std::string & result, bool required);
 
+    // The PrismML hadamard metadata is read by string key from llama-model.cpp, so the
+    // string-key overloads need explicit instantiations too (upstream v0.4.8 only
+    // instantiates the enum-key forms, which leaves libllama with undefined symbols).
+    template bool llama_model_loader::get_key<bool>       (const std::string & key, bool & result,        bool required);
+    template bool llama_model_loader::get_key<int32_t>    (const std::string & key, int32_t & result,     bool required);
+    template bool llama_model_loader::get_key<uint32_t>   (const std::string & key, uint32_t & result,    bool required);
+    template bool llama_model_loader::get_key<float>      (const std::string & key, float & result,       bool required);
+    template bool llama_model_loader::get_key<std::string>(const std::string & key, std::string & result, bool required);
+    template bool llama_model_loader::get_arr<std::string>(const std::string & key, std::vector<std::string> & result, bool required);
+    template bool llama_model_loader::get_arr<int32_t>    (const std::string & key, std::vector<int32_t> & result,     bool required);
+    template bool llama_model_loader::get_arr<uint32_t>   (const std::string & key, std::vector<uint32_t> & result,    bool required);
+    template bool llama_model_loader::get_arr<float>      (const std::string & key, std::vector<float> & result,       bool required);
+
     template<>
     bool llama_model_loader::get_key(enum llm_kv kid, enum llama_pooling_type & result, bool required) {
         uint32_t tmp;
