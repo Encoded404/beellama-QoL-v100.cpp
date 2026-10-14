@@ -84,6 +84,13 @@ struct config {
     // admission, never during a decode, so this only hides the write latency.
     bool async_writes = true;
 
+    // Persistent mode: files survive the process. Construction does not wipe
+    // the directory (entries persisted by a previous run are adopted through
+    // adopt()), destruction never wipes, and published files use the `pcp-`
+    // prefix instead of `pcd-`. The limit is not enforced in this mode; the
+    // directory holds exactly what the last clean shutdown persisted.
+    bool persist = false;
+
     bool enabled() const {
         return !path.empty() && limit_mib != 0;
     }
@@ -116,6 +123,10 @@ struct entry {
     // correlation with the owning cache entry
     uint64_t n_tokens    = 0;
     uint64_t tokens_hash = 0;
+
+    // True when this entry's file lives in the persistent tier's directory
+    // and must survive the process. Dispatch for open()/erase().
+    bool persist_tier = false;
 
     bool on_disk() const {
         return status == status::present;
@@ -218,6 +229,23 @@ public:
     // Open a present entry. On any failure the entry is invalidated (no payload
     // remains) and its file is deleted; returns null.
     std::unique_ptr<mapping> open(entry & e);
+
+    // Next published-file name in this store's directory, advancing the serial.
+    // Used by the persistent save to reserve a rename destination. Returns an
+    // empty string when the tier is disabled.
+    std::string next_name();
+
+    // Register a file that already exists in this store's directory (persisted
+    // by a previous run, or just renamed in by the persistent save). The entry
+    // must carry path, n_tokens and tokens_hash; sizes and the total are filled
+    // in from the file header after validating identity and correlation against
+    // them. Returns false and leaves the entry unchanged (and the file alone)
+    // on any mismatch.
+    bool adopt(entry & e);
+
+    // Release this store's accounting for an entry whose file was moved out of
+    // its directory (persistent-save promotion). Does not touch the file.
+    void release(const entry & e);
 
     // Invalidate an entry and delete its file. Safe on any status.
     void erase(entry & e);

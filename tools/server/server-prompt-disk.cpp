@@ -310,7 +310,12 @@ store::store(config cfg, uint64_t identity) : cfg_(std::move(cfg)), identity_(id
         return;
     }
 
-    wipe();
+    if (cfg_.persist) {
+        // persistent mode: a previous run's published files are adopted by the
+        // caller (store::adopt), so nothing is removed here
+    } else {
+        wipe();
+    }
 
     if (cfg_.async_writes) {
         worker_ = std::thread([this] { writer_loop(); });
@@ -343,6 +348,11 @@ void store::remove_file(const std::string & path) {
 
 void store::wipe() {
     if (cfg_.path.empty()) {
+        return;
+    }
+
+    if (cfg_.persist) {
+        // persistent mode: the directory outlives the process
         return;
     }
 
@@ -599,7 +609,8 @@ bool store::spill(entry & e,
     payload_hash = hash_bytes(payload_hash, j.ckpt.data(), j.ckpt.size());
     h.payload_hash = payload_hash;
 
-    const std::string final_path = cfg_.path + "pcd-" + std::to_string(next_serial_++) + ".swap";
+    const char * file_prefix = cfg_.persist ? "pcp-" : "pcd-";
+    const std::string final_path = cfg_.path + file_prefix + std::to_string(next_serial_++) + ".swap";
     const std::string tmp_path   = final_path + ".tmp";
 
     j.header     = encode_header(h);
@@ -779,6 +790,104 @@ std::unique_ptr<mapping> store::open(entry & e) {
 
     ++restore_successes;
     return std::make_unique<mapping>(std::move(m));
+}
+
+std::string store::next_name() {
+    if (!enabled()) {
+        return {};
+    }
+
+    const char * file_prefix = cfg_.persist ? "pcp-" : "pcd-";
+    return cfg_.path + file_prefix + std::to_string(next_serial_++) + ".swap";
+}
+
+bool store::adopt(entry & e) {
+    if (!enabled() || !e.on_disk() || e.path.empty()) {
+        return false;
+    }
+
+    std::ifstream ifs(std::filesystem::u8path(e.path), std::ios::binary);
+    if (!ifs) {
+        return false;
+    }
+
+    uint8_t head[HEADER_SIZE];
+    if (!ifs.read((char *) head, sizeof(head))) {
+        return false;
+    }
+
+    header h;
+    if (!decode_header(head, sizeof(head), h)) {
+        return false;
+    }
+
+    if (h.identity != identity_) {
+        return false;
+    }
+
+    // the caller's entry metadata must correlate with the file, exactly like a
+    // read of a runtime entry would validate it
+    if (h.n_tokens != e.n_tokens || h.tokens_hash != e.tokens_hash) {
+        return false;
+    }
+
+    if (h.off_main != HEADER_SIZE ||
+            h.off_drft != h.off_main + h.size_main ||
+            h.off_spec != h.off_drft + h.size_drft ||
+            h.off_ckpt != h.off_spec + h.size_spec) {
+        return false;
+    }
+
+    if (h.size_main == 0) {
+        return false;
+    }
+
+    // advance the serial past the file's number, so nothing later overwrites it
+    {
+        const std::string & path = e.path;
+        const size_t base = path.find("pcp-");
+        if (base != std::string::npos) {
+            size_t idx = base + 4;
+            uint64_t value = 0;
+            while (idx < path.size() && path[idx] >= '0' && path[idx] <= '9') {
+                value = value*10 + uint64_t(path[idx] - '0');
+                ++idx;
+                if (value > 0xFFFFFFFFFFFFFFFULL) { // absurd serial: refuse
+                    value = 0;
+                    break;
+                }
+            }
+            if (value > 0 && value >= next_serial_) {
+                next_serial_ = value + 1;
+            }
+        }
+    }
+
+    e.bytes       = h.off_ckpt + h.size_ckpt;
+    e.size_main   = h.size_main;
+    e.size_drft   = h.size_drft;
+    e.size_spec   = h.size_spec;
+    e.size_ckpt   = h.size_ckpt;
+
+    // adoption is the persistent tier's registration path
+    e.persist_tier = true;
+
+    bytes_on_disk_   += size_t(e.bytes);
+    entries_on_disk_ += 1;
+
+    return true;
+}
+
+void store::release(const entry & e) {
+    if (!e.on_disk()) {
+        return;
+    }
+
+    const size_t bytes_cur = bytes_on_disk_.load();
+    bytes_on_disk_ = bytes_cur > e.bytes ? bytes_cur - e.bytes : 0;
+
+    const size_t entries_cur = entries_on_disk_.load();
+    entries_on_disk_ = entries_cur > 0 ? entries_cur - 1 : 0;
 }
 
 } // namespace server_prompt_disk

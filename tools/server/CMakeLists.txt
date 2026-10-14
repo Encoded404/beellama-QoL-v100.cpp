@@ -21,6 +21,8 @@ add_library(${TARGET} STATIC
     server-loop-guard.h
     server-prompt-disk.cpp
     server-prompt-disk.h
+    server-prompt-persist.cpp
+    server-prompt-persist.h
     server-stream.cpp
     server-stream.h
     server-tools.cpp

@@ -9,6 +9,7 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "server-common.h"
+#include "server-prompt-persist.h"
 
 #include <chrono>
 #include <sstream>
@@ -1704,6 +1705,14 @@ std::string server_task_result_metrics::to_metrics() {
             "prompt_cache_disk_bytes",
             "Serialized prompt-cache payload bytes currently held on disk",
             (double) metrics.prompt_cache_disk_bytes
+        }, {
+            "prompt_cache_persist_entries",
+            "Prompt-cache entries currently held by the persistent prompt-cache tier",
+            (double) metrics.prompt_cache_persist_entries
+        }, {
+            "prompt_cache_persist_bytes",
+            "Serialized prompt-cache payload bytes currently held by the persistent prompt-cache tier",
+            (double) metrics.prompt_cache_persist_bytes
         },
     };
 
@@ -1805,16 +1814,22 @@ json server_task_result_apply_lora::to_json() {
 
 server_prompt_cache::server_prompt_cache(
         int32_t limit_size_mib, size_t limit_tokens,
-        server_prompt_disk::config disk_config, uint64_t disk_identity)
-    : disk(std::move(disk_config), disk_identity) {
+        server_prompt_disk::config disk_config, uint64_t disk_identity,
+        server_prompt_disk::config persist_config, uint64_t persist_identity)
+    : disk(std::move(disk_config), disk_identity),
+      persist(std::move(persist_config), persist_identity) {
     this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
     this->limit_tokens = limit_tokens;
 }
 
 server_prompt_cache::~server_prompt_cache() {
-    // release every file this cache owns; the store is session-scoped
+    // release every file this cache owns in the session swap tier; the store
+    // is session-scoped. Files owned by the persistent tier survive the
+    // process and are re-adopted by the next run's identity check.
     for (auto & state : states) {
-        disk.erase(state.disk);
+        if (!state.disk.persist_tier) {
+            disk.erase(state.disk);
+        }
     }
     states.clear();
     accounted_bytes_cached = 0;
@@ -2005,7 +2020,8 @@ bool server_prompt_cache::erase(const server_prompt_cache_state * entry) {
 
 std::list<server_prompt_cache_state>::iterator server_prompt_cache::erase_iterator(
         std::list<server_prompt_cache_state>::iterator it) {
-    disk.erase(it->disk);
+    // the file is owned by whichever tier the entry was persisted into
+    (it->disk.persist_tier ? persist : disk).erase(it->disk);
     return states.erase(it);
 }
 
@@ -2305,7 +2321,11 @@ bool server_prompt_cache::load(
 
         if (it_best->disk.on_disk()) {
             const int64_t t_read_start = ggml_time_us();
-            mapping = disk.open(it_best->disk);
+            // materialize from whichever tier owns the entry's file; the
+            // persistent tier's read path validates identity the same way
+            mapping = it_best->disk.persist_tier
+                    ? persist.open(it_best->disk)
+                    : disk.open(it_best->disk);
             disk_read_us += uint64_t(ggml_time_us() - t_read_start);
             if (!mapping) {
                 // open() already invalidated the entry: it has no RAM payload and
@@ -2424,4 +2444,217 @@ void server_prompt_cache::update() {
                 (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(),
                 state.accounted_size() / (1024.0 * 1024.0), state.disk.on_disk() ? " [disk]" : "");
     }
+}
+
+//
+// persistent prompt-cache tier
+//
+
+namespace {
+
+std::string persist_file_name(const std::string & path) {
+    const size_t slash = path.find_last_of("/\\");
+    return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
+} // namespace
+
+bool server_prompt_cache::persist_load(bool with_mmproj) {
+    if (!persist.enabled()) {
+        return false;
+    }
+
+    const std::string dir = persist.path();
+
+    std::vector<server_prompt_persist::record> records;
+    if (!server_prompt_persist::index_read(dir, records)) {
+        // no usable index: the directory is cleared instead of trusting files
+        // whose token metadata nobody can validate
+        const size_t removed = server_prompt_persist::remove_stale_files(dir, {});
+        SRV_WRN("persisted prompt cache: no usable index in '%s', removed %zu stale file(s)\n",
+                dir.c_str(), removed);
+        return false;
+    }
+
+    std::vector<server_prompt_persist::record> adopted;
+    adopted.reserve(records.size());
+
+    for (auto & rec : records) {
+        if (rec.tokens.size() % sizeof(llama_token) != 0 || rec.tokens.empty()) {
+            server_prompt_persist::remove_file(dir + rec.name);
+            continue;
+        }
+
+        server_tokens toks;
+        try {
+            const llama_tokens packed((const llama_token *) rec.tokens.data(),
+                    (const llama_token *) (rec.tokens.data() + rec.tokens.size()));
+            toks = server_tokens::deserialize(packed, rec.has_media && with_mmproj);
+        } catch (const std::exception & err) {
+            // media tokens without an mmproj, or a corrupt token payload
+            SRV_WRN("persisted prompt cache: unusable token payload for '%s', dropping: %s\n",
+                    rec.name.c_str(), err.what());
+            server_prompt_persist::remove_file(dir + rec.name);
+            continue;
+        }
+
+        const llama_tokens & raw = toks.get_tokens();
+        if (raw.empty()) {
+            server_prompt_persist::remove_file(dir + rec.name);
+            continue;
+        }
+
+        // capture the correlation values now: raw points into toks, which is
+        // moved into the state below
+        const uint64_t n_tok = (uint64_t) raw.size();
+        const uint64_t tokens_hash = server_prompt_disk::hash_bytes(
+                raw.data(), raw.size()*sizeof(llama_token));
+
+        server_prompt_cache_state state;
+        state.prompt.tokens = std::move(toks);
+
+        // checkpoint appendix metadata only; the buffers live in the entry
+        // file, exactly like a runtime entry that was demoted to disk
+        for (const auto & meta : rec.checkpoints) {
+            common_prompt_checkpoint ckpt;
+            ckpt.id_task = -1;
+            ckpt.n_tokens = meta.n_tokens;
+            ckpt.pos_min  = meta.pos_min;
+            ckpt.pos_max  = meta.pos_max;
+            state.prompt.checkpoints.push_back(std::move(ckpt));
+        }
+
+        server_prompt_disk::entry & e = state.disk;
+        e.status      = server_prompt_disk::entry::status::present;
+        e.path        = dir + rec.name;
+        e.n_tokens    = n_tok;
+        e.tokens_hash = tokens_hash;
+
+        // adopt() validates the file header against the identity and the
+        // metadata above; on any mismatch the file is dropped
+        if (!persist.adopt(e)) {
+            SRV_WRN("persisted prompt cache: entry '%s' failed validation, dropping\n", rec.name.c_str());
+            server_prompt_persist::remove_file(dir + rec.name);
+            continue;
+        }
+
+        // keep the save order: records are oldest first, and the list expects
+        // the same order so eviction semantics carry over the restart
+        states.push_back(std::move(state));
+        adopted.push_back(std::move(rec));
+    }
+
+    // files present but not referenced by adopted records are stale
+    const size_t removed = server_prompt_persist::remove_stale_files(dir, adopted);
+    refresh_accounted_bytes();
+
+    SRV_INF("persisted prompt cache loaded: %zu entr%s (%.3f MiB), %zu stale file(s) removed\n",
+            adopted.size(), adopted.size() == 1 ? "y" : "ies",
+            persist.bytes_on_disk() / (1024.0 * 1024.0), removed);
+
+    return !states.empty();
+}
+
+void server_prompt_cache::persist_save() {
+    if (!persist.enabled()) {
+        return;
+    }
+
+    // every published session spill must have landed before its file moves
+    disk.flush();
+
+    std::vector<server_prompt_persist::record> records;
+    records.reserve(states.size());
+
+    for (auto it = states.begin(); it != states.end();) {
+        server_prompt_cache_state & state = *it;
+        server_prompt_disk::entry & e = state.disk;
+
+        if (e.persist_tier && e.on_disk()) {
+            // already persisted (rehydrated earlier or saved by an earlier
+            // call): nothing to move, only the index record is refreshed
+        } else if (e.on_disk() && !e.path.empty()) {
+            // a session spill: promote by rename plus a 128-byte in-place
+            // header identity patch. The payload is never read or rewritten.
+            const std::string src = e.path;
+            const std::string dst = persist.next_name();
+            if (dst.empty() || !server_prompt_persist::move_file(src, dst)) {
+                SRV_WRN("persisted prompt cache: failed to move '%s', entry not persisted\n", src.c_str());
+                ++it;
+                continue;
+            }
+            // the swap tier wrote its own identity into the header; re-stamp it
+            // before adoption so the persistent tier's read path accepts it
+            if (!server_prompt_persist::patch_header_identity(dst, persist.identity())) {
+                SRV_WRN("persisted prompt cache: failed to re-stamp '%s', entry not persisted\n", dst.c_str());
+                server_prompt_persist::remove_file(dst);
+                ++it;
+                continue;
+            }
+            disk.release(e);
+            e.path = dst;
+            if (!persist.adopt(e)) {
+                SRV_WRN("persisted prompt cache: failed to adopt '%s', removing it\n", dst.c_str());
+                server_prompt_persist::remove_file(dst);
+                e = server_prompt_disk::entry {};
+                ++it;
+                continue;
+            }
+        } else if (!state.data.main.empty()) {
+            // a RAM-resident entry with no file: one write from already
+            // serialized buffers, never a disk read
+            const llama_tokens & raw = state.prompt.tokens.get_tokens();
+            if (raw.empty()) {
+                ++it;
+                continue;
+            }
+
+            const uint64_t tokens_hash = server_prompt_disk::hash_bytes(
+                    raw.data(), raw.size()*sizeof(llama_token));
+
+            if (!persist.spill(e,
+                        std::move(state.data.main), std::move(state.data.drft), std::move(state.data.spec),
+                        state.prompt.checkpoints,
+                        (uint64_t) raw.size(), tokens_hash)) {
+                // the payload was consumed by the failed spill, so the entry
+                // can no longer serve either tier and must not stay cached
+                SRV_WRN("%s", "persisted prompt cache: a RAM entry failed to persist, dropping it\n");
+                it = erase_iterator(it);
+                continue;
+            }
+            e.persist_tier = true;
+        } else {
+            // no file, no payload: nothing to persist
+            ++it;
+            continue;
+        }
+
+        server_prompt_persist::record rec;
+        rec.name      = persist_file_name(e.path);
+        rec.tokens    = state.prompt.tokens.serialize();
+        rec.has_media = state.prompt.tokens.has_mtmd;
+
+        for (const auto & ckpt : state.prompt.checkpoints) {
+            rec.checkpoints.push_back({ ckpt.n_tokens, ckpt.pos_min, ckpt.pos_max });
+        }
+
+        records.push_back(std::move(rec));
+        ++it;
+    }
+
+    // every entry file must be complete before the index names it
+    persist.flush();
+
+    // the index is published last and atomically: an interruption between the
+    // promotions and this point loses the save, never leaves a stale partial one
+    if (!server_prompt_persist::index_write(persist.path(), persist.identity(), records)) {
+        SRV_WRN("persisted prompt cache: failed to write the index in '%s'\n", persist.path().c_str());
+    }
+
+    const size_t removed = server_prompt_persist::remove_stale_files(persist.path(), records);
+    refresh_accounted_bytes();
+
+    SRV_INF("persisted prompt cache saved: %zu entr%s (%.3f MiB), %zu stale file(s) removed\n",
+            records.size(), records.size() == 1 ? "y" : "ies",
+            persist.bytes_on_disk() / (1024.0 * 1024.0), removed);
 }

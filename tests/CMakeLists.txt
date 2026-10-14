@@ -106,6 +106,12 @@ if (Python3_Interpreter_FOUND)
     set_property(TEST test-cache-disk-static PROPERTY LABELS main)
 
     add_test(
+        NAME test-cache-persist-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-cache-persist-static.py)
+    set_property(TEST test-cache-persist-static PROPERTY LABELS main)
+
+    add_test(
         NAME test-spec-cession-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-spec-cession-static.py)
@@ -443,6 +449,21 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
                 --model ${MODEL_DIR}llama-dense.gguf)
         set_property(TEST test-cache-disk-e2e PROPERTY LABELS main)
         set_tests_properties(test-cache-disk-e2e PROPERTIES
+            FIXTURES_REQUIRED generate-models
+            TIMEOUT 900
+        )
+
+        # Persistent prompt-cache tier through the real server: argument
+        # gating, a restart round trip with a spill promotion, and a
+        # same-name/different-content model rejection
+        add_test(
+            NAME test-cache-persist-e2e
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-cache-persist-e2e.py
+                --server $<TARGET_FILE:llama-server>
+                --model ${MODEL_DIR}llama-dense.gguf)
+        set_property(TEST test-cache-persist-e2e PROPERTY LABELS main)
+        set_tests_properties(test-cache-persist-e2e PROPERTIES
             FIXTURES_REQUIRED generate-models
             TIMEOUT 900
         )

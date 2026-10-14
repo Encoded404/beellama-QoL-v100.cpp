@@ -765,6 +765,8 @@ struct common_params {
 
     std::string cache_disk_path = "";    // NOLINT; directory for the automatic disk prompt-cache swap, empty = disabled
 
+    std::string cache_persist_path = ""; // NOLINT; directory the prompt cache is persisted to across restarts, empty = disabled
+
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
     std::string chat_template = "";                                                                         // NOLINT

@@ -2031,6 +2031,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-persist"}, "PATH",
+        "path to a directory where the prompt cache is persisted on clean shutdown and reloaded on startup (default: disabled; requires --cache-ram; must not equal --cache-disk)",
+        [](common_params & params, const std::string & value) {
+            params.cache_persist_path = value;
+            if (!fs_is_directory(params.cache_persist_path)) {
+                throw std::invalid_argument("not a directory: " + value);
+            }
+            // if doesn't end with DIRECTORY_SEPARATOR, add it
+            if (!params.cache_persist_path.empty() && params.cache_persist_path[params.cache_persist_path.size() - 1] != DIRECTORY_SEPARATOR) {
+                params.cache_persist_path += DIRECTORY_SEPARATOR;
+            }
+        }
+    ).set_env("LLAMA_ARG_CACHE_PERSIST").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

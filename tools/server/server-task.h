@@ -993,7 +993,9 @@ struct server_prompt_cache {
             int32_t limit_size_mib,
             size_t limit_tokens,
             server_prompt_disk::config disk = {},
-            uint64_t disk_identity = 0);
+            uint64_t disk_identity = 0,
+            server_prompt_disk::config persist = {},
+            uint64_t persist_identity = 0);
 
     ~server_prompt_cache();
 
@@ -1014,6 +1016,11 @@ struct server_prompt_cache {
 
     // automatic disk swap tier
     server_prompt_disk::store disk;
+
+    // persistent prompt-cache tier: an empty config disables it. Files survive
+    // the process; the identity fingerprint of the next run must match for
+    // them to be adopted again.
+    server_prompt_disk::store persist;
 
     // Cumulative disk-tier work, in microseconds. Read concurrently by the
     // metrics path, so they are separate from the plain counters above.
@@ -1072,6 +1079,19 @@ struct server_prompt_cache {
             server_prompt_restore_timings * timings = nullptr);
 
     void update();
+
+    // Rehydrate entries persisted by a previous run (see persist_save). No-ops
+    // and returns false when the persistent tier is disabled. `with_mmproj`
+    // states whether this run can serve mtmd media tokens; entries carrying
+    // media are dropped when it cannot.
+    bool persist_load(bool with_mmproj);
+
+    // Persist the whole cache for the next run. Spilled entries are promoted
+    // by rename plus an in-place header identity patch (the payload is never
+    // read or rewritten); RAM-resident entries are written once through the
+    // tier's spill path; then the sidecar index is published atomically. No-op
+    // when the persistent tier is disabled; safe to call repeatedly.
+    void persist_save();
 
 private:
     server_prompt_cache_state * admit(server_prompt_cache_state && candidate);

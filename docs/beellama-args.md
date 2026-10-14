@@ -259,13 +259,40 @@ selects `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE`, so it needs no CUDA, ROCm, Metal, or
 Vulkan build and behaves identically on the CPU backend. A GPU build changes
 only the device-to-host transfer underneath the spill and restore.
 
+`--cache-persist DIR` (default: disabled; requires `--cache-ram`; must not be
+the same directory as `--cache-disk`) adds a persistent tier on top: on a clean
+shutdown the whole prompt cache is persisted there, and the next startup with
+the same layout and models rehydrates it. An entry the session swap tier already
+holds is promoted by a rename plus an in-place 128-byte header re-stamp; the
+payload is never read or rewritten. A RAM-resident entry is written once from
+its already-serialized buffers. A small sidecar `index.bin` records the entry
+order, the serialized token sequences, and the checkpoint metadata — the parts
+that live only in RAM otherwise. The index is published atomically last, so an
+interrupted shutdown loses the save instead of leaving a stale partial one, and
+leftover entry files without an index record are removed at the next startup.
+Restores served from the persisted state are reported as `cache_source = "disk"`.
+
+The persist tier reuses the swap file format and its full validation chain
+(magic, version, identity, token correlation, section layout, payload hash), and
+its identity additionally fingerprints the model file itself: file size,
+last-write time, and content slices spread across the file. Restarting the same
+server keeps the cache; a rebuilt fine-tune with the same name but different
+content (new mtime, or contents changed inside a sampled region) produces a
+different identity, so its cache is refused and deleted instead of restored.
+Entries carrying mtmd media tokens require the `--mmproj` of the next run to be
+present when they are rehydrated, and are dropped otherwise. Like the swap
+tier, persist runs on the CPU backend unchanged and should point only at
+storage where prompt-derived KV state is acceptable; the directory must be
+owned by a single serving instance.
+
 Completion timing JSON includes `cache_lcp_n`, `cache_planned_n`,
 `cache_reprocessed_n`, `cache_source`, `cache_reason`, `cache_disk_save_ms`, and
 `cache_disk_load_ms`. Prometheus exports
 `prompt_cache_admission_*_total`, `prompt_cache_restore_*_total`,
 `prompt_cache_accounted_bytes`, `prompt_cache_disk_spill_total`,
 `prompt_cache_disk_restore_total`, `prompt_cache_disk_entries`,
-`prompt_cache_disk_bytes`, `n_busy_slots_per_decode`, and the
+`prompt_cache_disk_bytes`, `prompt_cache_persist_entries`,
+`prompt_cache_persist_bytes`, `n_busy_slots_per_decode`, and the
 `kv_tail_*` coverage/degradation gauges. A nonzero restore-failure or degraded
 tail metric is actionable rather than silently counted as a hit. Accounted
 bytes are serialized payload accounting, not exact process-resident memory; the

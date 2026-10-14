@@ -9,6 +9,7 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-prompt-persist.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -1149,7 +1150,9 @@ static void prompt_disk_append_model(std::string & out, const char * tag, const 
     prompt_disk_append_meta(out, model);
 }
 
-static uint64_t prompt_disk_identity(
+// Shared body of a tier fingerprint: every setting that determines the
+// serialized sequence-state layout, plus all model metadata.
+static std::string prompt_state_identity_body(
         const common_params & params,
         const llama_model * model_tgt,
         const llama_model * model_dft,
@@ -1157,8 +1160,6 @@ static uint64_t prompt_disk_identity(
     const auto & kvarn = params.kvarn;
 
     std::string id;
-    id += "pcd-v1\n";
-    id += "format="  + std::to_string(server_prompt_disk::FILE_VERSION) + "\n";
     id += "ctx="     + std::to_string(params.n_ctx) + "," + std::to_string(params.n_parallel) +
             "," + std::to_string((int) params.kv_unified) + "," + std::to_string((int) params.swa_full) + "\n";
     id += "kv="      + std::to_string((int) params.cache_type_k) + "," + std::to_string((int) params.cache_type_v) + "\n";
@@ -1178,6 +1179,44 @@ static uint64_t prompt_disk_identity(
     } else {
         id += "dft=none\n";
     }
+
+    return id;
+}
+
+static uint64_t prompt_disk_identity(
+        const common_params & params,
+        const llama_model * model_tgt,
+        const llama_model * model_dft,
+        bool draft_owns_state) {
+    std::string id;
+    id += "pcd-v1\n";
+    id += "format="  + std::to_string(server_prompt_disk::FILE_VERSION) + "\n";
+    id += prompt_state_identity_body(params, model_tgt, model_dft, draft_owns_state);
+
+    return server_prompt_disk::hash_bytes(id.data(), id.size());
+}
+
+// Fingerprint for the persistent prompt-cache tier: the disk identity body
+// plus a content-sampled fingerprint of the model files themselves. The file
+// fingerprint stays stable across restarts with the same file and separates
+// re-finetunes that keep the same name, metadata and tensor layout.
+static uint64_t prompt_persist_identity(
+        const common_params & params,
+        const llama_model * model_tgt,
+        const llama_model * model_dft,
+        bool draft_owns_state) {
+    std::string id;
+    id += "pcp-v1\n";
+    id += "format="  + std::to_string(server_prompt_persist::INDEX_VERSION) + "\n";
+    id += prompt_state_identity_body(params, model_tgt, model_dft, draft_owns_state);
+
+    std::string fp = "file-fp=" + std::to_string(server_prompt_persist::file_fingerprint(params.model.path));
+    if (draft_owns_state && model_dft != nullptr) {
+        fp += "," + std::to_string(server_prompt_persist::file_fingerprint(params.speculative.draft.mparams.path));
+    } else {
+        fp += ",none";
+    }
+    id += fp + "\n";
 
     return server_prompt_disk::hash_bytes(id.data(), id.size());
 }
@@ -1248,6 +1287,8 @@ public:
             result.prompt_cache_disk_restore_failures = prompt_cache->disk.restore_failures.load();
             result.prompt_cache_disk_entries          = prompt_cache->disk.entries_on_disk();
             result.prompt_cache_disk_bytes            = prompt_cache->disk.bytes_on_disk();
+            result.prompt_cache_persist_entries       = prompt_cache->persist.entries_on_disk();
+            result.prompt_cache_persist_bytes         = prompt_cache->persist.bytes_on_disk();
         }
         return result;
     }
@@ -1321,6 +1362,12 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        // persist the cache before it is released: entries the tier already
+        // spilled are promoted by rename, RAM entries are written once
+        if (prompt_cache) {
+            prompt_cache->persist_save();
+        }
+
         prompt_cache.reset();
         spec.reset();
         spec_init.reset();
@@ -1791,12 +1838,30 @@ private:
                 SRV_TRC("%s", "disk prompt cache is disabled by `--cache-disk-mib 0`\n");
             }
 
+            // persistent tier: survives restarts, so it never wipes and never
+            // enforces a size limit (the directory holds the last save)
+            server_prompt_disk::config persist_cfg;
+            if (!params_base.cache_persist_path.empty()) {
+                if (params_base.cache_disk_path == params_base.cache_persist_path) {
+                    SRV_WRN("%s", "--cache-persist must not be the same directory as --cache-disk, disabling the persistent tier\n");
+                } else if (params_base.cache_ram_mib == 0) {
+                    SRV_WRN("%s", "--cache-persist requires --cache-ram, disabling the persistent tier\n");
+                } else {
+                    persist_cfg.path      = params_base.cache_persist_path;
+                    persist_cfg.limit_mib = -1;
+                    persist_cfg.persist   = true;
+                }
+            }
+
             const uint64_t disk_identity = disk_cfg.enabled()
                     ? prompt_disk_identity(params_base, model_tgt, model_dft, draft_owns_state)
                     : 0;
+            const uint64_t persist_identity = persist_cfg.enabled()
+                    ? prompt_persist_identity(params_base, model_tgt, model_dft, draft_owns_state)
+                    : 0;
 
             prompt_cache = std::make_unique<server_prompt_cache>(
-                    params_base.cache_ram_mib, n_ctx, disk_cfg, disk_identity);
+                    params_base.cache_ram_mib, n_ctx, disk_cfg, disk_identity, persist_cfg, persist_identity);
 
             if (prompt_cache->disk.enabled()) {
                 SRV_INF("disk prompt cache enabled: dir = %s, limit = %.3f MiB, identity = %016" PRIx64 "\n",
@@ -1804,11 +1869,20 @@ private:
                         prompt_cache->disk.identity());
                 SRV_INF("%s", "spilled prompt state (prompt-derived KV) will be written to this directory\n");
             }
+
+            if (prompt_cache->persist.enabled()) {
+                SRV_INF("persistent prompt cache enabled: dir = %s, identity = %016" PRIx64 "\n",
+                        prompt_cache->persist.path().c_str(), prompt_cache->persist.identity());
+                prompt_cache->persist_load(!params_base.mmproj.path.empty());
+            }
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
 
             if (!params_base.cache_disk_path.empty()) {
                 SRV_WRN("%s", "--cache-disk requires --cache-ram, disabling the disk swap tier\n");
+            }
+            if (!params_base.cache_persist_path.empty()) {
+                SRV_WRN("%s", "--cache-persist requires --cache-ram, disabling the persistent tier\n");
             }
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");

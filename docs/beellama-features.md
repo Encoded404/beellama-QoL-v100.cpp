@@ -562,6 +562,20 @@ restore served from disk), and `test-cache-disk-static` (wiring and
 documentation invariants). Only the device-to-host copy of a real GPU KV cache is
 left to hardware-backed runs.
 
+`--cache-persist` adds an opt-in persistent tier above the swap tier: a clean
+shutdown persists the whole prompt cache (RAM-resident and spilled entries) into
+a separate directory, and the next startup rehydrates it when the identity
+matches. Spilled entries are promoted by rename plus a 128-byte header re-stamp
+and their payload is never read or rewritten; a sidecar `index.bin` carries the
+entry order, serialized token sequences and checkpoint metadata. The identity
+fingerprint additionally covers the model file itself (size, mtime, sampled
+content), so a re-finetuned model with the same name but different content gets
+a fresh cache instead of a state mix-up. Validation, fail-closed deletion and
+backend neutrality follow the swap tier. Coverage: `test-cache-persist-e2e`
+(real server: gating, a restart round trip with a spill promotion, and a
+same-name/different-content rejection) and `test-cache-persist-static` (wiring
+and fail-closed invariants).
+
 For hybrid iSWA with multiple slots, eligible non-SWA layers keep KVarN while
 SWA layers use the explicit, warned, bit-width-matched standard-cache fallback.
 This is a supported hybrid placement rather than record reinterpretation;
