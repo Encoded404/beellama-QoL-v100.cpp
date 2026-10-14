@@ -213,6 +213,14 @@ if (CUDAToolkit_FOUND)
 
     set(CUDA_FLAGS -use_fast_math -extended-lambda)
 
+    if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12")
+        # This fork targets sm_70 (Volta). Toolkits >= 12 issue a notice for
+        # every offline compilation of architectures prior to 75; targeting 70
+        # here is intentional, so silence it. It is harmless with arch-only
+        # lists that contain no pre-Turing targets (e.g. 86, 89).
+        list(APPEND CUDA_FLAGS -Wno-deprecated-gpu-targets)
+    endif()
+
     if (GGML_CUDA_DEBUG)
         list(APPEND CUDA_FLAGS -lineinfo)
         add_compile_definitions(GGML_CUDA_DEBUG)
