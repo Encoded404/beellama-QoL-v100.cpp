@@ -731,7 +731,7 @@ int main(int argc, char ** argv) {
         }
     }
 
-    llama_batch batch = llama_batch_init(n_batch, 0, 1);
+    common_batch batch(ctx);
 
     const llama_token eos_token = llama_vocab_eos(vocab);
 
@@ -814,16 +814,16 @@ int main(int argc, char ** argv) {
         while (offset < n_total) {
             const int64_t n_chunk = std::min<int64_t>(n_batch, n_total - offset);
 
-            common_batch_clear(batch);
+            batch.clear();
             for (int64_t i = 0; i < n_chunk; ++i) {
                 // logits only needed on the last token of the whole sequence;
                 // hidden states are extracted for every token regardless
                 const bool want_logits = (offset + i == n_total - 1);
-                common_batch_add(batch, tokens[offset + i], offset + i, { 0 }, want_logits);
+                batch.add(tokens[offset + i], offset + i, 0, want_logits);
             }
 
-            if (llama_decode(ctx, batch) != 0) {
-                LOG_ERR("%s: doc %zu: llama_decode failed at offset %lld\n", __func__, doc_idx, (long long) offset);
+            if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+                LOG_ERR("%s: doc %zu: decode failed at offset %lld\n", __func__, doc_idx, (long long) offset);
                 return 1;
             }
 
@@ -859,7 +859,7 @@ int main(int argc, char ** argv) {
             }
 
             // read the K/V rows of every selected layer for this chunk. each
-            // llama_decode() starts filling the host buffers at row 0, so this
+            // decode pass starts filling the host buffers at row 0, so this
             // chunk occupies the first n_chunk rows.
             for (size_t i = 0; i < n_kv; ++i) {
                 const size_t nk = llama_get_kv_dump_n_embd_k(ctx, i);
@@ -1007,8 +1007,6 @@ int main(int argc, char ** argv) {
         LOG_INF("%s: write verification: %zu verified, %zu needed more than one attempt, %zu failed\n",
                 __func__, n_verified, n_retried, n_failed);
     }
-
-    llama_batch_free(batch);
 
     llama_perf_context_print(ctx);
 
