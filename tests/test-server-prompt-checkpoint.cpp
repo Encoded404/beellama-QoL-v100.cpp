@@ -2,8 +2,13 @@
 
 #undef NDEBUG
 #include <cassert>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <initializer_list>
 #include <list>
+#include <string>
 #include <vector>
 
 static constexpr size_t KIB = 1024;
@@ -622,6 +627,656 @@ static void prompt_cache_snapshot_restore_evict_stress() {
     assert(cache.restore_failures == 0);
 }
 
+//
+// automatic disk swap tier
+//
+
+static std::string disk_test_dir() {
+    static int counter = 0;
+
+    const char * env = getenv("SERVER_PROMPT_DISK_TEST_DIR");
+    const std::filesystem::path base = env != nullptr
+            ? std::filesystem::u8path(env)
+            : std::filesystem::temp_directory_path();
+
+    const std::filesystem::path dir = base / ("beellama-prompt-disk-test-" + std::to_string(counter++));
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir, ec);
+    assert(!ec);
+
+    return dir.u8string() + "/";
+}
+
+static void disk_test_remove(const std::string & dir) {
+    std::error_code ec;
+    std::filesystem::remove_all(std::filesystem::u8path(dir), ec);
+}
+
+// Insert two entries large enough to exceed a 1 MiB RAM budget, which demotes the
+// oldest one to disk. Returns the demoted file path.
+static std::string disk_test_make_demoted(server_prompt_cache & cache) {
+    assert(cache.disk.enabled());
+
+    server_prompt_data data;
+    data.main = std::vector<uint8_t>(700*KIB, 0x11);
+    data.drft = std::vector<uint8_t>(64, 0x22);
+    for (size_t i = 0; i < 64; ++i) {
+        data.main[i] = uint8_t(i);
+    }
+    assert(cache.insert(make_prompt({1, 2, 3, 4}), std::move(data)) != nullptr);
+    assert(cache.disk.bytes_on_disk() == 0);
+
+    server_prompt_data data2;
+    data2.main = std::vector<uint8_t>(700*KIB, 0x33);
+    assert(cache.insert(make_prompt({5, 6, 7, 8}), std::move(data2)) != nullptr);
+
+    // spills are published before their bytes land, so drain to observe files
+    cache.disk_flush();
+
+    assert(cache.states.size() == 2);
+    assert(cache.states.front().disk.on_disk());
+    assert(cache.disk.entries_on_disk() == 1);
+
+    const std::string file = cache.states.front().disk.path;
+    assert(!file.empty());
+    assert(std::filesystem::exists(std::filesystem::u8path(file)));
+    return file;
+}
+
+static void disk_spill_restore_round_trip() {
+    const std::string dir = disk_test_dir();
+
+    const std::vector<uint8_t> main_bytes = []{
+        std::vector<uint8_t> v(700*KIB, 0x11);
+        for (size_t i = 0; i < 64; ++i) {
+            v[i] = uint8_t(i);
+        }
+        return v;
+    }();
+    const std::vector<uint8_t> drft_bytes(64, 0x22);
+
+    {
+        server_prompt_disk::config cfg;
+        cfg.path      = dir;
+        cfg.limit_mib = 64;
+
+        server_prompt_cache cache(1, 0, cfg, 0xabcdef01u);
+
+        server_prompt_data data;
+        data.main = main_bytes;
+        data.drft = drft_bytes;
+        assert(cache.insert(make_prompt({1, 2, 3, 4}), std::move(data)) != nullptr);
+
+        server_prompt_data data2;
+        data2.main = std::vector<uint8_t>(700*KIB, 0x33);
+        assert(cache.insert(make_prompt({5, 6, 7, 8}), std::move(data2)) != nullptr);
+
+        // the RAM payload is handed to the disk tier at submission time
+        assert(cache.states.size() == 2);
+        const auto & demoted = cache.states.front();
+        assert(demoted.disk.on_disk());
+        assert(demoted.data.main.empty());
+        assert(demoted.data.drft.empty());
+        assert(cache.disk.bytes_on_disk() > 0);
+
+        cache.disk_flush();
+        assert(cache.disk.entries_on_disk() == 1);
+        assert(cache.disk.spill_successes.load() == 1);
+        assert(cache.disk.spill_failures.load() == 0);
+
+        bool called = false;
+        server_prompt_cache_state_io io {
+            /*.has_draft =*/ true,
+            /*.has_speculative =*/ false,
+            /*.restore_transaction =*/ [&](const uint8_t * main, size_t main_size,
+                                           const uint8_t * drft, size_t drft_size,
+                                           const uint8_t *, size_t) {
+                called = true;
+                return main_size == main_bytes.size() &&
+                        memcmp(main, main_bytes.data(), main_size) == 0 &&
+                        drft_size == drft_bytes.size() &&
+                        memcmp(drft, drft_bytes.data(), drft_size) == 0;
+            },
+        };
+
+        server_prompt current = make_prompt({9});
+        const server_tokens requested(llama_tokens {1, 2, 3, 4, 5, 6}, false);
+
+        assert(cache.load(current, requested, 0, 1, io));
+        assert(called);
+        assert(current.n_tokens() == 4);
+        assert(cache.restore_disk_successes.load() == 1);
+        assert(cache.restore_successes == 1);
+        assert(cache.restore_failures == 0);
+
+        // the disk entry stays restorable and is not consumed by a read
+        assert(cache.states.front().disk.on_disk());
+    }
+
+    disk_test_remove(dir);
+}
+
+static void disk_identity_mismatch_is_rejected() {
+    const std::string dir = disk_test_dir();
+
+    {
+        server_prompt_disk::config cfg;
+        cfg.path      = dir;
+        cfg.limit_mib = 64;
+
+        server_prompt_cache cache(1, 0, cfg, 0xabcdef01u);
+        const std::string file = disk_test_make_demoted(cache);
+
+        {
+            std::fstream fs(std::filesystem::u8path(file), std::ios::in | std::ios::out | std::ios::binary);
+            assert(fs.is_open());
+            const uint64_t other = 0x0123456789abcdefull;
+            fs.seekp(8);
+            fs.write((const char *) &other, sizeof(other));
+            fs.close();
+        }
+
+        bool called = false;
+        server_prompt_cache_state_io io {
+            /*.has_draft =*/ true,
+            /*.has_speculative =*/ false,
+            /*.restore_transaction =*/ [&](const uint8_t *, size_t, const uint8_t *, size_t, const uint8_t *, size_t) {
+                called = true;
+                return true;
+            },
+        };
+
+        server_prompt current = make_prompt({9});
+        const server_tokens requested(llama_tokens {1, 2, 3, 4, 5, 6}, false);
+
+        assert(!cache.load(current, requested, 0, 1, io));
+        assert(!called);
+        // only the unusable disk entry is dropped; the RAM entry stays
+        assert(cache.states.size() == 1);
+        assert(!cache.states.front().disk.on_disk());
+        assert(!std::filesystem::exists(std::filesystem::u8path(file)));
+        assert(cache.disk.bytes_on_disk() == 0);
+        assert(cache.disk.entries_on_disk() == 0);
+        assert(cache.disk.restore_failures.load() >= 1);
+    }
+
+    disk_test_remove(dir);
+}
+
+enum class disk_corruption {
+    magic,
+    version,
+    identity,
+    offsets,
+    payload_byte,
+    truncate,
+};
+
+static void disk_corruption_is_rejected(disk_corruption kind) {
+    const std::string dir = disk_test_dir();
+
+    {
+        server_prompt_disk::config cfg;
+        cfg.path      = dir;
+        cfg.limit_mib = 64;
+
+        server_prompt_cache cache(1, 0, cfg, 0xabcdef01u);
+        const std::string file = disk_test_make_demoted(cache);
+
+        {
+            std::fstream fs(std::filesystem::u8path(file), std::ios::in | std::ios::out | std::ios::binary);
+            assert(fs.is_open());
+
+            const auto put64 = [&](std::streamoff off, uint64_t v) {
+                fs.seekp(off);
+                fs.write((const char *) &v, sizeof(v));
+            };
+            const auto put32 = [&](std::streamoff off, uint32_t v) {
+                fs.seekp(off);
+                fs.write((const char *) &v, sizeof(v));
+            };
+
+            switch (kind) {
+                case disk_corruption::magic:        put32(0, 0xdeadbeef);  break;
+                case disk_corruption::version:      put32(4, 99);          break;
+                case disk_corruption::identity:     put64(8, 0xfeedface);  break;
+                case disk_corruption::offsets:      put64(32, 4096);       break;
+                case disk_corruption::payload_byte: put32(128 + 3, 0xffffffff); break;
+                case disk_corruption::truncate:     break;
+            }
+            fs.close();
+        }
+
+        if (kind == disk_corruption::truncate) {
+            const auto size = std::filesystem::file_size(std::filesystem::u8path(file));
+            assert(size > 1);
+            std::filesystem::resize_file(std::filesystem::u8path(file), size - 1);
+        }
+
+        bool called = false;
+        server_prompt_cache_state_io io {
+            /*.has_draft =*/ true,
+            /*.has_speculative =*/ false,
+            /*.restore_transaction =*/ [&](const uint8_t *, size_t, const uint8_t *, size_t, const uint8_t *, size_t) {
+                called = true;
+                return true;
+            },
+        };
+
+        server_prompt current = make_prompt({9});
+        const server_tokens requested(llama_tokens {1, 2, 3, 4, 5, 6}, false);
+
+        assert(!cache.load(current, requested, 0, 1, io));
+        assert(!called);
+        assert(cache.states.size() == 1);
+        assert(!cache.states.front().disk.on_disk());
+        assert(!std::filesystem::exists(std::filesystem::u8path(file)));
+        assert(cache.disk.bytes_on_disk() == 0);
+    }
+
+    disk_test_remove(dir);
+}
+
+static void disk_truncated_and_corrupt_files_are_rejected() {
+    for (const auto kind : {
+            disk_corruption::magic,
+            disk_corruption::version,
+            disk_corruption::identity,
+            disk_corruption::offsets,
+            disk_corruption::payload_byte,
+            disk_corruption::truncate }) {
+        disk_corruption_is_rejected(kind);
+    }
+}
+
+static void disk_budget_eviction() {
+    const std::string dir = disk_test_dir();
+
+    {
+        server_prompt_disk::config cfg;
+        cfg.path      = dir;
+        cfg.limit_mib = 1;
+
+        server_prompt_cache cache(1, 0, cfg, 0xabcdef01u);
+
+        for (llama_token i = 0; i < 3; ++i) {
+            server_prompt_data data;
+            data.main = std::vector<uint8_t>(600*KIB, uint8_t(i));
+            assert(cache.insert(make_prompt({i, i + 100, i + 200, i + 300}), std::move(data)) != nullptr);
+        }
+
+        cache.disk_flush();
+        assert(cache.disk.bytes_on_disk() <= cache.disk.limit_bytes());
+        assert(cache.accounted_size() <= cache.limit_size);
+        assert(cache.disk.entries_on_disk() == 1);
+
+        size_t n_disk = 0;
+        for (const auto & state : cache.states) {
+            n_disk += state.disk.on_disk() ? 1 : 0;
+        }
+        assert(n_disk == cache.disk.entries_on_disk());
+    }
+
+    disk_test_remove(dir);
+}
+
+static void disk_checkpoint_appendix_round_trip() {
+    const std::string dir = disk_test_dir();
+
+    {
+        server_prompt_disk::config cfg;
+        cfg.path      = dir;
+        cfg.limit_mib = 64;
+
+        server_prompt_cache cache(1, 0, cfg, 0xabcdef01u);
+
+        server_prompt prompt = make_prompt({1, 2, 3, 4});
+
+        // one durable checkpoint with a payload on every axis
+        auto & ckpt = prompt.checkpoints.emplace_back();
+        ckpt.n_tokens = 2;
+        ckpt.pos_min  = 0;
+        ckpt.pos_max  = 1;
+        ckpt.data_tgt.resize(256);
+        ckpt.data_dft.resize(128);
+        ckpt.data_spec.resize(64);
+        for (size_t i = 0; i < ckpt.data_tgt.size(); ++i) {
+            ckpt.data_tgt.data()[i] = uint8_t(i);
+        }
+
+        server_prompt_data data;
+        data.main = std::vector<uint8_t>(700*KIB, 0x11);
+        data.drft = std::vector<uint8_t>(64, 0x22);
+        assert(cache.insert(prompt, std::move(data)) != nullptr);
+
+        server_prompt_data data2;
+        data2.main = std::vector<uint8_t>(700*KIB, 0x33);
+        assert(cache.insert(make_prompt({5, 6, 7, 8}), std::move(data2)) != nullptr);
+
+        const auto & demoted = cache.states.front();
+        assert(demoted.disk.on_disk());
+        assert(demoted.disk.size_ckpt > 0);
+        // checkpoint payloads are released together with the main payload
+        assert(demoted.prompt.checkpoints.size() == 1);
+        assert(demoted.prompt.checkpoints.front().empty());
+
+        bool called = false;
+        server_prompt_cache_state_io io {
+            /*.has_draft =*/ true,
+            /*.has_speculative =*/ false,
+            /*.restore_transaction =*/ [&](const uint8_t *, size_t, const uint8_t *, size_t, const uint8_t *, size_t) {
+                called = true;
+                return true;
+            },
+        };
+
+        server_prompt current = make_prompt({9});
+        const server_tokens requested(llama_tokens {1, 2, 3, 4, 5, 6}, false);
+
+        assert(cache.load(current, requested, 0, 1, io));
+        assert(called);
+
+        assert(current.checkpoints.size() == 1);
+        const auto & restored = current.checkpoints.front();
+        assert(restored.n_tokens == 2);
+        assert(restored.pos_min == 0);
+        assert(restored.pos_max == 1);
+        assert(restored.data_tgt.size() == 256);
+        assert(restored.data_dft.size() == 128);
+        assert(restored.data_spec.size() == 64);
+        assert(restored.data_tgt.data()[7] == 7);
+    }
+
+    disk_test_remove(dir);
+}
+
+static void disk_erase_and_destructor_clean_the_directory() {
+    const std::string dir = disk_test_dir();
+
+    std::string file;
+    {
+        server_prompt_disk::config cfg;
+        cfg.path      = dir;
+        cfg.limit_mib = 64;
+
+        server_prompt_cache cache(1, 0, cfg, 0xabcdef01u);
+        file = disk_test_make_demoted(cache);
+
+        assert(cache.erase(&cache.states.front()));
+        assert(cache.states.size() == 1);
+        assert(!std::filesystem::exists(std::filesystem::u8path(file)));
+        assert(cache.disk.bytes_on_disk() == 0);
+    }
+
+    // nothing left behind: the store wipes its own files on destruction
+    for (const auto & entry : std::filesystem::directory_iterator(std::filesystem::u8path(dir))) {
+        const std::string name = entry.path().filename().u8string();
+        assert(!(name.size() > 4 && name.compare(0, 4, "pcd-") == 0));
+    }
+
+    disk_test_remove(dir);
+}
+
+static void disk_disabled_keeps_eviction_behaviour() {
+    const std::string dir = disk_test_dir();
+
+    {
+        server_prompt_cache cache(1, 0);
+        assert(!cache.disk.enabled());
+
+        server_prompt_data data;
+        data.main = std::vector<uint8_t>(700*KIB, 0x11);
+        assert(cache.insert(make_prompt({1, 2, 3, 4}), std::move(data)) != nullptr);
+
+        server_prompt_data data2;
+        data2.main = std::vector<uint8_t>(700*KIB, 0x33);
+        assert(cache.insert(make_prompt({5, 6, 7, 8}), std::move(data2)) != nullptr);
+
+        // with the tier disabled the oldest entry is dropped, not demoted
+        assert(cache.states.size() == 1);
+        assert(cache.accounted_size() <= cache.limit_size);
+        assert(cache.disk.bytes_on_disk() == 0);
+    }
+
+    disk_test_remove(dir);
+}
+
+static void disk_mapping_modes_agree() {
+    const std::string dir = disk_test_dir();
+
+    std::vector<uint8_t> main_bytes(4096);
+    for (size_t i = 0; i < main_bytes.size(); ++i) {
+        main_bytes[i] = uint8_t(i*7 + 1);
+    }
+    const std::vector<uint8_t> drft_bytes = { 1, 2, 3, 4 };
+    const std::vector<uint8_t> spec_bytes = { 9, 8, 7 };
+
+    std::list<common_prompt_checkpoint> checkpoints;
+    {
+        auto & ckpt = checkpoints.emplace_back();
+        ckpt.n_tokens = 2;
+        ckpt.pos_min  = 0;
+        ckpt.pos_max  = 1;
+        ckpt.data_tgt.resize(32);
+        ckpt.data_dft.resize(16);
+    }
+
+    for (const bool use_mmap : { false, true }) {
+        server_prompt_disk::config cfg;
+        cfg.path      = dir;
+        cfg.limit_mib = 64;
+        cfg.use_mmap  = use_mmap;
+
+        server_prompt_disk::store store(cfg, 0x1111222233334444ull);
+
+        server_prompt_disk::entry entry;
+        assert(store.spill(entry,
+                    main_bytes.data(), main_bytes.size(),
+                    drft_bytes.data(), drft_bytes.size(),
+                    spec_bytes.data(), spec_bytes.size(),
+                    checkpoints, 4, 0xabc));
+        assert(entry.on_disk());
+
+        auto m = store.open(entry);
+        assert(m != nullptr);
+
+        // the requested mode is used whenever the platform supports mapping
+        assert(m->mapped() == (use_mmap && server_prompt_disk::store::mapping_supported()));
+
+        assert(m->main_size() == main_bytes.size());
+        assert(memcmp(m->main(), main_bytes.data(), main_bytes.size()) == 0);
+        assert(m->drft_size() == drft_bytes.size());
+        assert(memcmp(m->drft(), drft_bytes.data(), drft_bytes.size()) == 0);
+        assert(m->spec_size() == spec_bytes.size());
+        assert(memcmp(m->spec(), spec_bytes.data(), spec_bytes.size()) == 0);
+
+        std::list<common_prompt_checkpoint> parsed;
+        size_t n_consumed = 0;
+        assert(server_prompt_disk::read_checkpoints(m->ckpt(), m->ckpt_size(), parsed, SIZE_MAX, &n_consumed));
+        assert(n_consumed == m->ckpt_size());
+        assert(parsed.size() == 1);
+        assert(parsed.front().n_tokens == 2);
+        assert(parsed.front().data_tgt.size() == 32);
+        assert(parsed.front().data_dft.size() == 16);
+
+        // releasing the mapping must not invalidate the entry
+        m.reset();
+        assert(entry.on_disk());
+        assert(store.bytes_on_disk() > 0);
+
+        // a read that cannot be served must fail closed and invalidate the entry
+        std::filesystem::remove(std::filesystem::u8path(entry.path));
+        assert(store.open(entry) == nullptr);
+        assert(!entry.on_disk());
+        assert(store.bytes_on_disk() == 0);
+    }
+
+    disk_test_remove(dir);
+}
+
+static void disk_async_lifecycle() {
+    // erasing a published entry whose write is still in flight must not leak a file
+    {
+        const std::string dir = disk_test_dir();
+
+        server_prompt_disk::config cfg;
+        cfg.path         = dir;
+        cfg.limit_mib    = 64;
+        cfg.async_writes = true;
+
+        server_prompt_disk::store store(cfg, 0xabcdef01u);
+
+        server_prompt_disk::entry entry;
+        std::vector<uint8_t> main(256*KIB, 0x77);
+        assert(store.spill(entry, std::move(main), {}, {}, {}, 4, 0x1));
+
+        // the entry is published immediately and the writer owns the bytes
+        assert(entry.on_disk());
+        assert(store.entries_on_disk() == 1);
+
+        store.erase(entry);
+        assert(!entry.on_disk());
+
+        // whatever the writer had done, draining must leave nothing behind
+        store.flush();
+
+        size_t n_files = 0;
+        for (const auto & de : std::filesystem::directory_iterator(std::filesystem::u8path(dir))) {
+            const std::string name = de.path().filename().u8string();
+            if (name.size() > 4 && name.compare(0, 4, "pcd-") == 0) {
+                ++n_files;
+            }
+        }
+        assert(n_files == 0);
+        assert(store.bytes_on_disk() == 0);
+        assert(store.entries_on_disk() == 0);
+
+        disk_test_remove(dir);
+    }
+
+    // reading a published entry before its bytes land must drain, not fail
+    {
+        const std::string dir = disk_test_dir();
+
+        server_prompt_disk::config cfg;
+        cfg.path         = dir;
+        cfg.limit_mib    = 64;
+        cfg.async_writes = true;
+
+        server_prompt_disk::store store(cfg, 0xabcdef01u);
+
+        std::vector<uint8_t> main(512*KIB, 0x11);
+        for (size_t i = 0; i < 64; ++i) {
+            main[i] = uint8_t(i);
+        }
+
+        server_prompt_disk::entry entry;
+        assert(store.spill(entry, std::move(main), {}, {}, {}, 4, 0x2));
+
+        auto m = store.open(entry);
+        assert(m != nullptr);
+        assert(m->main_size() == 512*KIB);
+        assert(m->main()[7] == 7);
+        m.reset();
+
+        store.flush();
+        assert(store.spill_successes.load() == 1);
+        assert(store.spill_failures.load() == 0);
+
+        disk_test_remove(dir);
+    }
+}
+
+static void disk_read_checkpoints_structure() {
+    // an absent appendix is a valid empty appendix
+    {
+        std::list<common_prompt_checkpoint> out;
+        size_t n_consumed = 123;
+        assert(server_prompt_disk::read_checkpoints(nullptr, 0, out, SIZE_MAX, &n_consumed));
+        assert(n_consumed == 0);
+        assert(out.empty());
+    }
+
+    std::vector<uint8_t> appendix;
+    {
+        std::list<common_prompt_checkpoint> checkpoints;
+        auto & ckpt = checkpoints.emplace_back();
+        ckpt.n_tokens = 3;
+        ckpt.pos_min  = 1;
+        ckpt.pos_max  = 2;
+        ckpt.data_tgt.resize(8, 0x5a);
+        server_prompt_disk::write_checkpoints(appendix, checkpoints);
+    }
+    assert(!appendix.empty());
+
+    // truncation is rejected without touching the caller's list
+    for (const size_t keep : { appendix.size() - 1, size_t(4), size_t(1) }) {
+        std::list<common_prompt_checkpoint> out;
+        out.emplace_back().n_tokens = 99;
+        assert(!server_prompt_disk::read_checkpoints(appendix.data(), keep, out, SIZE_MAX, nullptr));
+        assert(out.size() == 1 && out.front().n_tokens == 99);
+    }
+
+    {
+        std::vector<uint8_t> bad = appendix;
+        bad[0] ^= 0xff;
+        std::list<common_prompt_checkpoint> out;
+        assert(!server_prompt_disk::read_checkpoints(bad.data(), bad.size(), out, SIZE_MAX, nullptr));
+    }
+    {
+        std::vector<uint8_t> bad = appendix;
+        bad[4] = 99;
+        std::list<common_prompt_checkpoint> out;
+        assert(!server_prompt_disk::read_checkpoints(bad.data(), bad.size(), out, SIZE_MAX, nullptr));
+    }
+
+    // a valid appendix round-trips
+    {
+        std::list<common_prompt_checkpoint> parsed;
+        size_t n_consumed = 0;
+        assert(server_prompt_disk::read_checkpoints(appendix.data(), appendix.size(), parsed, SIZE_MAX, &n_consumed));
+        assert(n_consumed == appendix.size());
+        assert(parsed.size() == 1);
+        assert(parsed.front().n_tokens == 3);
+        assert(parsed.front().pos_min == 1);
+        assert(parsed.front().pos_max == 2);
+        assert(parsed.front().data_tgt.size() == 8);
+        assert(parsed.front().data_tgt.data()[0] == 0x5a);
+
+        // the limit truncates the oldest entries
+        std::list<common_prompt_checkpoint> limited;
+        assert(server_prompt_disk::read_checkpoints(appendix.data(), appendix.size(), limited, 0, nullptr));
+        assert(limited.empty());
+    }
+
+    // semantic validation against the prompt
+    {
+        server_prompt prompt = make_prompt({1, 2, 3, 4});
+        std::list<common_prompt_checkpoint> checkpoints;
+        auto & ckpt = checkpoints.emplace_back();
+        ckpt.n_tokens = 2;
+        ckpt.pos_min  = 0;
+        ckpt.pos_max  = 1;
+        ckpt.data_tgt.resize(8);
+
+        assert(server_prompt_disk::checkpoints_match_prompt(
+                checkpoints, 1, prompt.n_tokens(), prompt.tokens.pos_next()));
+        assert(!server_prompt_disk::checkpoints_match_prompt(
+                checkpoints, 2, prompt.n_tokens(), prompt.tokens.pos_next()));
+
+        checkpoints.front().pos_max = prompt.tokens.pos_next();
+        assert(!server_prompt_disk::checkpoints_match_prompt(
+                checkpoints, 1, prompt.n_tokens(), prompt.tokens.pos_next()));
+
+        checkpoints.front().pos_max = 1;
+        checkpoints.front().data_tgt.clear();
+        assert(!server_prompt_disk::checkpoints_match_prompt(
+                checkpoints, 1, prompt.n_tokens(), prompt.tokens.pos_next()));
+    }
+}
+
 int main() {
     prompt_cache_ranks_safe_restorable_prefix_before_lexical_lcp();
     prompt_cache_load_target_success_draft_failure_is_atomic();
@@ -641,6 +1296,16 @@ int main() {
     server_planned_removal_preserves_atomic_media_chunks();
     cache_phase_timings_are_public();
     prompt_cache_snapshot_restore_evict_stress();
+    disk_spill_restore_round_trip();
+    disk_identity_mismatch_is_rejected();
+    disk_truncated_and_corrupt_files_are_rejected();
+    disk_budget_eviction();
+    disk_checkpoint_appendix_round_trip();
+    disk_erase_and_destructor_clean_the_directory();
+    disk_disabled_keeps_eviction_behaviour();
+    disk_mapping_modes_agree();
+    disk_async_lifecycle();
+    disk_read_checkpoints_structure();
     {
         common_prompt_checkpoint ckpt;
         ckpt.n_tokens = 3;
@@ -684,6 +1349,7 @@ int main() {
                 /*.drft =*/ std::vector<uint8_t>(32),
                 /*.spec =*/ { },
             },
+            /*.disk =*/ { },
         };
         assert(state.accounted_size() == 128);
     }

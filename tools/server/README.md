@@ -172,6 +172,8 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-cram, --cache-ram N` | set the maximum cache size in MiB (default: 8192, -1 - no limit, 0 - disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
 | `-kvu, --kv-unified, -no-kvu, --no-kv-unified` | use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)<br/>(env: LLAMA_ARG_KV_UNIFIED) |
 | `--cache-idle-slots, --no-cache-idle-slots` | save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)<br/>(env: LLAMA_ARG_CACHE_IDLE_SLOTS) |
+| `--cache-disk PATH` | directory for the automatic disk swap of spilled prompt-cache state (default: disabled, requires `--cache-ram`). Prompt-derived KV state is written to this directory and the directory is cleaned on shutdown.<br/>(env: LLAMA_ARG_CACHE_DISK) |
+| `--cache-disk-mib N` | maximum automatic disk swap size in MiB (default: 2048, -1 - no limit, 0 - disable)<br/>(env: LLAMA_ARG_CACHE_DISK_MIB) |
 | `--context-shift, --no-context-shift` | whether to use context shift on infinite text generation (default: disabled)<br/>(env: LLAMA_ARG_CONTEXT_SHIFT) |
 | `-r, --reverse-prompt PROMPT` | halt generation at PROMPT, return control in interactive mode |
 | `-sp, --special` | special tokens output enabled (default: false) |

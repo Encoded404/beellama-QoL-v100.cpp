@@ -5,6 +5,7 @@
 #include "server-loop-guard.h"
 
 #include <algorithm>
+#include <atomic>
 #include <iterator>
 #include <limits>
 #include <string>
@@ -16,6 +17,7 @@
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
+#include "server-prompt-disk.h"
 
 
 struct common_speculative;
@@ -970,6 +972,11 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
 
+    // Automatic disk swap state. When the entry is demoted to disk its RAM
+    // payload and checkpoint buffers are released and this records the section
+    // layout needed to validate the file before restore.
+    server_prompt_disk::entry disk;
+
     size_t accounted_size() const {
         size_t res = data.size();
 
@@ -982,10 +989,13 @@ struct server_prompt_cache_state {
 };
 
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
-        this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
-        this->limit_tokens = limit_tokens;
-    }
+    server_prompt_cache(
+            int32_t limit_size_mib,
+            size_t limit_tokens,
+            server_prompt_disk::config disk = {},
+            uint64_t disk_identity = 0);
+
+    ~server_prompt_cache();
 
     std::list<server_prompt_cache_state> states;
 
@@ -1002,18 +1012,44 @@ struct server_prompt_cache {
     uint64_t restore_successes = 0;
     uint64_t restore_failures = 0;
 
+    // automatic disk swap tier
+    server_prompt_disk::store disk;
+
+    // Cumulative disk-tier work, in microseconds. Read concurrently by the
+    // metrics path, so they are separate from the plain counters above.
+    std::atomic<uint64_t> disk_spill_us{0};
+    std::atomic<uint64_t> disk_read_us{0};
+
+    // Successful restores whose payload came from the disk tier. Used to label
+    // the request source string without changing the load() signature.
+    std::atomic<uint64_t> restore_disk_successes{0};
+
+    // Snapshot of accounted_size() maintained for the concurrent metrics path,
+    // which must not walk the entry list.
+    std::atomic<size_t> accounted_bytes_cached{0};
+
     // Payload-only accounting: serialized target/draft/speculative bytes and
     // deduplicated shared checkpoint buffers. Container/token capacity and
     // allocator overhead are intentionally excluded.
     size_t accounted_size() const;
 
+    // Serialized bytes currently held on disk, excluding the file header.
+    size_t accounted_disk_size() const;
+
     size_t n_tokens() const;
+
+    // Tokens whose payload is RAM-resident. The derived token budget tracks RAM
+    // capacity, so disk-resident entries must not count against it.
+    size_t n_tokens_ram() const;
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
     server_prompt_cache_state * insert(const server_prompt & prompt, server_prompt_data && data);
 
     bool erase(const server_prompt_cache_state * entry);
+
+    // Drain deferred disk writes. No-op while spills are synchronous.
+    void disk_flush();
 
     bool load(
             server_prompt & prompt,
@@ -1039,6 +1075,21 @@ struct server_prompt_cache {
 
 private:
     server_prompt_cache_state * admit(server_prompt_cache_state && candidate);
+
+    // Free RAM under pressure. Spills the oldest RAM-resident entry to disk when
+    // possible and drops it otherwise, so the entry list keeps its LRU order for
+    // the entries that actually hold RAM. Returns true when an entry was spilled.
+    bool demote_oldest_ram();
+
+    // Drop an entry, deleting its disk file when present. Returns the iterator
+    // following the erased element.
+    std::list<server_prompt_cache_state>::iterator erase_iterator(std::list<server_prompt_cache_state>::iterator it);
+
+    void erase_front();
+
+    void enforce_disk_budget();
+
+    void refresh_accounted_bytes();
 };
 
 // used exclusively by router mode

@@ -98,6 +98,8 @@ json server_slot_stats::to_json() const {
         {"cache_checkpoint_restore_ms", cache_checkpoint_restore_ms},
         {"cache_checkpoint_prepare_ms", cache_checkpoint_prepare_ms},
         {"cache_checkpoint_commit_ms",  cache_checkpoint_commit_ms},
+        {"cache_disk_save_ms",     cache_disk_save_ms},
+        {"cache_disk_load_ms",     cache_disk_load_ms},
 
         {"prompt_n",               n_prompt_processed},
         {"prompt_ms",              t_prompt_ms()},

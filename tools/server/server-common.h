@@ -448,6 +448,12 @@ struct server_slot_stats {
     double cache_checkpoint_prepare_ms       = 0.0;
     double cache_checkpoint_commit_ms        = 0.0;
 
+    // Disk swap tier work. These are subsets of the matching RAM phase above:
+    // cache_disk_save_ms is the spill time inside the save phase and
+    // cache_disk_load_ms is the file-read time inside the load phase.
+    double cache_disk_save_ms                = 0.0;
+    double cache_disk_load_ms                = 0.0;
+
     // speculative decoding stats
     // note: the per-position breakdown lives in server_slot, it is not needed in a task result
     uint64_t n_draft_tokens      = 0;
@@ -588,6 +594,14 @@ struct server_metrics {
     uint64_t prompt_cache_restore_successes   = 0;
     uint64_t prompt_cache_restore_failures    = 0;
     uint64_t prompt_cache_accounted_bytes     = 0;
+    uint64_t prompt_cache_disk_spill_attempts   = 0;
+    uint64_t prompt_cache_disk_spill_successes  = 0;
+    uint64_t prompt_cache_disk_spill_failures   = 0;
+    uint64_t prompt_cache_disk_restore_attempts = 0;
+    uint64_t prompt_cache_disk_restore_successes = 0;
+    uint64_t prompt_cache_disk_restore_failures = 0;
+    uint64_t prompt_cache_disk_entries          = 0;
+    uint64_t prompt_cache_disk_bytes            = 0;
 
     void init() {
         t_start = ggml_time_us();

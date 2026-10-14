@@ -761,6 +761,9 @@ struct common_params {
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t checkpoint_max_step = 0;     // force a context checkpoint at least this often; 0 = off
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    int32_t cache_disk_mib      = 2048;  // automatic disk swap budget: -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+
+    std::string cache_disk_path = "";    // NOLINT; directory for the automatic disk prompt-cache swap, empty = disabled
 
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT

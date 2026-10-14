@@ -436,19 +436,29 @@ struct server_slot {
             size_t live_native_restorable_tokens,
             int32_t reuse_alignment,
             const server_prompt_cache_state * excluded = nullptr) {
-        const uint64_t restored_before = prompt_cache.restore_successes;
+        const uint64_t restored_before      = prompt_cache.restore_successes;
+        const uint64_t restored_disk_before = prompt_cache.restore_disk_successes.load();
+        const uint64_t disk_read_us_before  = prompt_cache.disk_read_us.load();
+
         server_prompt_restore_timings restore_timings;
         bool res = prompt_cache.load(
                 prompt, tokens, ctx_tgt, draft_owns_state ? ctx_dft : nullptr, spec, id,
                 live_native_restorable_tokens, reuse_alignment, excluded, &restore_timings);
         stats.cache_ram_restore_prepare_ms += restore_timings.prepare_us / 1000.0;
         stats.cache_ram_restore_commit_ms += restore_timings.commit_us / 1000.0;
+        stats.cache_disk_load_ms += (prompt_cache.disk_read_us.load() - disk_read_us_before) / 1000.0;
+
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
             prompt_cache_reason = "ram_restore_failed";
         } else if (prompt_cache.restore_successes != restored_before) {
-            prompt_cache_source = "ram";
-            prompt_cache_reason = "ram_restore_committed";
+            if (prompt_cache.restore_disk_successes.load() != restored_disk_before) {
+                prompt_cache_source = "disk";
+                prompt_cache_reason = "disk_restore_committed";
+            } else {
+                prompt_cache_source = "ram";
+                prompt_cache_reason = "ram_restore_committed";
+            }
         }
 
         return res;
@@ -1091,6 +1101,87 @@ static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * ch
 // server_context_impl (private implementation)
 //
 
+// Canonical fingerprint of the model(s) and of every setting that determines the
+// serialized sequence-state layout. A disk swap file may only be restored when
+// its fingerprint matches the running process.
+static std::string prompt_disk_model_desc(const llama_model * model) {
+    char dummy[1] = { 0 };
+    const int32_t n = llama_model_desc(model, dummy, 0);
+    if (n < 0) {
+        return {};
+    }
+    std::vector<char> buf(size_t(n) + 1, '\0');
+    llama_model_desc(model, buf.data(), buf.size());
+    return std::string(buf.data());
+}
+
+static void prompt_disk_append_meta(std::string & out, const llama_model * model) {
+    const int32_t n_meta = llama_model_meta_count(model);
+    for (int32_t i = 0; i < n_meta; ++i) {
+        char dummy[1] = { 0 };
+
+        const int32_t n_key = llama_model_meta_key_by_index(model, i, dummy, 0);
+        if (n_key < 0) {
+            continue;
+        }
+        std::vector<char> key(size_t(n_key) + 1, '\0');
+        llama_model_meta_key_by_index(model, i, key.data(), key.size());
+
+        const int32_t n_val = llama_model_meta_val_str_by_index(model, i, dummy, 0);
+        if (n_val < 0) {
+            continue;
+        }
+        std::vector<char> val(size_t(n_val) + 1, '\0');
+        llama_model_meta_val_str_by_index(model, i, val.data(), val.size());
+
+        out += key.data();
+        out += '\n';
+        out += val.data();
+        out += '\n';
+    }
+    out += '\n';
+}
+
+static void prompt_disk_append_model(std::string & out, const char * tag, const llama_model * model) {
+    out += tag; out += ".desc=";   out += prompt_disk_model_desc(model);               out += '\n';
+    out += tag; out += ".size=";   out += std::to_string(llama_model_size(model));     out += '\n';
+    out += tag; out += ".params="; out += std::to_string(llama_model_n_params(model)); out += '\n';
+    prompt_disk_append_meta(out, model);
+}
+
+static uint64_t prompt_disk_identity(
+        const common_params & params,
+        const llama_model * model_tgt,
+        const llama_model * model_dft,
+        bool draft_owns_state) {
+    const auto & kvarn = params.kvarn;
+
+    std::string id;
+    id += "pcd-v1\n";
+    id += "format="  + std::to_string(server_prompt_disk::FILE_VERSION) + "\n";
+    id += "ctx="     + std::to_string(params.n_ctx) + "," + std::to_string(params.n_parallel) +
+            "," + std::to_string((int) params.kv_unified) + "," + std::to_string((int) params.swa_full) + "\n";
+    id += "kv="      + std::to_string((int) params.cache_type_k) + "," + std::to_string((int) params.cache_type_v) + "\n";
+    id += "kvarn="   + std::to_string((int) kvarn.type) + "," + std::to_string(kvarn.key_bits) +
+            "," + std::to_string(kvarn.value_bits) + "," + std::to_string(kvarn.swa_key_bits) +
+            "," + std::to_string(kvarn.swa_value_bits) + "," + std::to_string(kvarn.group) +
+            "," + std::to_string(kvarn.sinkhorn_iters) + "," + std::to_string(kvarn.sink_tokens) +
+            "," + std::to_string((int) kvarn.fail_if_unsupported) + "\n";
+    id += "kvarn-preset=" + std::to_string(params.cache_kvarn_bits_k) + "," + std::to_string(params.cache_kvarn_bits_v) +
+            "," + std::to_string(params.cache_kvarn_swa_bits_k) + "," + std::to_string(params.cache_kvarn_swa_bits_v) + "\n";
+    id += "tail="    + params.kv_tail_tokens + "," + std::to_string((int) params.kv_tail_type) + "\n";
+
+    prompt_disk_append_model(id, "tgt", model_tgt);
+
+    if (draft_owns_state && model_dft != nullptr) {
+        prompt_disk_append_model(id, "dft", model_dft);
+    } else {
+        id += "dft=none\n";
+    }
+
+    return server_prompt_disk::hash_bytes(id.data(), id.size());
+}
+
 struct server_context_impl {
     friend struct server_context;
 
@@ -1148,7 +1239,15 @@ public:
             result.prompt_cache_restore_attempts    = prompt_cache->restore_attempts;
             result.prompt_cache_restore_successes   = prompt_cache->restore_successes;
             result.prompt_cache_restore_failures    = prompt_cache->restore_failures;
-            result.prompt_cache_accounted_bytes     = prompt_cache->accounted_size();
+            result.prompt_cache_accounted_bytes     = prompt_cache->accounted_bytes_cached.load();
+            result.prompt_cache_disk_spill_attempts   = prompt_cache->disk.spill_attempts.load();
+            result.prompt_cache_disk_spill_successes  = prompt_cache->disk.spill_successes.load();
+            result.prompt_cache_disk_spill_failures   = prompt_cache->disk.spill_failures.load();
+            result.prompt_cache_disk_restore_attempts = prompt_cache->disk.restore_attempts.load();
+            result.prompt_cache_disk_restore_successes = prompt_cache->disk.restore_successes.load();
+            result.prompt_cache_disk_restore_failures = prompt_cache->disk.restore_failures.load();
+            result.prompt_cache_disk_entries          = prompt_cache->disk.entries_on_disk();
+            result.prompt_cache_disk_bytes            = prompt_cache->disk.bytes_on_disk();
         }
         return result;
     }
@@ -1684,9 +1783,33 @@ private:
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            server_prompt_disk::config disk_cfg;
+            if (!params_base.cache_disk_path.empty() && params_base.cache_disk_mib != 0) {
+                disk_cfg.path      = params_base.cache_disk_path;
+                disk_cfg.limit_mib = params_base.cache_disk_mib;
+            } else if (!params_base.cache_disk_path.empty()) {
+                SRV_TRC("%s", "disk prompt cache is disabled by `--cache-disk-mib 0`\n");
+            }
+
+            const uint64_t disk_identity = disk_cfg.enabled()
+                    ? prompt_disk_identity(params_base, model_tgt, model_dft, draft_owns_state)
+                    : 0;
+
+            prompt_cache = std::make_unique<server_prompt_cache>(
+                    params_base.cache_ram_mib, n_ctx, disk_cfg, disk_identity);
+
+            if (prompt_cache->disk.enabled()) {
+                SRV_INF("disk prompt cache enabled: dir = %s, limit = %.3f MiB, identity = %016" PRIx64 "\n",
+                        prompt_cache->disk.path().c_str(), prompt_cache->disk.limit_bytes() / (1024.0 * 1024.0),
+                        prompt_cache->disk.identity());
+                SRV_INF("%s", "spilled prompt state (prompt-derived KV) will be written to this directory\n");
+            }
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
+
+            if (!params_base.cache_disk_path.empty()) {
+                SRV_WRN("%s", "--cache-disk requires --cache-ram, disabling the disk swap tier\n");
+            }
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
@@ -2007,6 +2130,8 @@ private:
             ret->stats.cache_checkpoint_restore_ms = 0.0;
             ret->stats.cache_checkpoint_prepare_ms = 0.0;
             ret->stats.cache_checkpoint_commit_ms = 0.0;
+            ret->stats.cache_disk_save_ms = 0.0;
+            ret->stats.cache_disk_load_ms = 0.0;
 
             update_cache = update_cache && prompt_cache;
 
@@ -2018,6 +2143,9 @@ private:
                 SRV_TRC("%s", "updating prompt cache\n");
 
                 const int64_t t_start = ggml_time_us();
+
+                // spills may happen during admission or during the budget update
+                const uint64_t disk_spill_us_before = prompt_cache->disk_spill_us.load();
 
                 int64_t t_phase = ggml_time_us();
                 const auto * admitted = ret->prompt_save(*prompt_cache);
@@ -2035,6 +2163,9 @@ private:
                 t_phase = ggml_time_us();
                 prompt_cache->update();
                 ret->stats.cache_ram_update_ms = (ggml_time_us() - t_phase) / 1000.0;
+
+                ret->stats.cache_disk_save_ms =
+                        (prompt_cache->disk_spill_us.load() - disk_spill_us_before) / 1000.0;
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }

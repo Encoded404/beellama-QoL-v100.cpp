@@ -100,6 +100,12 @@ if (Python3_Interpreter_FOUND)
     set_property(TEST test-server-loop-guard-checkpoint-static PROPERTY LABELS main)
 
     add_test(
+        NAME test-cache-disk-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-cache-disk-static.py)
+    set_property(TEST test-cache-disk-static PROPERTY LABELS main)
+
+    add_test(
         NAME test-spec-cession-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-spec-cession-static.py)
@@ -380,7 +386,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
-    llama_build(test-llama-archs.cpp)
+    llama_build(test-llama-archs.cpp ../tools/server/server-prompt-disk.cpp)
+    target_include_directories(test-llama-archs PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     llama_test(
         test-llama-archs
         NAME test-mtp-ubatch-sync
@@ -405,6 +412,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         LABEL main
         ARGS --test-kvarn-state-restore
     )
+    llama_test(
+        test-llama-archs
+        NAME test-kvarn-disk-swap-restore
+        LABEL main
+        ARGS --test-kvarn-disk-swap-restore
+    )
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
@@ -418,6 +431,22 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-generate-models PROPERTIES
         FIXTURES_SETUP generate-models
     )
+
+    # Automatic disk swap tier through the real server: argument gating, a spill
+    # under RAM pressure, and a restore served from disk
+    if (LLAMA_BUILD_SERVER)
+        add_test(
+            NAME test-cache-disk-e2e
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-cache-disk-e2e.py
+                --server $<TARGET_FILE:llama-server>
+                --model ${MODEL_DIR}llama-dense.gguf)
+        set_property(TEST test-cache-disk-e2e PROPERTY LABELS main)
+        set_tests_properties(test-cache-disk-e2e PROPERTIES
+            FIXTURES_REQUIRED generate-models
+            TIMEOUT 900
+        )
+    endif()
 
     # Test recurrent-state rollback across all architectures, using the generated dummy models
     llama_test(

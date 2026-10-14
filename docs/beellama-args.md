@@ -230,13 +230,47 @@ serialized checkpoint byte buffers, not native KV blocks. Self-contained RAM
 state continues to own and transfer the body because it must survive source
 removal.
 
+`--cache-disk DIR` adds an automatic third tier below the RAM prompt cache and
+requires `--cache-ram`. When `--cache-ram` pressure would otherwise drop the
+oldest entry, the already-serialized self-contained target/draft/speculative
+state and its serialized checkpoint appendix are published to a single swap file
+instead, bounded by `--cache-disk-mib` (default 2048, `-1` no limit, `0`
+disable). A later request whose prompt matches a demoted entry is restored from
+disk, reported as `cache_source = "disk"`. The RAM payload is handed to the
+writer instead of copied, and spills are published before their bytes land, so a
+read arriving first drains the writer rather than failing. Spills run on a
+dedicated writer thread; the cache work itself only happens at request
+admission, never during a decode.
+
+Every swap file is validated before a byte is used: file magic and version, a
+layout identity fingerprint covering the model metadata, tensor byte count and
+every setting that determines the serialized layout, the recorded prompt-token
+correlation, the section layout, and a payload hash. A mismatch, truncation,
+corruption, identity change, or write failure invalidates and deletes the entry
+rather than reinterpreting state, and an entry left without a usable payload is
+removed from the cache so it cannot be selected again. Files are staged and
+published with a rename, the directory is owned by the process and wiped at
+startup and shutdown, and the tier is session-scoped: it is not reused across
+restarts. Because a spilled file holds prompt-derived KV state, enable the tier
+only where that is acceptable and keep the directory out of shared backups.
+
+The tier is backend-neutral. It moves only host-side serialized state and never
+selects `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE`, so it needs no CUDA, ROCm, Metal, or
+Vulkan build and behaves identically on the CPU backend. A GPU build changes
+only the device-to-host transfer underneath the spill and restore.
+
 Completion timing JSON includes `cache_lcp_n`, `cache_planned_n`,
-`cache_reprocessed_n`, `cache_source`, and `cache_reason`. Prometheus exports
+`cache_reprocessed_n`, `cache_source`, `cache_reason`, `cache_disk_save_ms`, and
+`cache_disk_load_ms`. Prometheus exports
 `prompt_cache_admission_*_total`, `prompt_cache_restore_*_total`,
-`prompt_cache_accounted_bytes`, `n_busy_slots_per_decode`, and the
+`prompt_cache_accounted_bytes`, `prompt_cache_disk_spill_total`,
+`prompt_cache_disk_restore_total`, `prompt_cache_disk_entries`,
+`prompt_cache_disk_bytes`, `n_busy_slots_per_decode`, and the
 `kv_tail_*` coverage/degradation gauges. A nonzero restore-failure or degraded
 tail metric is actionable rather than silently counted as a hit. Accounted
-bytes are serialized payload accounting, not exact process-resident memory.
+bytes are serialized payload accounting, not exact process-resident memory; the
+disk byte gauge counts published entries, including a spill whose bytes are
+still being written.
 
 ## DFlash and adaptive draft depth
 

@@ -16,12 +16,17 @@
 #include "../src/llama-arch.h"
 #include "../src/llama-model-saver.h"
 
+#include "../tools/server/server-prompt-disk.h"
+
 #include <cinttypes>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <filesystem>
+#include <list>
 #include <random>
 #include <regex>
 #include <stdexcept>
@@ -103,6 +108,7 @@ static void usage(char ** argv) {
     LOG("      --test-mtp-request-reset Run the Bee MTP request reset regression\n");
     LOG("      --test-mtp-kvarn-routing Run the Bee MTP KVarN routing regression\n");
     LOG("      --test-kvarn-state-restore Run the Bee KVarN self-contained state restore regression\n");
+    LOG("      --test-kvarn-disk-swap-restore Run the automatic disk swap restore regression\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -966,6 +972,199 @@ static int test_kvarn_state_restore(const size_t seed) {
     return failures == 0 ? 0 : 1;
 }
 
+// End-to-end proof that a self-contained sequence state survives a round trip
+// through the automatic disk swap tier: spill from a live cache, drop the whole
+// cache, restore through the tier, and require a bit-exact continuation. Runs on
+// the in-process tiny models, so it needs no model files and no GPU, and covers
+// both the mapped and the buffered read paths plus identity rejection.
+static int test_disk_swap_restore(const size_t seed) {
+    static int dir_counter = 0;
+
+    const auto make_dir = [&]() {
+        const char * env = getenv("SERVER_PROMPT_DISK_TEST_DIR");
+        const std::filesystem::path base = env != nullptr
+                ? std::filesystem::u8path(env)
+                : std::filesystem::temp_directory_path();
+        const std::filesystem::path dir =
+                base / ("beellama-disk-swap-archs-" + std::to_string(dir_counter++));
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+        std::filesystem::create_directories(dir, ec);
+        return dir;
+    };
+
+    int failures = 0;
+
+    // 300 leaves an unsealed live group that exists only in the F16 stage
+    constexpr uint32_t n_prefix = 300;
+    constexpr uint32_t n_keep   = n_prefix;
+
+    for (const llm_arch arch : { LLM_ARCH_LLAMA, LLM_ARCH_QWEN35 }) {
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, false);
+        llama_model_params model_params = llama_model_default_params();
+        model_params.progress_callback = silent_model_load_progress;
+        tensor_data_params tensor_params = { seed, 1.0e-2f };
+        llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_params, model_params));
+        if (!model) {
+            throw std::runtime_error("failed to create disk swap test model");
+        }
+
+        const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+        const auto prefix = get_tokens(n_prefix, n_vocab, seed + 1);
+        const auto suffix = get_tokens(24, n_vocab, seed + 2);
+
+        for (const bool use_mmap : { false, true }) {
+            const std::filesystem::path dir    = make_dir();
+            const std::filesystem::path dir_id = make_dir();
+
+            {
+                llama_context_params params = llama_context_default_params();
+                params.n_ctx = 1024;
+                params.n_batch = 512;
+                params.n_ubatch = 64;
+                params.n_seq_max = 2;
+                params.kv_unified = false;
+                params.n_threads = 4;
+                params.n_threads_batch = 4;
+                params.offload_kqv = false;
+                params.kvarn = llama_kvarn_params_for_type(LLAMA_KVARN_K4V4_G128);
+                llama_context_ptr ctx(llama_init_from_model(model.get(), params));
+                if (!ctx) {
+                    throw std::runtime_error("failed to create disk swap test context");
+                }
+
+                llama_memory_t mem = llama_get_memory(ctx.get());
+                constexpr llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED;
+
+                kvarn_restore_decode(ctx.get(), prefix, 0, 0);
+
+                const size_t state_size = llama_state_seq_get_size_ext(ctx.get(), 0, flags);
+                std::vector<uint8_t> state(state_size);
+                if (state.empty() ||
+                        llama_state_seq_get_data_ext(ctx.get(), state.data(), state.size(), 0, flags) != state.size()) {
+                    throw std::runtime_error("failed to save disk swap state");
+                }
+
+                // reference: trim the live state and continue
+                if (!llama_memory_seq_rm(mem, 0, llama_pos(n_keep), -1)) {
+                    throw std::runtime_error("failed to trim live disk swap reference");
+                }
+                const auto reference = kvarn_restore_decode(ctx.get(), suffix, n_keep, 0);
+
+                // a checkpoint appendix so the tier codec carries real metadata
+                std::list<common_prompt_checkpoint> checkpoints;
+                {
+                    auto & ckpt = checkpoints.emplace_back();
+                    ckpt.n_tokens = n_keep/2;
+                    ckpt.pos_min  = 0;
+                    ckpt.pos_max  = llama_pos(n_keep/2 - 1);
+                    ckpt.data_tgt.resize(64, 0x5a);
+                }
+
+                server_prompt_disk::config cfg;
+                cfg.path      = dir.u8string() + "/";
+                cfg.limit_mib = 64;
+                cfg.use_mmap  = use_mmap;
+
+                server_prompt_disk::store store(cfg, 0x5eed1234u);
+
+                server_prompt_disk::entry entry;
+                if (!store.spill(entry, state.data(), state.size(), nullptr, 0, nullptr, 0,
+                            checkpoints, n_prefix, 0x1234)) {
+                    fprintf(stderr, "%s disk swap: spill failed\n", llm_arch_name(arch));
+                    ++failures;
+                } else {
+                    // hard clear so nothing can be recovered from the live cache
+                    llama_memory_clear(mem, true);
+
+                    auto m = store.open(entry);
+                    if (!m) {
+                        fprintf(stderr, "%s disk swap: open failed\n", llm_arch_name(arch));
+                        ++failures;
+                    } else {
+                        if (m->mapped() != (use_mmap && server_prompt_disk::store::mapping_supported())) {
+                            fprintf(stderr, "%s disk swap: unexpected read mode (mapped = %d)\n",
+                                    llm_arch_name(arch), (int) m->mapped());
+                            ++failures;
+                        }
+
+                        llama_state_seq_restore_plan * plan = llama_state_seq_prepare_data_ext(
+                                ctx.get(), m->main(), m->main_size(), 0, flags);
+                        if (plan == nullptr) {
+                            fprintf(stderr, "%s disk swap: restore prepare failed\n", llm_arch_name(arch));
+                            ++failures;
+                        } else {
+                            const size_t committed = llama_state_seq_restore_plan_commit(plan);
+                            llama_state_seq_restore_plan_free(plan);
+
+                            if (committed != m->main_size()) {
+                                fprintf(stderr, "%s disk swap: restored %zu of %zu bytes\n",
+                                        llm_arch_name(arch), committed, m->main_size());
+                                ++failures;
+                            } else {
+                                if (!llama_memory_seq_rm(mem, 0, llama_pos(n_keep), -1)) {
+                                    throw std::runtime_error("failed to trim restored disk swap state");
+                                }
+                                const auto restored = kvarn_restore_decode(ctx.get(), suffix, n_keep, 0);
+                                const double err = nmse(reference, restored);
+                                const bool ok = reference == restored;
+                                fprintf(stderr, "%-6s disk swap %-8s nmse = %.3e %s\n",
+                                        llm_arch_name(arch), use_mmap ? "mmap" : "buffered", err, ok ? "OK" : "FAIL");
+                                failures += ok ? 0 : 1;
+                            }
+                        }
+
+                        // the appendix round-trips and validates against the prompt
+                        std::list<common_prompt_checkpoint> parsed;
+                        size_t n_consumed = 0;
+                        if (!server_prompt_disk::read_checkpoints(
+                                    m->ckpt(), m->ckpt_size(), parsed, SIZE_MAX, &n_consumed) ||
+                                n_consumed != m->ckpt_size() ||
+                                !server_prompt_disk::checkpoints_match_prompt(
+                                    parsed, checkpoints.size(), n_prefix, llama_pos(n_prefix))) {
+                            fprintf(stderr, "%s disk swap: checkpoint appendix did not round-trip\n", llm_arch_name(arch));
+                            ++failures;
+                        }
+
+                        m.reset();
+                    }
+                }
+
+                // a file keyed for another identity must be refused and dropped.
+                // the reader is constructed first so its constructor's wipe
+                // cannot delete the file under test.
+                server_prompt_disk::config cfg_id = cfg;
+                cfg_id.path = dir_id.u8string() + "/";
+
+                server_prompt_disk::store reader(cfg_id, 0x5eed1234u);
+                server_prompt_disk::store other (cfg_id, 0x9999u);
+
+                server_prompt_disk::entry foreign;
+                if (!other.spill(foreign, state.data(), state.size(), nullptr, 0, nullptr, 0,
+                            checkpoints, n_prefix, 0x1234)) {
+                    fprintf(stderr, "%s disk swap: foreign spill failed\n", llm_arch_name(arch));
+                    ++failures;
+                } else {
+                    if (!other.open(foreign)) {
+                        fprintf(stderr, "%s disk swap: own-identity reopen failed\n", llm_arch_name(arch));
+                        ++failures;
+                    }
+                    if (reader.open(foreign) != nullptr || foreign.on_disk()) {
+                        fprintf(stderr, "%s disk swap: identity mismatch was accepted\n", llm_arch_name(arch));
+                        ++failures;
+                    }
+                }
+            }
+
+            std::error_code ec;
+            std::filesystem::remove_all(dir, ec);
+            std::filesystem::remove_all(dir_id, ec);
+        }
+    }
+
+    return failures == 0 ? 0 : 1;
+}
+
 static std::vector<float> get_logits(
         llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false) {
     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
@@ -1532,6 +1731,7 @@ int main(int argc, char ** argv) {
     bool test_mtp_reset = false;
     bool test_mtp_kvarn = false;
     bool test_kvarn_restore = false;
+    bool test_disk_swap = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -1607,6 +1807,8 @@ int main(int argc, char ** argv) {
             test_mtp_kvarn = true;
         } else if (strcmp(argv[i], "--test-kvarn-state-restore") == 0) {
             test_kvarn_restore = true;
+        } else if (strcmp(argv[i], "--test-kvarn-disk-swap-restore") == 0) {
+            test_disk_swap = true;
         } else {
             LOG_ERR("%s: unknown argument: %s\n", __func__, argv[i]);
             usage(argv);
@@ -1634,6 +1836,9 @@ int main(int argc, char ** argv) {
         }
         if (test_kvarn_restore) {
             return test_kvarn_state_restore(seed);
+        }
+        if (test_disk_swap) {
+            return test_disk_swap_restore(seed);
         }
         return test_backends(arch_filter, seed, stdev, verbosity, target_backend);
     } catch (const std::exception & err) {

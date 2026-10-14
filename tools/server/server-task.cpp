@@ -1688,6 +1688,22 @@ std::string server_task_result_metrics::to_metrics() {
             "prompt_cache_accounted_bytes",
             "Serialized RAM prompt-cache payload bytes, excluding container and allocator overhead",
             (double) metrics.prompt_cache_accounted_bytes
+        }, {
+            "prompt_cache_disk_spill_total",
+            "Prompt-cache entries successfully spilled to the automatic disk swap tier",
+            (double) metrics.prompt_cache_disk_spill_successes
+        }, {
+            "prompt_cache_disk_restore_total",
+            "Prompt-cache restores served from the automatic disk swap tier",
+            (double) metrics.prompt_cache_disk_restore_successes
+        }, {
+            "prompt_cache_disk_entries",
+            "Prompt-cache entries currently held on disk",
+            (double) metrics.prompt_cache_disk_entries
+        }, {
+            "prompt_cache_disk_bytes",
+            "Serialized prompt-cache payload bytes currently held on disk",
+            (double) metrics.prompt_cache_disk_bytes
         },
     };
 
@@ -1787,6 +1803,23 @@ json server_task_result_apply_lora::to_json() {
     return json {{ "success", true }};
 }
 
+server_prompt_cache::server_prompt_cache(
+        int32_t limit_size_mib, size_t limit_tokens,
+        server_prompt_disk::config disk_config, uint64_t disk_identity)
+    : disk(std::move(disk_config), disk_identity) {
+    this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
+    this->limit_tokens = limit_tokens;
+}
+
+server_prompt_cache::~server_prompt_cache() {
+    // release every file this cache owns; the store is session-scoped
+    for (auto & state : states) {
+        disk.erase(state.disk);
+    }
+    states.clear();
+    accounted_bytes_cached = 0;
+}
+
 size_t server_prompt_cache::accounted_size() const {
     size_t res = 0;
     std::unordered_set<const void *> checkpoint_storage;
@@ -1809,6 +1842,10 @@ size_t server_prompt_cache::accounted_size() const {
     return res;
 }
 
+size_t server_prompt_cache::accounted_disk_size() const {
+    return disk.bytes_on_disk();
+}
+
 size_t server_prompt_cache::n_tokens() const {
     size_t res = 0;
 
@@ -1817,6 +1854,26 @@ size_t server_prompt_cache::n_tokens() const {
     }
 
     return res;
+}
+
+size_t server_prompt_cache::n_tokens_ram() const {
+    size_t res = 0;
+
+    for (const auto & state : states) {
+        if (!state.disk.on_disk()) {
+            res += state.prompt.n_tokens();
+        }
+    }
+
+    return res;
+}
+
+void server_prompt_cache::disk_flush() {
+    disk.flush();
+}
+
+void server_prompt_cache::refresh_accounted_bytes() {
+    accounted_bytes_cached = accounted_size();
 }
 
 server_prompt_cache_state * server_prompt_cache::admit(server_prompt_cache_state && candidate) {
@@ -1888,7 +1945,7 @@ server_prompt_cache_state * server_prompt_cache::admit(server_prompt_cache_state
         if (len == (int) it->prompt.tokens.size()) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
-            it = states.erase(it);
+            it = erase_iterator(it);
         } else {
             ++it;
         }
@@ -1898,12 +1955,12 @@ server_prompt_cache_state * server_prompt_cache::admit(server_prompt_cache_state
         // The candidate is already present and fully materialized. Evict only
         // older entries until unique payload accounting is within budget.
         while (!states.empty() && accounted_size() > limit_size) {
-            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                    states.front().accounted_size() / (1024.0 * 1024.0));
-
-            states.pop_front();
+            demote_oldest_ram();
         }
     }
+
+    enforce_disk_budget();
+    refresh_accounted_bytes();
 
     ++admission_successes;
     return &*admitted;
@@ -1938,11 +1995,99 @@ server_prompt_cache_state * server_prompt_cache::alloc(
 bool server_prompt_cache::erase(const server_prompt_cache_state * entry) {
     for (auto it = states.begin(); it != states.end(); ++it) {
         if (&*it == entry) {
-            states.erase(it);
+            erase_iterator(it);
+            refresh_accounted_bytes();
             return true;
         }
     }
     return false;
+}
+
+std::list<server_prompt_cache_state>::iterator server_prompt_cache::erase_iterator(
+        std::list<server_prompt_cache_state>::iterator it) {
+    disk.erase(it->disk);
+    return states.erase(it);
+}
+
+void server_prompt_cache::erase_front() {
+    erase_iterator(states.begin());
+}
+
+bool server_prompt_cache::demote_oldest_ram() {
+    if (states.empty()) {
+        return false;
+    }
+
+    // Disk-resident entries contribute nothing to the RAM budget, so skip them
+    // instead of rewriting a file that cannot relieve any pressure.
+    auto it = std::find_if(states.begin(), states.end(), [](const server_prompt_cache_state & state) {
+        return !state.disk.on_disk();
+    });
+
+    if (it == states.end()) {
+        // no RAM payload is left to free; drop the oldest disk entry
+        SRV_WRN(" - dropping oldest disk entry (size = %.3f MiB)\n", states.front().disk.bytes / (1024.0 * 1024.0));
+        erase_front();
+        return false;
+    }
+
+    server_prompt_data & data = it->data;
+
+    const llama_tokens & toks = it->prompt.tokens.get_tokens();
+
+    if (disk.enabled() && !data.main.empty()) {
+        const int64_t t_spill_start = ggml_time_us();
+
+        // take ownership of the payload: the writer frees it, so the spill costs
+        // no extra copy and the RAM is released as soon as the job is queued
+        const bool spilled = disk.spill(it->disk,
+                    std::move(data.main), std::move(data.drft), std::move(data.spec),
+                    it->prompt.checkpoints,
+                    (uint64_t) toks.size(),
+                    server_prompt_disk::hash_bytes(toks.data(), toks.size()*sizeof(llama_token)));
+
+        disk_spill_us += uint64_t(ggml_time_us() - t_spill_start);
+
+        if (spilled) {
+            SRV_WRN(" - moving oldest RAM entry to disk (size = %.3f MiB)\n", it->disk.bytes / (1024.0 * 1024.0));
+            // the RAM payload is already owned by the disk tier; release the
+            // checkpoint buffers too so no serialized state is pinned in RAM
+            for (auto & ckpt : it->prompt.checkpoints) {
+                ckpt.clear_tgt();
+                ckpt.clear_dft();
+                std::vector<uint8_t>().swap(ckpt.data_spec);
+            }
+            return true;
+        }
+
+        // the payload was consumed by the failed spill, so the entry can no
+        // longer serve either tier
+        SRV_WRN("%s", " - dropping oldest entry after a failed disk spill\n");
+        erase_iterator(it);
+        return false;
+    }
+
+    SRV_WRN(" - dropping oldest entry (size = %.3f MiB)\n", it->accounted_size() / (1024.0 * 1024.0));
+    erase_iterator(it);
+    return false;
+}
+
+void server_prompt_cache::enforce_disk_budget() {
+    if (!disk.enabled() || disk.bytes_on_disk() <= disk.limit_bytes()) {
+        return;
+    }
+
+    for (auto it = states.begin(); it != states.end() && disk.bytes_on_disk() > disk.limit_bytes();) {
+        if (!it->disk.on_disk()) {
+            ++it;
+            continue;
+        }
+
+        SRV_WRN(" - disk swap budget reached, removing oldest disk entry (size = %.3f MiB)\n",
+                it->disk.bytes / (1024.0 * 1024.0));
+
+        it = erase_iterator(it);
+    }
 }
 
 server_prompt_restore_result server_prompt_restore_transaction_diagnostic(
@@ -2149,23 +2294,69 @@ bool server_prompt_cache::load(
                 restorable_best, f_keep_best, f_sim_best);
 
         auto & data = it_best->data;
-        if (data.main.empty() ||
-                io.has_draft != !data.drft.empty() ||
-                (!io.has_speculative && !data.spec.empty()) ||
+
+        // A demoted entry owns no RAM payload; materialize it from disk. The
+        // mapping must outlive the restore transaction because the transaction
+        // reads tensor data straight out of it.
+        std::unique_ptr<server_prompt_disk::mapping> mapping;
+        const uint8_t * p_main = data.main.data(); size_t n_main = data.main.size();
+        const uint8_t * p_drft = data.drft.data(); size_t n_drft = data.drft.size();
+        const uint8_t * p_spec = data.spec.data(); size_t n_spec = data.spec.size();
+
+        if (it_best->disk.on_disk()) {
+            const int64_t t_read_start = ggml_time_us();
+            mapping = disk.open(it_best->disk);
+            disk_read_us += uint64_t(ggml_time_us() - t_read_start);
+            if (!mapping) {
+                // open() already invalidated the entry: it has no RAM payload and
+                // no readable file, so it must not stay selectable.
+                ++restore_failures;
+                erase_iterator(it_best);
+                return false;
+            }
+            p_main = mapping->main(); n_main = mapping->main_size();
+            p_drft = mapping->drft(); n_drft = mapping->drft_size();
+            p_spec = mapping->spec(); n_spec = mapping->spec_size();
+        }
+
+        if (n_main == 0 ||
+                io.has_draft != (n_drft > 0) ||
+                (!io.has_speculative && n_spec > 0) ||
                 !io.restore_transaction) {
             ++restore_failures;
             return false;
         }
 
-        if (!io.restore_transaction(
-                    data.main.data(), data.main.size(),
-                    data.drft.data(), data.drft.size(),
-                    data.spec.data(), data.spec.size())) {
+        if (!io.restore_transaction(p_main, n_main, p_drft, n_drft, p_spec, n_spec)) {
             ++restore_failures;
             return false;
         }
 
+        if (mapping) {
+            // Rehydrate the checkpoint appendix only after the transaction has
+            // committed. A payload-less checkpoint must never enter the slot, so
+            // a failed read drops the metadata instead.
+            std::list<common_prompt_checkpoint> checkpoints;
+            size_t n_ckpt_consumed = 0;
+            const bool ok = server_prompt_disk::read_checkpoints(
+                    mapping->ckpt(), mapping->ckpt_size(), checkpoints, SIZE_MAX, &n_ckpt_consumed) &&
+                    n_ckpt_consumed == mapping->ckpt_size() &&
+                    server_prompt_disk::checkpoints_match_prompt(
+                            checkpoints, it_best->prompt.checkpoints.size(),
+                            it_best->prompt.n_tokens(), it_best->prompt.tokens.pos_next());
+
+            if (ok) {
+                it_best->prompt.checkpoints = std::move(checkpoints);
+            } else {
+                SRV_WRN("%s", " - disk swap entry has an unusable checkpoint appendix, dropping checkpoints\n");
+                it_best->prompt.checkpoints.clear();
+            }
+        }
+
         prompt = it_best->prompt.clone();
+        if (mapping) {
+            ++restore_disk_successes;
+        }
         ++restore_successes;
     }
 
@@ -2204,32 +2395,33 @@ bool server_prompt_cache::load(
 void server_prompt_cache::update() {
     if (limit_size > 0) {
         while (!states.empty() && accounted_size() > limit_size) {
-            SRV_WRN(" - cache accounted-payload limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().accounted_size() / (1024.0 * 1024.0));
-
-            states.pop_front();
+            demote_oldest_ram();
         }
     }
 
-    // average size per token
-    const float size_per_token = std::max<float>(1.0f, float(accounted_size()) / (std::max<size_t>(1, n_tokens())));
+    // average size per token over RAM-resident payloads: the derived token
+    // budget tracks RAM capacity, so disk-resident entries must not count
+    const float size_per_token = std::max<float>(1.0f, float(accounted_size()) / (std::max<size_t>(1, n_tokens_ram())));
 
     // dynamically increase the token limit if it can fit in the memory limit
     const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
 
     if (limit_tokens > 0) {
-        while (!states.empty() && n_tokens() > limit_tokens_cur) {
-            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().accounted_size() / (1024.0 * 1024.0));
-
-            states.pop_front();
+        while (!states.empty() && n_tokens_ram() > limit_tokens_cur) {
+            demote_oldest_ram();
         }
     }
 
-    SRV_TRC(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
-            states.size(), accounted_size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
+    enforce_disk_budget();
+    refresh_accounted_bytes();
+
+    SRV_TRC(" - cache state: %zu prompts, %.3f MiB RAM + %.3f MiB disk (limits: %.3f MiB, %.3f MiB disk, %zu tokens, %zu est)\n",
+            states.size(), accounted_size() / (1024.0 * 1024.0), accounted_disk_size() / (1024.0 * 1024.0),
+            limit_size / (1024.0 * 1024.0), disk.limit_bytes() / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
 
     for (const auto & state : states) {
-        SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
-                (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.accounted_size() / (1024.0 * 1024.0));
+        SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB%s\n",
+                (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(),
+                state.accounted_size() / (1024.0 * 1024.0), state.disk.on_disk() ? " [disk]" : "");
     }
 }

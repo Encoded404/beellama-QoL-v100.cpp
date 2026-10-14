@@ -529,6 +529,39 @@ frontier-only. Accounted bytes include serialized entry payloads and count
 shared immutable checkpoint buffers once; container capacity and allocator
 overhead are intentionally excluded.
 
+`--cache-disk` adds an opt-in automatic disk tier below the RAM cache. RAM
+pressure demotes the oldest RAM-resident entry instead of dropping it: the
+already-serialized self-contained payload plus its checkpoint appendix are
+published to one swap file, the RAM buffers are handed to the writer so the
+spill costs no copy, and the disk budget (`--cache-disk-mib`) evicts the oldest
+disk entries independently. The entry keeps its tokens and checkpoint metadata
+in RAM, so prefix planning and restorable-prefix ranking are unchanged; only the
+payload moves. A restore materializes the payload, revalidates it, runs the
+same prepared transaction as a RAM entry, and only then rehydrates the
+checkpoint payloads, so the fail-closed contract is identical.
+
+Files embed a layout identity fingerprint, a payload hash, and a token
+correlation, and the directory is process-owned and session-scoped. Any
+validation failure invalidates the entry and deletes the file rather than
+reinterpreting state, and an entry whose only payload was lost this way is
+removed from the cache. Spills are published before their bytes reach disk, so a
+read that races the writer drains it; erasing an entry whose write is still in
+flight removes the file once it lands. Payloads are mapped on read where the
+platform supports it, so a restore faults reclaimable page cache instead of
+allocating a second anonymous copy. The disk tier carries prompt-derived KV
+state, so it is opt-in and should not point at shared or backed-up storage.
+
+The tier is backend-neutral: it moves host-side serialized bytes and never
+selects the device-resident state mode, so no CUDA/ROCm/Metal/Vulkan build is
+required and behavior is identical on the CPU backend. Coverage is `main`-labeled
+and needs no GPU: `test-server-prompt-checkpoint` (format, demotion, rejection,
+budget, both read modes, deferred-write lifecycle), `test-kvarn-disk-swap-restore`
+(bit-exact restore on in-process dense and hybrid tiny models),
+`test-cache-disk-e2e` (real server: gating, a spill under RAM pressure, and a
+restore served from disk), and `test-cache-disk-static` (wiring and
+documentation invariants). Only the device-to-host copy of a real GPU KV cache is
+left to hardware-backed runs.
+
 For hybrid iSWA with multiple slots, eligible non-SWA layers keep KVarN while
 SWA layers use the explicit, warned, bit-width-matched standard-cache fallback.
 This is a supported hybrid placement rather than record reinterpretation;

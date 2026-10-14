@@ -2009,6 +2009,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--cache-disk"}, "PATH",
+        "path to a directory used for the automatic disk swap of spilled prompt-cache state (default: disabled; requires --cache-ram)",
+        [](common_params & params, const std::string & value) {
+            params.cache_disk_path = value;
+            if (!fs_is_directory(params.cache_disk_path)) {
+                throw std::invalid_argument("not a directory: " + value);
+            }
+            // if doesn't end with DIRECTORY_SEPARATOR, add it
+            if (!params.cache_disk_path.empty() && params.cache_disk_path[params.cache_disk_path.size() - 1] != DIRECTORY_SEPARATOR) {
+                params.cache_disk_path += DIRECTORY_SEPARATOR;
+            }
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-mib"}, "N",
+        string_format("set the maximum automatic disk swap size in MiB (default: %d, -1 - no limit, 0 - disable)",
+            params.cache_disk_mib),
+        [](common_params & params, int value) {
+            params.cache_disk_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

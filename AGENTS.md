@@ -21,6 +21,8 @@ small:
 - A profit-only adaptive draft-max controller for DFlash1. DFlash2 keeps its fixed trained block limit and selector confidence.
 - Reasoning-loop detection and the opted-in realtime
   `/v1/chat/completions/control` endpoint.
+- Opt-in automatic disk swap for spilled prompt-cache state
+  (`--cache-disk` / `--cache-disk-mib`).
 - INI presets and KLD measurement support in `llama-perplexity`.
 
 DFlash GGUFs must use upstream's `dflash` architecture, metadata, and tensor
@@ -107,6 +109,11 @@ Key binaries are `llama-server`, `llama-cli`, `llama-bench`, and
   attention shaders.
 - `tools/server/server-adaptive-dm.h` - profit adaptive draft-max controller.
 - `tools/server/server-loop-guard.cpp` / `.h` - reasoning loop detection.
+- `tools/server/server-prompt-disk.cpp` / `.h` - automatic disk swap tier for
+  spilled prompt-cache state. Backend-neutral: it moves host-side serialized
+  state only, so it needs no CUDA/ROCm/Metal/Vulkan build and is fully testable
+  on the CPU backend.
+
 ### Key Docs
 
 - `docs/beellama-features.md` - fork feature and compatibility matrix.
@@ -161,6 +168,13 @@ build/bin/llama-server -m target.gguf \
 
 KLD comparisons use matching `-b` and `-ub` values for the baseline and
 candidate. Record both values with every result.
+
+The automatic disk swap tier is backend-neutral and every test that covers it is
+`main`-labeled (`test-cache-disk-static`, `test-server-prompt-checkpoint`,
+`test-kvarn-disk-swap-restore`, `test-cache-disk-e2e`), so `ctest -L main` on a
+CPU-only build is a complete functional check. Only the device-to-host copy of a
+real GPU KV cache is left to hardware-backed runs; the tier itself selects no
+device-resident state mode.
 
 ## Git Conventions
 
