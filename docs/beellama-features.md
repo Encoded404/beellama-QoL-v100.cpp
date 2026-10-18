@@ -210,7 +210,12 @@ split-D kernel in `fattn-sm70-d256.cu` pairs two warps on the same Q rows
 instead: the pair splits the KV columns for QK, passes the scores through a
 pair-shared shared-memory tile, and then splits the output dimension for PV so
 each warp accumulates only 128 of the 256 dims. Spill drops to 48 bytes of stack
-at the same register budget. Upstream issue #28037 documents why this is the
+at the same register budget. Two operand-path refinements keep the same
+arithmetic but remove hot-path waste: the shared score tile is row-padded
+(`32 + 1` floats) so the thread-local softmax reads do not all hit the same
+shared-memory bank, and K/V are double buffered with the next KV tile
+prefetched while the current one computes, which also drops the per-tile
+barrier count from four to two. Upstream issue #28037 documents why this is the
 remaining lever on Volta: the gap to Turing and newer is architectural (m8n8k4,
 no `ldmatrix`, no `cp.async`) and cannot be closed by configuration tuning.
 
@@ -278,11 +283,14 @@ output, not a crash:
   `dst`, `nb[2]` is the query-row stride and `nb[1]` is the head stride — the
   opposite of `Q`. The two coincide when `heads_q == 1`, so a swap is invisible
   on single-head shapes and scrambles every row on real models.
-- Exact-tail FlashAttention (`dst->src[5..11]`) runs its packed body as a
+- Exact-tail FlashAttention (`dst->src[5..11]`) runs its body as a
   normal FlashAttention op with a per-(row, head) max/sum meta in `src[8]`,
-  which the stock kernels publish and the merge consumes. This route does not
-  write that meta, so it declines ops that carry `src[8]`; those body passes use
-  the stock MMA_F16 route.
+  which the stock kernels publish and the merge consumes. This route now
+  publishes the same final `(row_max, row_sum)` pair for every row it computes
+  (in the flat `(sequence*rows + row)*heads + head` layout the merge reads), so
+  it serves those body and tail passes directly when the meta is a contiguous
+  `[2][heads_q][q_rows][sequences]` f32 tensor; only a meta with an unexpected
+  layout keeps the pass on the stock MMA_F16 route.
 - The f16 K/V mirror is **not** always `[batch][head][kv][D]`, because
   `ggml_is_contiguously_allocated()` compares the tensor's extent rather than its
   axis order: it is true for any gapless tensor, including the permuted KV cache

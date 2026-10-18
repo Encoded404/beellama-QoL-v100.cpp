@@ -119,15 +119,19 @@ bool ggml_cuda_sm70_d256_supported(const int cc, const ggml_tensor * dst) {
         sm70_d256_probe("REJECT: no mask / sinks / small batch", cc, dst);
         return false;
     }
-    // The exact-tail path (dst->src[5..11]) runs its packed body through this op with the
-    // per-(row, head) max/sum meta attached as src[8] and folds the body result into the
-    // tail pass. The stock kernels publish that meta; this kernel computes the same row
-    // max/sum but does not write it, so the tail pass would read uninitialized weights.
-    // Those body passes keep the stock route (the outer tail op is dispatched before this
-    // route is consulted at all), which costs the tail path the split-D kernel but keeps
-    // it correct.
-    if (dst->src[8] != nullptr) {
-        sm70_d256_probe("REJECT: exact-tail body meta (src[8])", cc, dst);
+    // Exact-tail FlashAttention (dst->src[5..11]) runs its body as a normal
+    // FlashAttention op with a per-(row, head) max/sum meta attached as src[8],
+    // which the tail merge then consumes (the same contract the stock kernels
+    // publish). This kernel computes that same final (max, sum) state and
+    // publishes it to the meta tensor when one is attached, so body and tail
+    // passes qualify under the same shape contract as ordinary passes. The only
+    // extra requirement is the exact meta layout the tail wraps the passes into:
+    // [2][heads_q][q_rows][sequences] f32, contiguously allocated.
+    const ggml_tensor * meta = dst->src[8];
+    if (meta != nullptr && (meta->type != GGML_TYPE_F32 || meta->ne[0] != 2 ||
+            meta->ne[1] != Q->ne[2] || meta->ne[2] != Q->ne[1] ||
+            meta->ne[3] != Q->ne[3] || !ggml_is_contiguously_allocated(meta))) {
+        sm70_d256_probe("REJECT: exact-tail meta layout", cc, dst);
         return false;
     }
     // Same mask contract the exact-tail body pass uses. The mask must be F16 (the stock
@@ -318,6 +322,7 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
             mask->nb[1] / (int64_t) sizeof(half),
             mask->nb[3] / (int64_t) sizeof(half), mask_n_batch,
             use_kv_max ? kv_max_alloc.ptr : nullptr,
+            (float2 *) (dst->src[8] != nullptr ? dst->src[8]->data : nullptr),
             // dst is not laid out like Q: ggml_flash_attn_ext returns permute(0, 2, 1, 3), so the
             // result is [D][heads_q][q_len][batch] while Q is [D][q_len][heads_q][batch]. The row
             // stride therefore lives in nb[2] and the head stride in nb[1] - the opposite of Q.
