@@ -471,10 +471,9 @@ extern "C" {
         GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_HISTORY_SLOTS = 6,
         GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_WINDOW_CHUNK = 7,
         GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_NON_CAUSAL_MASK = 8,
-        // Number of graph-local current rows attached through src[10]/src[11].
-        // Unlike the exact-tail sources these are read in place: no arena, no
-        // run descriptor, and src[5]/src[6]/src[8]/src[9] stay NULL.
-        GGML_FLASH_ATTN_EXT_OP_PARAM_CURRENT_SLOTS = 9,
+        // 9 and above are backend-private; the CUDA kernel selector keeps its
+        // own hint in slot 9, so graph-local current sources are signalled by
+        // src[10]/src[11] being non-NULL and nothing else.
     };
 
     enum ggml_flash_attn_ext_kvarn_domain {

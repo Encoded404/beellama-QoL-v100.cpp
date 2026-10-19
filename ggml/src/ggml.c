@@ -5808,7 +5808,8 @@ void ggml_flash_attn_ext_set_kv_current(
     a->src[11] = v_current;
     a->src[7]  = mask_current;
 
-    ggml_set_op_params_i32(a, GGML_FLASH_ATTN_EXT_OP_PARAM_CURRENT_SLOTS, (int32_t) k_current->ne[1]);
+    // No op-param marker: backends detect this mode from src[10]/src[11], which
+    // keeps the backend-private slots free.
 }
 
 struct ggml_tensor * ggml_kv_tail_attention_merge(
