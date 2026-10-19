@@ -3842,13 +3842,18 @@ static void build_empty_kv_body(
         ggml_tensor *& body_mask,
         ggml_tensor *& body_bias) {
     GGML_ASSERT(k_cur && v_cur && body_mask_template);
-    GGML_ASSERT((body_type_k == GGML_TYPE_F16 || body_type_k == GGML_TYPE_BF16) &&
-                (body_type_v == GGML_TYPE_F16 || body_type_v == GGML_TYPE_BF16));
+    GGML_ASSERT((body_type_k == GGML_TYPE_F16 || body_type_k == GGML_TYPE_BF16 ||
+                 body_type_k == GGML_TYPE_Q8_0) &&
+                (body_type_v == GGML_TYPE_F16 || body_type_v == GGML_TYPE_BF16 ||
+                 body_type_v == GGML_TYPE_Q8_0));
     const int64_t n_stream = body_mask_template->ne[3];
     const auto zero_anchor = [&](ggml_type type, const ggml_tensor * current) {
+        // A quantized anchor is seeded from F32: the CUDA copy path has an
+        // F32->Q8_0 converter but no F16->Q8_0 one.
+        const ggml_type seed_type = ggml_is_quantized(type) ? GGML_TYPE_F32 : GGML_TYPE_F16;
         ggml_tensor * anchor = ggml_fill(ctx0, ggml_new_tensor_4d(
-                ctx0, GGML_TYPE_F16, current->ne[0], current->ne[1], 1, n_stream), 0.0f);
-        return type == GGML_TYPE_F16 ? anchor : ggml_cast(ctx0, anchor, type);
+                ctx0, seed_type, current->ne[0], current->ne[1], 1, n_stream), 0.0f);
+        return type == seed_type ? anchor : ggml_cast(ctx0, anchor, type);
     };
     const auto first_row_anchor = [&](ggml_tensor * source) {
         ggml_tensor * row = ggml_view_4d(ctx0, source,

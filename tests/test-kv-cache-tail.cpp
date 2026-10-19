@@ -252,9 +252,10 @@ int main() {
             bool shadow_k_capable = true,
             bool shadow_v_capable = true,
             ggml_type body_type_k = GGML_TYPE_Q5_0,
-            ggml_type body_type_v = GGML_TYPE_Q5_0) {
+            ggml_type body_type_v = GGML_TYPE_Q5_0,
+            ggml_type exact_type = GGML_TYPE_BF16) {
         return llama_kv_tail_storage_request {
-            body_type_k, body_type_v, GGML_TYPE_BF16,
+            body_type_k, body_type_v, exact_type,
             n_tokens, n_tokens, 1, 512, visibility_window,
             physical_body_rows, requested_body_bytes_per_row,
             promotion_bytes_per_row, overlay_bytes_per_row,
@@ -345,6 +346,28 @@ int main() {
     CHECK(storage.compact_layout.history_stride == 1032);
     CHECK(storage.compact_layout.history_slots == 1032);
     CHECK(storage.compact_history_bytes == uint64_t(1032)*16384);
+    CHECK(storage.actual_body_bytes == 0);
+    CHECK(!storage.has_owned_body);
+
+    // A q8_0 tail on a full-window SWA group is stored as a bodyless
+    // compact-native cache. The realized body type must stay q8_0 so the
+    // graph's empty-body anchor matches the route it was probed for.
+    auto compact_full_q8 = storage_request(1024, 1024, 1536, 10752, 16384,
+            5632, true, false, true, false, true, true,
+            GGML_TYPE_Q5_0, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0);
+    compact_full_q8.rollback_tokens = 8;
+    compact_full_q8.compact_history_capable = true;
+    compact_full_q8.compact_current_source_capable = true;
+    compact_full_q8.compact_ordered_commit_capable = true;
+    compact_full_q8.full_window_body_can_be_omitted = true;
+    storage = llama_kv_tail_storage_plan_for(compact_full_q8);
+    CHECK(storage.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT);
+    CHECK(storage.actual_body_type_k == GGML_TYPE_Q8_0);
+    CHECK(storage.actual_body_type_v == GGML_TYPE_Q8_0);
+    CHECK(storage.body_promoted);
+    CHECK(storage.shadow_k && storage.shadow_v);
+    CHECK(storage.shadow_type_k == GGML_TYPE_Q8_0);
+    CHECK(storage.shadow_type_v == GGML_TYPE_Q8_0);
     CHECK(storage.actual_body_bytes == 0);
     CHECK(!storage.has_owned_body);
 

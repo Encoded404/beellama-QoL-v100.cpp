@@ -680,6 +680,11 @@ def main() -> None:
         raise AssertionError("bodyless standard-tail anchors must match the realized exact type")
     empty_body = graph.split("static void build_empty_kv_body", 1)[1].split(
         "static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl", 1)[0]
+    if "GGML_TYPE_Q8_0" not in empty_body:
+        raise AssertionError("bodyless standard-tail anchors must accept the q8_0 exact type")
+    if "ggml_is_quantized(type) ? GGML_TYPE_F32 : GGML_TYPE_F16" not in empty_body:
+        raise AssertionError(
+            "bodyless quantized-tail anchors must be seeded from F32 for the CUDA copy path")
     if "first_row_anchor(body_mask_template)" not in empty_body:
         raise AssertionError(
             "bodyless standard-tail masks must retain a graph dependency on the authoritative planner mask")
