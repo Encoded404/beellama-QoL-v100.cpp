@@ -41,6 +41,9 @@ struct llama_memory_params {
     uint32_t  kv_tail_rollback_tokens;
     ggml_type kv_tail_type;
 
+    // in-place current segment for the SWA group (see llama-cparams.h)
+    bool      kv_swa_inplace_current;
+
     llama_memory_t mem_other;
 };
 

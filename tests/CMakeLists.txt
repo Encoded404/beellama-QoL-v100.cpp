@@ -420,6 +420,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     llama_test(
         test-llama-archs
+        NAME test-swa-inplace-current
+        LABEL main
+        ARGS --test-swa-inplace-current
+    )
+    llama_test(
+        test-llama-archs
         NAME test-kvarn-disk-swap-restore
         LABEL main
         ARGS --test-kvarn-disk-swap-restore
@@ -608,6 +614,8 @@ llama_test(test-meta-graph-reuse NAME test-meta-cuda-graph-reuse LABEL cuda ARGS
 llama_test(test-meta-graph-reuse NAME test-meta-kvarn-cuda-graph-reuse LABEL cuda ARGS kvarn-cuda)
 llama_build_and_test(test-kv-cache-placement.cpp ../src/llama-kv-cache-placement.cpp)
 target_include_directories(test-kv-cache-placement PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_build_and_test(test-kv-swa-inplace.cpp)
+
 llama_build_and_test(test-std-kv-tail-graph.cpp ../src/llama-kv-cache-tail.cpp)
 target_include_directories(test-std-kv-tail-graph PRIVATE ${PROJECT_SOURCE_DIR}/src)
 

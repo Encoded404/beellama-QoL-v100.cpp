@@ -1009,6 +1009,7 @@ static void ggml_cuda_flash_attn_ext_dispatch(ggml_backend_cuda_context & ctx, g
 }
 
 #include "fattn-tail.cuh"
+#include "fattn-current.cuh"
 
 static bool ggml_cuda_flash_attn_ext_tail_pass_supported(int device, const ggml_tensor * dst) {
     const ggml_tensor * qo = dst->src[8];
@@ -1104,6 +1105,12 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     const bool has_exact_tail = dst->src[5] != nullptr && dst->src[6] != nullptr && dst->src[7] != nullptr &&
         dst->src[8] != nullptr && dst->src[9] != nullptr;
+
+    if (!has_exact_tail && dst->src[10] != nullptr) {
+        ggml_cuda_flash_attn_ext_current(ctx, dst);
+        return;
+    }
+
     const bool uses_kvarn = ggml_cuda_flash_attn_ext_kvarn_uses_views(dst);
     const bool portable_kvarn_tail = uses_kvarn && has_exact_tail &&
         ggml_cuda_flash_attn_ext_kvarn_direct_tail_supported(ctx.device, dst);
@@ -1131,6 +1138,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     const bool has_exact_tail = dst->src[5] != nullptr && dst->src[6] != nullptr && dst->src[7] != nullptr &&
         dst->src[8] != nullptr && dst->src[9] != nullptr;
+
+    if (!has_exact_tail && dst->src[10] != nullptr) {
+        return ggml_cuda_flash_attn_ext_current_supported(device, dst);
+    }
+
     const bool uses_kvarn = ggml_cuda_flash_attn_ext_kvarn_uses_views(dst);
     const bool portable_kvarn_tail = uses_kvarn && has_exact_tail &&
         ggml_cuda_flash_attn_ext_kvarn_direct_tail_supported(device, dst);

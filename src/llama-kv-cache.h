@@ -50,6 +50,11 @@ public:
         std::vector<idx_vec_t>    stage_slots;       // [ns], structured caches only
         std::vector<int32_t>      group_stage_slots; // complete post-allocation assignment
 
+        // Index of the first ubatch token covered by idxs. Non-zero only for the
+        // position-mapped SWA ring, which retains just the trailing window of a
+        // ubatch: tokens before the offset are never written to the cache.
+        uint32_t token_offset = 0;
+
         uint32_t head() const {
             GGML_ASSERT(idxs.size() == 1);
             GGML_ASSERT(!idxs[0].empty());
@@ -131,7 +136,8 @@ public:
                  uint32_t   tail_rollback_tokens = 0,
                  uint32_t   tail_visibility_window = 0,
                  const char * name_tag = "",
-                     bool   disable_attn_rot = false);
+                     bool   disable_attn_rot = false,
+                     bool   swa_ring = false);
 
     ~llama_kv_cache() = default;
 
@@ -299,6 +305,17 @@ public:
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
+    // Deferred trailing-window write for the position-mapped SWA ring.
+    ggml_tensor * cpy_k_suffix(
+            ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * suffix_idxs,
+            int32_t il, ggml_tensor * dependency) const;
+    ggml_tensor * cpy_v_suffix(
+            ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * suffix_idxs,
+            int32_t il, ggml_tensor * dependency) const;
+
+    ggml_tensor * build_input_suffix_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    void set_input_suffix_idxs(ggml_tensor * dst, const slot_info & sinfo) const;
+
     ggml_tensor * cpy_k_with_tail(
             ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs,
             ggml_tensor * tail_idxs, int32_t il, const slot_info & sinfo) const;
@@ -328,6 +345,10 @@ public:
     // return empty slot_info on failure
     slot_info find_slot(const llama_ubatch & ubatch, bool cont) const;
 
+    // Position-mapped ring allocation for swa_ring caches: commits only the
+    // trailing window of the ubatch, addressed by pos % size.
+    slot_info find_slot_ring(const llama_ubatch & ubatch) const;
+
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
 
@@ -354,6 +375,11 @@ public:
     void set_input_k_shift_tail(ggml_tensor * dst) const;
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+
+    // Mask over the ubatch's own rows, used by the in-place current segment.
+    void set_input_kq_mask_current(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+
+    bool is_swa_ring() const { return swa_ring; }
     void set_input_kq_mask_mapped(
             ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn,
             const std::vector<int64_t> & read_cells) const;
@@ -422,6 +448,11 @@ private:
 
     // SWA
     const uint32_t n_swa = 0;
+
+    // Position-mapped SWA ring: cells hold exactly the sliding window and the
+    // current ubatch is attended from the graph (see the KV tail planner's
+    // current segment). Requires a single stream and no position shifts.
+    const bool swa_ring = false;
 
     const uint32_t tail_tokens = 0;
     const uint32_t tail_rollback_tokens = 0;
@@ -692,6 +723,18 @@ public:
     virtual ggml_tensor * cpy_v_with_tail(
             ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs,
             ggml_tensor * tail_idxs, int32_t il) const;
+    virtual ggml_tensor * cpy_k_suffix(
+            ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * suffix_idxs,
+            int32_t il, ggml_tensor * dependency) const;
+    virtual ggml_tensor * cpy_v_suffix(
+            ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * suffix_idxs,
+            int32_t il, ggml_tensor * dependency) const;
+    virtual ggml_tensor * build_input_suffix_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    virtual void set_input_suffix_idxs(ggml_tensor * dst) const;
+    virtual void set_input_kq_mask_current(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    virtual bool is_swa_ring() const;
+    virtual uint32_t get_size() const;
+
     virtual ggml_tensor * cpy_k_tail(
             ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * tail_idxs,
             int32_t il, ggml_tensor * dependency = nullptr) const;

@@ -577,6 +577,8 @@ public:
     ggml_tensor * get_tail_body_read_idxs(bool swa) const { return swa ? self_tail_body_read_idxs_swa : self_tail_body_read_idxs; }
     ggml_tensor * get_tail_bias_read_idxs(bool swa) const { return swa ? self_tail_bias_read_idxs_swa : self_tail_bias_read_idxs; }
     ggml_tensor * get_kq_mask_tail(bool swa) const { return swa ? self_kq_mask_tail_swa : self_kq_mask_tail; }
+    ggml_tensor * get_kq_mask_current(bool swa) const { return swa ? self_kq_mask_current_swa : nullptr; }
+    ggml_tensor * get_suffix_idxs(bool swa) const { return swa ? self_suffix_idxs_swa : nullptr; }
     ggml_tensor * get_tail_query_order(bool swa) const {
         return swa ? self_tail_query_order_swa : self_tail_query_order;
     }
@@ -607,6 +609,10 @@ public:
     ggml_tensor * self_tail_query_order_swa = nullptr;
     ggml_tensor * self_tail_run_desc = nullptr;
     ggml_tensor * self_tail_run_desc_swa = nullptr;
+
+    // in-place current segment (SWA group only)
+    ggml_tensor * self_kq_mask_current_swa = nullptr; // F16 [n_batch, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * self_suffix_idxs_swa     = nullptr; // I64 [n_retained]
 
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
@@ -1399,7 +1405,10 @@ struct llm_graph_context {
             ggml_tensor * v_tail_current = nullptr,
                  uint32_t tail_history_slots = 0,
                      bool tail_bodyless = false,
-            ggml_tensor ** final_attn_op = nullptr) const;
+            ggml_tensor ** final_attn_op = nullptr,
+            ggml_tensor * k_current = nullptr,
+            ggml_tensor * v_current = nullptr,
+            ggml_tensor * kq_mask_current = nullptr) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

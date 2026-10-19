@@ -596,6 +596,43 @@ K/V and transient workspace; backend byte alignment does not add logical rows.
 Unified ordinary body storage does not merge these logical exact histories.
 Positive K-only MLA and DSA overlays are rejected during context creation.
 
+### In-place SWA current segment (experimental, env-gated)
+
+A sliding-window cache only needs to retain the window, but the default layout
+retains `n_swa + n_ubatch` cells. The extra `n_ubatch` exists because the whole
+ubatch is stored into the ring before attention reads it, so at that moment the
+ring must hold both the old window and the new batch. Those rows are redundant:
+the ubatch is already in the graph as `k_cur`/`v_cur`.
+
+`LLAMA_SWA_INPLACE_CURRENT=1` removes the redundancy. The SWA attention becomes
+a two-source operation — the window (body, in the cache) plus the ubatch
+(current, in the graph) — and only the trailing window of the batch is written
+back, after the attention, ordered by an explicit graph dependency. Backends run
+both passes and merge the normalized partials with the same FP32 rescaling the
+exact-tail route uses. Cells are addressed by `pos % size`, so the ring is the
+window by construction.
+
+Measured model, Gemma 4 31B, `-c 48000 -ub 4096`, `q8_0` K/V, 50 SWA + 10 full
+layers, 8,192 (K+V) elements per SWA cell and 4,096 per full cell at 1.0625 B
+per element:
+
+| group | default | in-place current |
+|---|---:|---:|
+| full (10 x 48,128 cells) | 1,997.5 MiB | 1,997.5 MiB |
+| SWA (50 layers) | 2,125.0 MiB (5,120 cells) | 425.0 MiB (1,024 cells) |
+| **KV total** | **4,122.5 MiB** | **2,422.5 MiB** |
+
+The 1,700 MiB difference is exactly `50 x 4,096 x 8,704 B`, i.e. `n_ubatch`
+cells of dead weight. The mode is not free in every configuration: the exact-tail
+route it generalises cost 1,405 MiB of transient workspace because it packed
+`[history | current]` per layer, and this mode exists specifically to avoid that
+by consuming both sources in place.
+
+Constraints: single unified sequence, no precision tail on the SWA group, no
+KVarN, no position shifts, CPU or CUDA backends. See
+[`beellama-args.md`](beellama-args.md#in-place-swa-current-segment) for the
+eligibility matrix.
+
 ### When to use it
 
 Use the precision tail when a quantized cache saves needed context memory but

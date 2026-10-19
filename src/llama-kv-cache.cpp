@@ -392,9 +392,10 @@ llama_kv_cache::llama_kv_cache(
                  uint32_t   tail_rollback_tokens,
                  uint32_t   tail_visibility_window,
                  const char * name_tag,
-                     bool   disable_attn_rot) :
+                     bool   disable_attn_rot,
+                     bool   swa_ring) :
     model(model), hparams(hparams), v_trans(v_trans),
-    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa),
+    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_ring(swa_ring),
     tail_tokens(tail_tokens), tail_rollback_tokens(tail_rollback_tokens),
     tail_metadata_only(tail_metadata_only),
     tail_type(tail_type_requested), swa_type(swa_type),
@@ -1438,6 +1439,23 @@ llama_memory_i::seq_rm_capability llama_kv_cache::get_seq_rm_capability() const 
 }
 
 bool llama_kv_cache::can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    if (swa_ring) {
+        // The ring only keeps the window. Removing a range that starts before it
+        // would have to restore rows that are already gone, which the deferred
+        // commit cannot do.
+        if (seq_id < 0 || size_t(seq_id) >= seq_to_stream.size()) {
+            return p0 <= 0 && p1 < 0;
+        }
+        const auto & cells = v_cells[seq_to_stream[seq_id]];
+        if (cells.get_used() == 0) {
+            return true;
+        }
+        const llama_pos pos_max = cells.seq_pos_max(seq_id);
+        if (p1 >= 0 && p1 < pos_max) {
+            return false; // interior removal is not expressible on a ring
+        }
+        return p0 < 0 || p0 >= pos_max - llama_pos(get_size()) + 1;
+    }
     if (!has_compact_tail()) {
         return true;
     }
@@ -1853,6 +1871,14 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
         return;
     }
 
+    if (swa_ring) {
+        // cell == pos % size only holds while positions are dense from the ring
+        // base; an in-place shift would silently alias live rows.
+        LLAMA_LOG_WARN("%s: position shifts are not supported by the in-place SWA ring; "
+                "the shift is ignored and the cache keeps its positions\n", __func__);
+        return;
+    }
+
     uint32_t new_head = cells.size();
 
     if (p0 < 0) {
@@ -1897,6 +1923,12 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
 
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
     GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_div() is only supported for n_pos_per_embd() == 1");
+
+    if (swa_ring) {
+        LLAMA_LOG_WARN("%s: position shifts are not supported by the in-place SWA ring; "
+                "the division is ignored and the cache keeps its positions\n", __func__);
+        return;
+    }
 
     const bool full_range = p0 <= 0 && p1 < 0;
     if (tail) {
@@ -2356,7 +2388,45 @@ llama_memory_status llama_kv_cache::update(llama_context * lctx, bool do_shift, 
     return result;
 }
 
+llama_kv_cache::slot_info llama_kv_cache::find_slot_ring(const llama_ubatch & ubatch) const {
+    // The ring holds exactly the sliding window, so only the trailing window of
+    // the ubatch is committed. Earlier tokens can never become visible to a
+    // future query: llama_hparams::is_masked_swa() masks any distance >= n_swa,
+    // and the trailing window is precisely the last n_swa positions.
+    GGML_ASSERT(n_stream == 1);
+    // A single sequence means the ubatch is a flat, position-ordered token run;
+    // b_equal_seqs is only an allocator hint and is not set for reserve batches.
+    GGML_ASSERT(ubatch.n_seqs_unq == 1);
+
+    slot_info res;
+    res.s0 = res.s1 = seq_to_stream[ubatch.seq_id_unq[0]];
+    res.resize(1);
+    res.strm[0] = res.s0;
+
+    const uint32_t size     = get_size();
+    const uint32_t n_tokens = ubatch.n_tokens;
+    const uint32_t n_keep   = std::min(n_tokens, size);
+
+    res.token_offset = n_tokens - n_keep;
+
+    std::vector<bool> seen(size, false);
+    res.idxs[0].reserve(n_keep);
+    for (uint32_t i = 0; i < n_keep; ++i) {
+        const llama_pos pos = ubatch.pos[res.token_offset + i];
+        GGML_ASSERT(pos >= 0 && "ring positions are non-negative");
+        const uint32_t idx = uint32_t(pos) % size;
+        GGML_ASSERT(!seen[idx] && "ring cells must be distinct; positions must be consecutive");
+        seen[idx] = true;
+        res.idxs[0].push_back(idx);
+    }
+
+    return res;
+}
+
 llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont) const {
+    if (swa_ring) {
+        return find_slot_ring(ubatch);
+    }
 
     if (debug > 0) {
         for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
@@ -2854,7 +2924,8 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         seq_pos_max_rm[s] = -1;
     }
 
-    assert(ubatch.n_tokens == sinfo.n_stream()*sinfo.size());
+    assert(ubatch.n_tokens == sinfo.n_stream()*sinfo.size() + sinfo.token_offset);
+    assert(sinfo.token_offset == 0 || sinfo.n_stream() == 1);
 
     if (tail && !tail_preparing) {
         if (has_compact_tail()) {
@@ -2872,7 +2943,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
-            const uint32_t i = s*sinfo.size() + ii;
+            const uint32_t i = sinfo.token_offset + s*sinfo.size() + ii;
 
             auto & cells = v_cells[sinfo.strm[s]];
 
@@ -3271,6 +3342,106 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     return ggml_set_rows(ctx, v_view, v_cur, v_idxs);
 }
 
+// Deferred write for the position-mapped SWA ring: only the trailing window of
+// the ubatch is stored, and the write is ordered after the attention that read
+// the same rows from the graph.
+ggml_tensor * llama_kv_cache::cpy_k_suffix(
+        ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * suffix_idxs,
+        int32_t il, ggml_tensor * dependency) const {
+    GGML_ASSERT(swa_ring);
+    GGML_ASSERT(dependency != nullptr);
+
+    const int32_t ikv = map_layer_ids.at(il);
+
+    ggml_tensor * k = layers[ikv].k;
+    if (!k || !suffix_idxs) {
+        return nullptr;
+    }
+
+    const int64_t n_embd_head = k_cur->ne[0];
+    const int64_t n_head      = k_cur->ne[1];
+    const int64_t n_tokens    = k_cur->ne[2];
+
+    // Derived from the ubatch and the ring only: the graph can also be built for
+    // a synthetic reserve batch, where no slot plan exists yet.
+    const int64_t n_keep       = std::min<int64_t>(n_tokens, get_size());
+    const int64_t token_offset = n_tokens - n_keep;
+
+    GGML_ASSERT(ggml_row_size(k_cur->type, n_embd_head) == k_cur->nb[1]);
+    GGML_ASSERT(suffix_idxs->ne[0] == n_keep);
+    GGML_ASSERT(token_offset + n_keep == n_tokens);
+
+    const int64_t n_embd_gqa = n_embd_head*n_head;
+    GGML_ASSERT(n_embd_gqa == k->ne[0]);
+    GGML_ASSERT(k->ne[2] == 1 && "the in-place SWA ring is single-stream");
+
+    // The retained rows are a contiguous suffix of the ubatch, so the source is
+    // a plain row-offset view: no gather, no copy.
+    k_cur = ggml_view_2d(ctx, k_cur, n_embd_gqa, n_keep, k_cur->nb[2],
+            token_offset*k_cur->nb[2]);
+
+    return ggml_set_rows_ordered(ctx, k, k_cur, suffix_idxs, dependency);
+}
+
+ggml_tensor * llama_kv_cache::cpy_v_suffix(
+        ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * suffix_idxs,
+        int32_t il, ggml_tensor * dependency) const {
+    GGML_ASSERT(swa_ring);
+    GGML_ASSERT(dependency != nullptr);
+    GGML_ASSERT(!v_trans && "the in-place SWA ring requires flash attention");
+
+    const int32_t ikv = map_layer_ids.at(il);
+
+    ggml_tensor * v = layers[ikv].v;
+    if (!v || !suffix_idxs) {
+        return nullptr;
+    }
+
+    const int64_t n_embd_head = v_cur->ne[0];
+    const int64_t n_head      = v_cur->ne[1];
+    const int64_t n_tokens    = v_cur->ne[2];
+
+    const int64_t n_keep       = std::min<int64_t>(n_tokens, get_size());
+    const int64_t token_offset = n_tokens - n_keep;
+
+    GGML_ASSERT(ggml_row_size(v_cur->type, n_embd_head) == v_cur->nb[1]);
+    GGML_ASSERT(suffix_idxs->ne[0] == n_keep);
+    GGML_ASSERT(token_offset + n_keep == n_tokens);
+
+    const int64_t n_embd_gqa = n_embd_head*n_head;
+    GGML_ASSERT(n_embd_gqa == v->ne[0]);
+    GGML_ASSERT(v->ne[2] == 1 && "the in-place SWA ring is single-stream");
+
+    v_cur = ggml_view_2d(ctx, v_cur, n_embd_gqa, n_keep, v_cur->nb[2],
+            token_offset*v_cur->nb[2]);
+
+    return ggml_set_rows_ordered(ctx, v, v_cur, suffix_idxs, dependency);
+}
+
+ggml_tensor * llama_kv_cache::build_input_suffix_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    GGML_UNUSED(ubatch);
+
+    // Sized for the retained suffix only, which is bounded by the ring size.
+    ggml_tensor * idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, int64_t(std::min<uint32_t>(ubatch.n_tokens, get_size())));
+    ggml_set_input(idxs);
+    ggml_set_name(idxs, "attn_inp_suffix_idxs");
+
+    return idxs;
+}
+
+void llama_kv_cache::set_input_suffix_idxs(ggml_tensor * dst, const slot_info & sinfo) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->ne[0] == int64_t(sinfo.size()));
+    GGML_ASSERT(sinfo.n_stream() == 1);
+
+    int64_t * data = (int64_t *) dst->data;
+    const int64_t offs = sinfo.strm[0]*get_size();
+
+    for (uint32_t i = 0; i < sinfo.size(); ++i) {
+        data[i] = offs + sinfo.idxs[0][i];
+    }
+}
+
 ggml_tensor * llama_kv_cache::cpy_k_with_tail(
         ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs,
         ggml_tensor * tail_idxs, int32_t il, const slot_info & sinfo) const {
@@ -3579,31 +3750,37 @@ ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
 
 void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
     const uint32_t n_tokens = ubatch->n_tokens;
-    GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
+    GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream() + sinfo.token_offset);
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     int64_t * data = (int64_t *) dst->data;
+
+    // Tokens before the retained suffix are never written: the ring only commits
+    // the trailing window, so their index entries are placeholders.
+    for (uint32_t i = 0; i < sinfo.token_offset; ++i) {
+        data[i] = 0;
+    }
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const int64_t offs = sinfo.strm[s]*get_size();
 
         for (uint32_t i = 0; i < sinfo.size(); ++i) {
-            data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
+            data[sinfo.token_offset + s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
         }
     }
 }
 
 void llama_kv_cache::set_input_k_idxs_backend(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
     const uint32_t n_tokens = ubatch->n_tokens;
-    GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
+    GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream() + sinfo.token_offset);
 
-    std::vector<int64_t> data(n_tokens);
+    std::vector<int64_t> data(n_tokens, 0);
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const int64_t offs = sinfo.strm[s]*get_size();
 
         for (uint32_t i = 0; i < sinfo.size(); ++i) {
-            data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
+            data[sinfo.token_offset + s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
         }
     }
 
@@ -3612,17 +3789,20 @@ void llama_kv_cache::set_input_k_idxs_backend(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
     const uint32_t n_tokens = ubatch->n_tokens;
-    GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
+    GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream() + sinfo.token_offset);
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     int64_t * data = (int64_t *) dst->data;
 
     if (!v_trans) {
+        for (uint32_t i = 0; i < sinfo.token_offset; ++i) {
+            data[i] = 0;
+        }
         for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
             const int64_t offs = sinfo.strm[s]*get_size();
 
             for (uint32_t i = 0; i < sinfo.size(); ++i) {
-                data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
+                data[sinfo.token_offset + s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
             }
         }
     } else {
@@ -3677,19 +3857,20 @@ void llama_kv_cache::set_input_tail_body_idxs(ggml_tensor * dst) const {
 
 void llama_kv_cache::set_input_v_idxs_backend(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
     const uint32_t n_tokens = ubatch->n_tokens;
-    GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
+    GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream() + sinfo.token_offset);
 
-    std::vector<int64_t> data(ggml_nelements(dst));
+    std::vector<int64_t> data(ggml_nelements(dst), 0);
 
     if (!v_trans) {
         for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
             const int64_t offs = sinfo.strm[s]*get_size();
 
             for (uint32_t i = 0; i < sinfo.size(); ++i) {
-                data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
+                data[sinfo.token_offset + s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
             }
         }
     } else {
+        GGML_ASSERT(sinfo.token_offset == 0 && "transposed V cache does not support the in-place SWA ring");
         const int64_t kv_size = get_size();
         const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa_max();
 
@@ -3735,6 +3916,10 @@ struct args_set_input_kq_mask {
     int64_t n_stream;
     int64_t n_tps;
     const std::vector<int64_t> * read_cells;
+
+    // Position-mapped SWA ring: cells this ubatch already committed but whose
+    // rows are written only after attention. -1 disables the exclusion.
+    llama_pos pos_min_in_batch = -1;
 };
 
 template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
@@ -3843,6 +4028,14 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 }
 
                 p0 = cells.pos_get(cell);
+
+                // The ubatch's destination cells carry this batch's positions
+                // but still hold the previous occupant's row, because the ring
+                // write is deferred until after attention. Those rows are
+                // contributed by the current segment instead.
+                if (args.pos_min_in_batch >= 0 && p0 >= args.pos_min_in_batch) {
+                    goto skip;
+                }
 
                 if (!alibi) {
                     if (!prev) {
@@ -3972,6 +4165,7 @@ void llama_kv_cache::set_input_kq_mask_mapped(
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
         /*.read_cells       =*/ read_cells.empty() ? nullptr : &read_cells,
+        /*.pos_min_in_batch =*/ swa_ring ? ubatch->pos[0] : -1,
     };
 
     if (dst->type == GGML_TYPE_F16) {
@@ -3983,6 +4177,63 @@ void llama_kv_cache::set_input_kq_mask_mapped(
     //const int64_t t_end = ggml_time_us();
 
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
+}
+
+// Mask over the ubatch's own rows for the in-place current segment. Column j is
+// ubatch row j -- there is no cell indirection, so this needs neither the cell
+// table nor a run descriptor.
+template<typename T>
+static void set_input_kq_mask_current_impl(
+        uint8_t * base, const llama_ubatch * ubatch, bool causal,
+        uint32_t n_swa, llama_swa_type swa_type,
+        int64_t n_tps, int64_t nb0, int64_t nb1, int64_t nb3, int64_t n_stream) {
+    const T keep = llama_cast<T>(0.0f);
+    const T drop = llama_cast<T>(-INFINITY);
+
+    for (int64_t s = 0; s < n_stream; ++s) {
+        const uint32_t b = uint32_t(s*n_tps);
+
+        for (int64_t i = 0; i < n_tps; ++i) {
+            const llama_pos p1 = ubatch->pos[b + i];
+
+            for (int64_t j = 0; j < n_tps; ++j) {
+                const llama_pos p0 = ubatch->pos[b + j];
+
+                const bool masked = (causal && p0 > p1) ||
+                        llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1);
+
+                *reinterpret_cast<T *>(base + j*nb0 + i*nb1 + s*nb3) = masked ? drop : keep;
+            }
+        }
+    }
+}
+
+void llama_kv_cache::set_input_kq_mask_current(
+        ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    const uint32_t n_tokens = ubatch->n_tokens;
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->ne[0] == n_tokens && dst->ne[1] == n_tokens);
+    // The gate admits only unified single-sequence contexts, so the whole
+    // ubatch is one stream and the mask is a plain n_tokens x n_tokens block.
+    GGML_ASSERT(dst->ne[3] == 1);
+
+    const int64_t n_stream = 1;
+    const int64_t n_tps    = n_tokens;
+
+    // Same rule as the body: only the SWA group of a non-causal run is
+    // bidirectional, and this builder is the SWA group's.
+    if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_ONLY) {
+        causal_attn = swa_type == LLAMA_SWA_TYPE_NONE;
+    }
+
+    if (dst->type == GGML_TYPE_F16) {
+        set_input_kq_mask_current_impl<ggml_fp16_t>((uint8_t *) dst->data, ubatch, causal_attn,
+                n_swa, swa_type, n_tps, dst->nb[0], dst->nb[1], dst->nb[3], n_stream);
+    } else {
+        set_input_kq_mask_current_impl<float>((uint8_t *) dst->data, ubatch, causal_attn,
+                n_swa, swa_type, n_tps, dst->nb[0], dst->nb[1], dst->nb[3], n_stream);
+    }
 }
 
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
@@ -5420,8 +5671,12 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
     for (const auto & layer : layers) {
         lowest_layer = std::min(lowest_layer, uint32_t(layer.il));
     }
+    // The in-place ring addresses cells by position, so a state written under a
+    // different cell count cannot be remapped onto it. The size is part of the
+    // identity, which makes a mismatched restore fail closed.
     const std::string group_id = std::string(n_swa > 0 ? "swa@l" : "full@l") +
-            std::to_string(lowest_layer == UINT32_MAX ? 0 : lowest_layer);
+            std::to_string(lowest_layer == UINT32_MAX ? 0 : lowest_layer) +
+            (swa_ring ? "/ring" + std::to_string(get_size()) : std::string());
     const uint64_t manifest_size = manifest_counter.n_bytes();
     const uint64_t body_payload_size = body_counter.n_bytes();
     const uint64_t tail_payload_size = tail_counter.n_bytes();
@@ -5615,8 +5870,12 @@ void llama_kv_cache::state_read_impl(
     for (const auto & layer : layers) {
         lowest_layer = std::min(lowest_layer, uint32_t(layer.il));
     }
+    // The in-place ring addresses cells by position, so a state written under a
+    // different cell count cannot be remapped onto it. The size is part of the
+    // identity, which makes a mismatched restore fail closed.
     const std::string group_id = std::string(n_swa > 0 ? "swa@l" : "full@l") +
-            std::to_string(lowest_layer == UINT32_MAX ? 0 : lowest_layer);
+            std::to_string(lowest_layer == UINT32_MAX ? 0 : lowest_layer) +
+            (swa_ring ? "/ring" + std::to_string(get_size()) : std::string());
     if (state_group_id != group_id) {
         throw std::runtime_error("KV tail state cache-group ID does not match the context");
     }
@@ -7828,6 +8087,38 @@ void llama_kv_cache_context::set_input_k_idxs_backend(ggml_tensor * dst, const l
 
 void llama_kv_cache_context::set_input_v_idxs_backend(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     kv->set_input_v_idxs_backend(dst, ubatch, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::cpy_k_suffix(
+        ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * suffix_idxs,
+        int32_t il, ggml_tensor * dependency) const {
+    return kv->cpy_k_suffix(ctx, k_cur, suffix_idxs, il, dependency);
+}
+
+ggml_tensor * llama_kv_cache_context::cpy_v_suffix(
+        ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * suffix_idxs,
+        int32_t il, ggml_tensor * dependency) const {
+    return kv->cpy_v_suffix(ctx, v_cur, suffix_idxs, il, dependency);
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_suffix_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    return kv->build_input_suffix_idxs(ctx, ubatch);
+}
+
+void llama_kv_cache_context::set_input_suffix_idxs(ggml_tensor * dst) const {
+    kv->set_input_suffix_idxs(dst, sinfos[i_cur]);
+}
+
+void llama_kv_cache_context::set_input_kq_mask_current(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    kv->set_input_kq_mask_current(dst, ubatch, causal_attn);
+}
+
+bool llama_kv_cache_context::is_swa_ring() const {
+    return kv->is_swa_ring();
+}
+
+uint32_t llama_kv_cache_context::get_size() const {
+    return kv->get_size();
 }
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {

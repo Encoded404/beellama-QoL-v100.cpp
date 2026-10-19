@@ -486,6 +486,45 @@ materialized into the f16 mirror. K and V may use different types. The additive
 mask is authoritative, so any mask is correct: the KV tile bound comes from the
 same on-GPU mask scan the stock tile and vector routes use, with a full-scan
 fallback when that scan does not apply.
+## In-place SWA current segment
+
+Opt-in, experimental. By default the SWA cache is sized `n_swa + n_ubatch`
+cells: the whole ubatch is written into the ring *before* attention runs, so it
+has to be resident even though it is already in the graph as `k_cur`/`v_cur`.
+
+With this mode the ring holds only the sliding window. The ubatch is attended
+directly from the graph as a second K/V source, and only the trailing `n_swa`
+rows are written back, after the attention. The cache therefore stops scaling
+with `-ub`: on Gemma 4 31B with `q8_0` K/V, `-c 48000 -ub 4096`, the SWA group
+drops from 2,125 MiB to 425 MiB (50 layers x 1,024 cells x 8,704 B).
+
+| Env var | Default | Behavior |
+|---|---|---|
+| `LLAMA_SWA_INPLACE_CURRENT` | unset | `1` (or any value other than `0`) enables the mode. Unset or `0` keeps today's sizing and graph. |
+
+The mode is refused, with a warning naming the reason, unless all of the
+following hold: flash attention is on, `--swa-full` is off, the model uses
+`LLAMA_SWA_TYPE_STANDARD` sliding windows, no precision tail is requested for
+the SWA group, KVarN is disabled, the context is a single unified sequence
+(`n_seq_max == 1`), and every SWA layer is on the CPU or CUDA backend.
+
+Constraints of this cut:
+
+- **No position shifts.** `pos % size` cell addressing cannot survive an
+  in-place `seq_add`/`seq_div`, so both log once and are ignored rather than
+  corrupting the ring. `llama_memory_seq_add` users (`--context-shift` style
+  flows, the server's discard path) are therefore incompatible.
+- **No speculative rollback across the ring.** Draft rejection relies on the
+  reserved rows; a rollback that would need a row the ring already dropped must
+  be refused by the caller.
+- **Not bit-identical** to the flag-off path: the current rows are attended at
+  graph precision (F32/F16) instead of the cache type. That is higher precision,
+  but it is a different rounding.
+- Backends other than CPU and CUDA do not advertise the route.
+
+See `docs/beellama-features.md` for the memory model and the measurement that
+motivates it.
+
 ## CUDA/HIP dequant matvec knobs
 
 | Env var | Default | Behavior |

@@ -987,6 +987,16 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
                     get_tail_query_order(swa), get_tail_run_desc(swa), mask,
                     ubatch, cparams.causal_attn);
         }
+        if (ggml_tensor * mask_current = get_kq_mask_current(swa)) {
+            if (mask_current->buffer) {
+                group->set_input_kq_mask_current(mask_current, ubatch, cparams.causal_attn);
+            }
+        }
+        if (ggml_tensor * suffix_idxs = get_suffix_idxs(swa)) {
+            if (suffix_idxs->buffer) {
+                group->set_input_suffix_idxs(suffix_idxs);
+            }
+        }
     };
     set_group(mctx->get_base(), false);
     set_group(mctx->get_swa(), true);
@@ -1042,6 +1052,19 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
             (self_tail_query_order->ne[0] == q_max && self_tail_query_order->ne[1] == n_active);
     res &= self_tail_query_order_swa == nullptr ||
             (self_tail_query_order_swa->ne[0] == q_max && self_tail_query_order_swa->ne[1] == n_active);
+    // in-place current segment: both inputs are sized by the ubatch
+    if (self_kq_mask_current_swa) {
+        res &= self_kq_mask_current_swa->ne[0] == int64_t(params.ubatch.n_tokens) &&
+               self_kq_mask_current_swa->ne[1] == int64_t(params.ubatch.n_tokens);
+        res &= mctx->get_swa()->is_swa_ring();
+    }
+    if (self_suffix_idxs_swa) {
+        res &= self_suffix_idxs_swa->ne[0] ==
+                int64_t(std::min<uint32_t>(params.ubatch.n_tokens, mctx->get_swa()->get_size()));
+        res &= mctx->get_swa()->is_swa_ring();
+    }
+    res &= (self_kq_mask_current_swa != nullptr) == mctx->get_swa()->is_swa_ring();
+    res &= (self_suffix_idxs_swa != nullptr) == mctx->get_swa()->is_swa_ring();
     const auto reuse_tail = [&](const llama_kv_cache_context * group, bool swa) {
         const uint32_t attention_stride = group->get_tail_attention_stride(uint32_t(q_max));
         ggml_tensor * read_idxs = get_tail_read_idxs(swa);
@@ -3399,7 +3422,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_tail_current,
               uint32_t tail_history_slots,
                    bool tail_bodyless,
-        ggml_tensor ** final_attn_op) const {
+        ggml_tensor ** final_attn_op,
+        ggml_tensor * k_current,
+        ggml_tensor * v_current,
+        ggml_tensor * kq_mask_current) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -3481,6 +3507,18 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 ggml_flash_attn_ext_set_kv_tail_history_slots(cur, int32_t(tail_history_slots));
             }
         }
+        if (k_current) {
+            // Body + graph-local current rows in one operation: no arena, no
+            // descriptor, nothing to pack before the kernel can read it.
+            GGML_ASSERT(v_current && kq_mask_current);
+            GGML_ASSERT(!k_tail && "the in-place current segment excludes a KV tail");
+            // k_cur/v_cur are [n_embd_head, n_head, n_tokens]; the attention
+            // sources are [n_embd_head, n_rows, n_head]. The permute is a view.
+            ggml_tensor * k_cur_rows = ggml_permute(ctx0, k_current, 0, 2, 1, 3);
+            ggml_tensor * v_cur_rows = ggml_permute(ctx0, v_current, 0, 2, 1, 3);
+            ggml_flash_attn_ext_set_kv_current(cur, k_cur_rows, v_cur_rows, kq_mask_current);
+        }
+
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
@@ -4562,6 +4600,10 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v_tail_written = nullptr;
     const bool compact_tail = mctx_cur->has_compact_tail();
 
+    // in-place current segment: the ubatch's rows are attended straight from the
+    // graph and written into the ring only after the attention
+    const bool ring_current = is_swa && mctx_cur->is_swa_ring() && k_cur && v_cur;
+
     // whole seq fits into batch in training mode
     const bool use_kv_cur = cparams.training && k_cur && v_cur;
     if (use_kv_cur) {
@@ -4571,7 +4613,7 @@ ggml_tensor * llm_graph_context::build_attn(
     const bool store_kv = !use_kv_cur || hparams.n_layer_kv_from_start >= 0;
 
     // optionally store to KV cache
-    if (store_kv && k_cur) {
+    if (store_kv && k_cur && !ring_current) {
         const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
 
         if (compact_tail) {
@@ -4594,7 +4636,7 @@ ggml_tensor * llm_graph_context::build_attn(
         }
     }
 
-    if (store_kv && v_cur) {
+    if (store_kv && v_cur && !ring_current) {
         const auto & v_idxs = is_swa ? inp->get_v_idxs_swa() : inp->get_v_idxs();
 
         if (compact_tail) {
@@ -4731,7 +4773,23 @@ ggml_tensor * llm_graph_context::build_attn(
             tail_route,
             kvarn_domain,
             k_tail_current, v_tail_current,
-            mctx_cur->get_tail_slots(), !mctx_cur->has_kv_body(il), &final_tail_op);
+            mctx_cur->get_tail_slots(), !mctx_cur->has_kv_body(il), &final_tail_op,
+            ring_current ? k_cur : nullptr,
+            ring_current ? v_cur : nullptr,
+            ring_current ? inp->get_kq_mask_current(is_swa) : nullptr);
+    if (ring_current) {
+        GGML_ASSERT(final_tail_op && final_tail_op->op == GGML_OP_FLASH_ATTN_EXT);
+        // Only the trailing window is committed, and only after the attention
+        // above consumed the same rows straight from the graph.
+        if (ggml_tensor * written = mctx_cur->cpy_k_suffix(
+                    ctx0, k_cur, inp->get_suffix_idxs(is_swa), il, final_tail_op)) {
+            ggml_build_forward_expand(gf, written);
+        }
+        if (ggml_tensor * written = mctx_cur->cpy_v_suffix(
+                    ctx0, v_cur, inp->get_suffix_idxs(is_swa), il, final_tail_op)) {
+            ggml_build_forward_expand(gf, written);
+        }
+    }
     if (use_kvarn) {
         llm_flash_attn_ext_set_kvarn_domain(cur, kvarn_domain);
     }
@@ -5030,6 +5088,16 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
 
         inp->self_kq_mask_swa = build_attn_inp_kq_mask(ctx0, mctx_cur->get_swa(), ubatch, cparams);
         inp->self_kq_mask_swa_cnv = inp->self_kq_mask_swa;
+        if (mctx_cur->get_swa()->is_swa_ring()) {
+            // body + in-place current: the body mask covers the ring and the
+            // current mask covers the ubatch's own rows
+            GGML_ASSERT(cparams.flash_attn && cparams.kv_unified);
+            inp->self_kq_mask_current_swa = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16,
+                    ubatch.n_tokens, ubatch.n_tokens, 1, 1);
+            ggml_set_input(inp->self_kq_mask_current_swa);
+            ggml_set_name(inp->self_kq_mask_current_swa, "attn_inp_kq_mask_current");
+            inp->self_suffix_idxs_swa = mctx_cur->get_swa()->build_input_suffix_idxs(ctx0, ubatch);
+        }
         build_attn_inp_tail(ctx0, ubatch, mctx_cur->get_swa(), inp->self_kq_mask_swa,
                 inp->self_tail_idxs_swa, inp->self_tail_read_idxs_swa,
                 inp->self_tail_body_read_idxs_swa, inp->self_tail_bias_read_idxs_swa,

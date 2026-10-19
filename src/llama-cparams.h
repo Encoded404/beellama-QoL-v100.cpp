@@ -99,6 +99,10 @@ struct llama_cparams {
     uint32_t  kv_tail_tokens_swa_requested = 0;
     bool      kv_tail_native_exact = false;
     bool      kv_tail_native_exact_swa = false;
+
+    // opt-in (env-gated) position-mapped SWA ring: the cache holds exactly the
+    // sliding window and the ubatch is attended from the graph
+    bool      kv_swa_inplace_current = false;
     uint32_t  kv_tail_rollback_tokens = 0;
     ggml_type kv_tail_type   = GGML_TYPE_COUNT;
 

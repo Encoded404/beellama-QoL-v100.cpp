@@ -134,7 +134,9 @@ static __global__ void k_flash_attn_ext_tail_pack_body_mask(
         const int it = int(rem % body_stride); rem /= body_stride;
         const int iq_packed = int(rem % q_max); rem /= q_max;
         const int ia = int(rem);
-        const int iq_global = query_order[ia*q_max + iq_packed];
+        // No query order means the identity packing used by the in-place current
+    // segment: one active sequence whose queries are already in place.
+    const int iq_global = query_order ? query_order[ia*q_max + iq_packed] : iq_packed;
         const int32_t * desc = run_desc + desc_stride*ia;
         half value = __float2half(-INFINITY);
         if (iq_global >= 0 && iq_global < n_query*n_stream && it < desc[5]) {

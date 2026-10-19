@@ -5774,6 +5774,43 @@ void ggml_flash_attn_ext_set_kv_tail_history_slots(
     ggml_set_op_params_i32(a, GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_HISTORY_SLOTS, history_slots);
 }
 
+void ggml_flash_attn_ext_set_kv_current(
+        struct ggml_tensor * a,
+        struct ggml_tensor * k_current,
+        struct ggml_tensor * v_current,
+        struct ggml_tensor * mask_current) {
+    GGML_ASSERT(a != NULL && a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(k_current != NULL && v_current != NULL && mask_current != NULL);
+
+    const struct ggml_tensor * q = a->src[0];
+    const struct ggml_tensor * k = a->src[1];
+    const struct ggml_tensor * v = a->src[2];
+
+    GGML_ASSERT(q != NULL && k != NULL && v != NULL);
+
+    // A current source is an alternative to the exact-tail sources, never a
+    // companion: the tail route owns the arena and the run descriptor, this one
+    // reads the rows the graph already holds.
+    GGML_ASSERT(a->src[5] == NULL && a->src[6] == NULL && a->src[8] == NULL && a->src[9] == NULL);
+    GGML_ASSERT(a->src[10] == NULL && a->src[11] == NULL);
+
+    // Served in place, so the geometry must match the body exactly. Types may
+    // differ (the body is usually quantized while the current rows arrive in
+    // graph precision), which the backends already handle for the body.
+    GGML_ASSERT(k_current->ne[0] == k->ne[0] && k_current->ne[2] == k->ne[2]);
+    GGML_ASSERT(v_current->ne[0] == v->ne[0] && v_current->ne[2] == v->ne[2]);
+    GGML_ASSERT(k_current->ne[1] == v_current->ne[1]);
+    GGML_ASSERT(k_current->ne[3] == 1 && v_current->ne[3] == 1);
+    GGML_ASSERT(mask_current->type == GGML_TYPE_F16);
+    GGML_ASSERT(mask_current->ne[0] == k_current->ne[1] && mask_current->ne[1] == q->ne[1]);
+
+    a->src[10] = k_current;
+    a->src[11] = v_current;
+    a->src[7]  = mask_current;
+
+    ggml_set_op_params_i32(a, GGML_FLASH_ATTN_EXT_OP_PARAM_CURRENT_SLOTS, (int32_t) k_current->ne[1]);
+}
+
 struct ggml_tensor * ggml_kv_tail_attention_merge(
         struct ggml_context * ctx,
         struct ggml_tensor  * body_attn,

@@ -9822,25 +9822,42 @@ static void ggml_compute_forward_flash_attn_ext_tail_ref(
     const ggml_tensor * kt_current = dst->src[10];
     const ggml_tensor * vt_current = dst->src[11];
 
-    GGML_ASSERT(q && k && v && kt && vt && mt && qo && rd);
+    // A current source carries the graph-local rows of the ubatch in flight
+    // (see ggml_flash_attn_ext_set_kv_current). It has no history arena, so the
+    // tail tensors and the run descriptor are absent and every current row is
+    // addressed directly.
+    const bool current_only = kt == nullptr && kt_current != nullptr;
+
+    GGML_ASSERT(q && k && v && mb);
+    if (!current_only) {
+        GGML_ASSERT(kt && vt && mt && qo && rd);
+    } else {
+        GGML_ASSERT(vt == nullptr && mt != nullptr);
+    }
     GGML_ASSERT((kt_current == nullptr) == (vt_current == nullptr));
     GGML_ASSERT(q->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
-    GGML_ASSERT(kt->ne[0] == q->ne[0] && vt->ne[0] == v->ne[0]);
-    GGML_ASSERT(kt->ne[1] == vt->ne[1] && kt->ne[2] == k->ne[2] && vt->ne[2] == v->ne[2]);
-    GGML_ASSERT(kt->ne[3] == 1 && vt->ne[3] == 1);
+    if (!current_only) {
+        GGML_ASSERT(kt->ne[0] == q->ne[0] && vt->ne[0] == v->ne[0]);
+        GGML_ASSERT(kt->ne[1] == vt->ne[1] && kt->ne[2] == k->ne[2] && vt->ne[2] == v->ne[2]);
+        GGML_ASSERT(kt->ne[3] == 1 && vt->ne[3] == 1);
+    }
     if (kt_current != nullptr) {
         GGML_ASSERT(kt_current->ne[0] == q->ne[0] && vt_current->ne[0] == v->ne[0]);
         GGML_ASSERT(kt_current->ne[1] == vt_current->ne[1] &&
                     kt_current->ne[2] == k->ne[2] && vt_current->ne[2] == v->ne[2]);
         GGML_ASSERT(kt_current->ne[3] == 1 && vt_current->ne[3] == 1);
     }
-    GGML_ASSERT(qo->type == GGML_TYPE_I32 && rd->type == GGML_TYPE_I32 && rd->ne[0] >= 4);
-    GGML_ASSERT(qo->ne[1] == rd->ne[1]);
+    if (!current_only) {
+        GGML_ASSERT(qo->type == GGML_TYPE_I32 && rd->type == GGML_TYPE_I32 && rd->ne[0] >= 4);
+        GGML_ASSERT(qo->ne[1] == rd->ne[1]);
+    }
     const int32_t configured_history_slots = ggml_get_op_params_i32(
             dst, GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_HISTORY_SLOTS);
-    const int64_t history_slots = configured_history_slots > 0 ?
-            configured_history_slots : kt->ne[1];
-    GGML_ASSERT(history_slots > 0 && history_slots <= kt->ne[1]);
+    const int64_t history_slots = current_only ? 0 :
+            (configured_history_slots > 0 ? configured_history_slots : kt->ne[1]);
+    if (!current_only) {
+        GGML_ASSERT(history_slots > 0 && history_slots <= kt->ne[1]);
+    }
 
     float scale = 1.0f, max_bias = 0.0f, logit_softcap = 0.0f;
     memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(float));
@@ -9860,14 +9877,16 @@ static void ggml_compute_forward_flash_attn_ext_tail_ref(
 
     const ggml_to_float_t k_to_float = ggml_get_type_traits(k->type)->to_float;
     const ggml_to_float_t v_to_float = ggml_get_type_traits(v->type)->to_float;
-    const ggml_to_float_t kt_to_float = ggml_get_type_traits(kt->type)->to_float;
-    const ggml_to_float_t vt_to_float = ggml_get_type_traits(vt->type)->to_float;
+    const ggml_to_float_t kt_to_float = kt ? ggml_get_type_traits(kt->type)->to_float : nullptr;
+    const ggml_to_float_t vt_to_float = vt ? ggml_get_type_traits(vt->type)->to_float : nullptr;
     const ggml_to_float_t kt_current_to_float = kt_current ?
         ggml_get_type_traits(kt_current->type)->to_float : nullptr;
     const ggml_to_float_t vt_current_to_float = vt_current ?
         ggml_get_type_traits(vt_current->type)->to_float : nullptr;
     GGML_ASSERT((k->type == GGML_TYPE_F32 || k_to_float) && (v->type == GGML_TYPE_F32 || v_to_float));
-    GGML_ASSERT((kt->type == GGML_TYPE_F32 || kt_to_float) && (vt->type == GGML_TYPE_F32 || vt_to_float));
+    if (!current_only) {
+        GGML_ASSERT((kt->type == GGML_TYPE_F32 || kt_to_float) && (vt->type == GGML_TYPE_F32 || vt_to_float));
+    }
     GGML_ASSERT(kt_current == nullptr ||
         ((kt_current->type == GGML_TYPE_F32 || kt_current_to_float) &&
          (vt_current->type == GGML_TYPE_F32 || vt_current_to_float)));
@@ -9923,18 +9942,21 @@ static void ggml_compute_forward_flash_attn_ext_tail_ref(
             max_score = next_max;
         };
 
-        int64_t active = -1;
-        for (int64_t packed = 0; packed < ggml_nelements(qo); ++packed) {
-            if (((const int32_t *) qo->data)[packed] == its) {
-                active = packed/qo->ne[0];
-                break;
+        int64_t active = 0;
+        if (!current_only) {
+            active = -1;
+            for (int64_t packed = 0; packed < ggml_nelements(qo); ++packed) {
+                if (((const int32_t *) qo->data)[packed] == its) {
+                    active = packed/qo->ne[0];
+                    break;
+                }
             }
+            GGML_ASSERT(active >= 0 && active < rd->ne[1]);
         }
-        GGML_ASSERT(active >= 0 && active < rd->ne[1]);
 
         const int64_t ik3 = is/(q->ne[3]/k->ne[3]);
-        const int32_t * desc = (const int32_t *) rd->data + rd->ne[0]*active;
-        const bool body_packed = rd->ne[0] > 6 + mt->ne[0];
+        const int32_t * desc = current_only ? nullptr : (const int32_t *) rd->data + rd->ne[0]*active;
+        const bool body_packed = !current_only && rd->ne[0] > 6 + mt->ne[0];
         const int64_t n_body = body_packed ? desc[5] : k->ne[1];
         for (int64_t packed_body = 0; packed_body < n_body; ++packed_body) {
             const int64_t flat = body_packed ? desc[6 + mt->ne[0] + packed_body] : ik3*k->ne[1] + packed_body;
@@ -9948,11 +9970,11 @@ static void ggml_compute_forward_flash_attn_ext_tail_ref(
                     mask_value, k, v, k_to_float, v_to_float);
         }
 
-        const int64_t n_tail = desc[4];
+        const int64_t n_tail = current_only ? kt_current->ne[1] : desc[4];
         for (int64_t token = 0; token < n_tail; ++token) {
             const float mask_value = ggml_fp16_to_fp32(*(const ggml_fp16_t *)
                 ((const char *) mt->data + token*mt->nb[0] + iq*mt->nb[1] + is*mt->nb[3]));
-            const int64_t slot = desc[6 + token];
+            const int64_t slot = current_only ? token : desc[6 + token];
             const bool from_current = kt_current != nullptr && slot >= history_slots;
             const ggml_tensor * ks = from_current ? kt_current : kt;
             const ggml_tensor * vs = from_current ? vt_current : vt;
@@ -9990,7 +10012,9 @@ void ggml_compute_forward_flash_attn_ext(
     if (ggml_compute_forward_flash_attn_ext_kvarn(params, dst)) {
         return;
     }
-    if (dst->src[5] != nullptr) {
+    // The tail reference also serves the in-place current source, which has no
+    // tail tensors but the same body + second-source row walk.
+    if (dst->src[5] != nullptr || dst->src[10] != nullptr) {
         ggml_compute_forward_flash_attn_ext_tail_ref(params, dst);
         return;
     }

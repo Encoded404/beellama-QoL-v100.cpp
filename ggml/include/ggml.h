@@ -471,6 +471,10 @@ extern "C" {
         GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_HISTORY_SLOTS = 6,
         GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_WINDOW_CHUNK = 7,
         GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_NON_CAUSAL_MASK = 8,
+        // Number of graph-local current rows attached through src[10]/src[11].
+        // Unlike the exact-tail sources these are read in place: no arena, no
+        // run descriptor, and src[5]/src[6]/src[8]/src[9] stay NULL.
+        GGML_FLASH_ATTN_EXT_OP_PARAM_CURRENT_SLOTS = 9,
     };
 
     enum ggml_flash_attn_ext_kvarn_domain {
@@ -2609,6 +2613,17 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_set_kv_tail_history_slots(
             struct ggml_tensor * a,
             int32_t              history_slots);
+
+    // Attach the graph-local current rows as a second in-place source: the body
+    // (src[1]/src[2], src[3]) plus src[10]/src[11] under mask src[7]. Backends
+    // run both passes and publish one normalized dst. No packed arena is built
+    // and the current rows are consumed exactly as the graph produced them, so
+    // the persistent cache never has to hold them.
+    GGML_API void ggml_flash_attn_ext_set_kv_current(
+            struct ggml_tensor * a,
+            struct ggml_tensor * k_current,
+            struct ggml_tensor * v_current,
+            struct ggml_tensor * mask_current);
 
     GGML_API struct ggml_tensor * ggml_kv_tail_attention_merge(
             struct ggml_context * ctx,

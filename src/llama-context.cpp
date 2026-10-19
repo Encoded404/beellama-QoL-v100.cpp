@@ -1002,6 +1002,55 @@ llama_context::llama_context(
 
     // init the memory module
     if (!hparams.vocab_only) {
+        // Opt-in position-mapped SWA ring. The SWA cache then holds exactly the
+        // sliding window and the ubatch is attended straight from the graph, so
+        // the cache no longer scales with -ub. Fail closed to today's sizing on
+        // anything this cut does not cover.
+        {
+            const char * env = getenv("LLAMA_SWA_INPLACE_CURRENT");
+            const bool requested = env && env[0] != '\0' && strcmp(env, "0") != 0;
+
+            if (requested) {
+                const char * why = nullptr;
+
+                if (!cparams.flash_attn)            { why = "flash attention is required"; }
+                else if (params.swa_full)           { why = "--swa-full is set"; }
+                else if (hparams.swa_type != LLAMA_SWA_TYPE_STANDARD) { why = "non-standard SWA type"; }
+                else if (cparams.kv_tail_tokens_swa > 0) { why = "the SWA precision tail owns the current segment"; }
+                else if (cparams.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) { why = "KVarN is enabled"; }
+                else if (cparams.n_seq_max != 1 || !cparams.kv_unified) { why = "requires a single unified sequence"; }
+                else if (hparams.n_swa == 0)        { why = "the model has no sliding window"; }
+                else if (hparams.n_layer_kv_from_start < int32_t(hparams.n_layer_all)) {
+                    why = "shared-KV layers are not supported";
+                }
+
+                if (!why) {
+                    for (uint32_t il = 0; il < hparams.n_layer_all && !why; ++il) {
+                        if (!hparams.has_kv(il) || !hparams.is_swa(il)) {
+                            continue;
+                        }
+                        ggml_backend_dev_t dev = cparams.offload_kqv ? model.dev_layer(il) : nullptr;
+                        if (!dev) {
+                            continue; // host-resident layer: the CPU reference serves it
+                        }
+                        const auto type = ggml_backend_dev_type(dev);
+                        if (type != GGML_BACKEND_DEVICE_TYPE_CPU && type != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                            why = "unsupported SWA layer backend";
+                        }
+                    }
+                }
+
+                if (!why) {
+                    cparams.kv_swa_inplace_current = true;
+                    LLAMA_LOG_INFO("%s: SWA in-place current segment enabled (ring = %u cells, was %u)\n",
+                            __func__, GGML_PAD(hparams.n_swa + cparams.kv_tail_rollback_tokens, 256),
+                            GGML_PAD(hparams.n_swa + cparams.n_ubatch, 256));
+                } else {
+                    LLAMA_LOG_WARN("%s: LLAMA_SWA_INPLACE_CURRENT ignored: %s\n", __func__, why);
+                }
+            }
+        }
+
         llama_memory_params params_mem = {
             /*.type_k    =*/ params.type_k,
             /*.type_v    =*/ params.type_v,
@@ -1016,6 +1065,7 @@ llama_context::llama_context(
             /*.kv_tail_native_exact_swa =*/ cparams.kv_tail_native_exact_swa,
             /*.kv_tail_rollback_tokens =*/ cparams.kv_tail_rollback_tokens,
             /*.kv_tail_type   =*/ cparams.kv_tail_type,
+            /*.kv_swa_inplace_current =*/ cparams.kv_swa_inplace_current,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
         };
 

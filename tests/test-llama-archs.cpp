@@ -10,6 +10,7 @@
 
 #include "../src/llama-context.h"
 #include "../src/llama-kv-cache-kvarn.h"
+#include "../src/llama-ext.h"
 #include "../src/llama-memory-hybrid.h"
 
 // TODO: replace with #include "llama-ext.h" in the future
@@ -298,8 +299,15 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_SWA,        n_embd_head);
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_SWA,      n_embd_head);
         ms.add_kv(LLM_KV_ROPE_FREQ_BASE_SWA,              10000.0f);
-        // SWA pattern: every 5th layer is full attention (matches E2B layer_types)
-        ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, uint32_t(5));
+        // SWA pattern: every 5th layer is full attention (matches E2B layer_types).
+        // The real GGUF carries the expanded per-layer array, so the fixture does too.
+        {
+            std::vector<uint32_t> pattern(n_layer, 1);
+            for (uint32_t il = 4; il < n_layer; il += 5) {
+                pattern[il] = 0;
+            }
+            ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, pattern);
+        }
     } else if (arch == LLM_ARCH_COHERE2MOE || arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_SPARK2_5 ||
             arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_GRANITE_SWA || arch == LLM_ARCH_DOTS3NOTE ||
             arch == LLM_ARCH_MAPLE) {
@@ -1715,6 +1723,138 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
     return all_ok ? 0 : 1;
 }
 
+// End-to-end parity for the in-place SWA current segment
+// (LLAMA_SWA_INPLACE_CURRENT). The same tiny Gemma 4 model is decoded twice:
+// once with the default n_swa + n_ubatch cache and once with the window-sized
+// ring, where the ubatch is attended straight from the graph. The visible set is
+// identical, so the logits must agree, and the ring must report fewer cells and
+// stop depending on n_ubatch.
+static int test_swa_inplace_current(const size_t seed) {
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_GEMMA4, false);
+
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    tensor_data_params tensor_params = { seed, 1.0e-2f };
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_params, model_params));
+    if (!model) {
+        LOG_ERR("%s: failed to create the tiny gemma4 model\n", __func__);
+        return 1;
+    }
+
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+    // The fixture's sliding window is 16 cells and the ring is padded to 256, so
+    // a 512-token ubatch is twice the ring: half of its committed rows must be
+    // dropped, and every destination cell has to be masked out of the body mask
+    // because the write is deferred until after attention.
+    constexpr uint32_t n_ubatch = 512;
+    constexpr uint32_t n_prefill = 512;
+    constexpr uint32_t n_decode  = 4;
+
+    const auto tokens_prefill = get_tokens(n_prefill, n_vocab, seed + 11);
+    const auto tokens_decode  = get_tokens(n_decode,  n_vocab, seed + 12);
+
+    struct run_result {
+        std::vector<float> logits;
+        uint32_t cells = 0;
+    };
+
+    const auto run = [&](const bool inplace) -> run_result {
+        run_result result;
+
+        if (inplace) {
+            setenv("LLAMA_SWA_INPLACE_CURRENT", "1", 1);
+        } else {
+            unsetenv("LLAMA_SWA_INPLACE_CURRENT");
+        }
+
+        llama_context_params params = llama_context_default_params();
+        params.n_ctx           = 4096;
+        params.n_batch         = n_ubatch;
+        params.n_ubatch        = n_ubatch;
+        params.kv_unified      = true;
+        params.n_seq_max       = 1;
+        params.n_threads       = 2;
+        params.n_threads_batch = 2;
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        // the library default keeps a full-size SWA cache, which would mask the
+        // whole point of this test
+        params.swa_full        = false;
+        params.offload_kqv     = false;
+        params.type_k          = GGML_TYPE_F32;
+        params.type_v          = GGML_TYPE_F32;
+
+        llama_context_ptr ctx(llama_init_from_model(model.get(), params));
+        if (!ctx) {
+            throw std::runtime_error(inplace ? "failed to create in-place context"
+                                             : "failed to create default context");
+        }
+
+        const auto decode = [&](const std::vector<llama_token> & tokens, llama_pos pos0, bool want_logits) {
+            common_batch batch(ctx.get());
+            for (size_t i = 0; i < tokens.size(); ++i) {
+                batch.add(tokens[i], pos0 + llama_pos(i), 0, want_logits && i + 1 == tokens.size());
+            }
+            if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+                throw std::runtime_error("llama_process failed in the in-place SWA test");
+            }
+            if (want_logits) {
+                const float * l = llama_get_logits_ith(ctx.get(), -1);
+                if (!l) {
+                    throw std::runtime_error("no logits in the in-place SWA test");
+                }
+                result.logits.assign(l, l + n_vocab);
+            }
+        };
+
+        decode(tokens_prefill, 0, false);
+        for (uint32_t i = 0; i < n_decode; ++i) {
+            const bool last = i + 1 == n_decode;
+            decode({ tokens_decode[i] }, llama_pos(n_prefill + i), last);
+        }
+
+        // resident SWA payload proves which cache layout was actually allocated
+        const llama_kv_memory_stats stats = llama_get_kv_memory_stats(ctx.get());
+        result.cells = uint32_t((stats.swa.k_payload_bytes + stats.swa.v_payload_bytes)/1024);
+        unsetenv("LLAMA_SWA_INPLACE_CURRENT");
+
+        return result;
+    };
+
+    int failures = 0;
+
+    const run_result base   = run(false);
+    const run_result inplace = run(true);
+
+    if (base.logits.size() != inplace.logits.size()) {
+        LOG_ERR("%s: logit vector size mismatch\n", __func__);
+        return 1;
+    }
+
+    double worst = 0.0;
+    for (size_t i = 0; i < base.logits.size(); ++i) {
+        worst = std::max(worst, double(std::fabs(base.logits[i] - inplace.logits[i])));
+    }
+
+    LOG_INF("%s: max |dlogit| = %.3e, SWA payload %u KiB vs %u KiB\n", __func__, worst,
+            base.cells, inplace.cells);
+
+    if (!(worst < 5e-2)) {
+        LOG_ERR("%s: in-place current segment changed the logits (max |dlogit| = %.3e)\n", __func__, worst);
+        ++failures;
+    }
+
+    // n_swa = n_ctx/8 = 16 cells, and the default layout adds the 32-token
+    // ubatch on top. The ring must be clearly smaller; a refused gate would
+    // leave both identical.
+    if (!(inplace.cells*2 < base.cells)) {
+        LOG_ERR("%s: SWA cache did not shrink (%u KiB vs %u KiB) - the in-place mode did not engage\n",
+                __func__, base.cells, inplace.cells);
+        ++failures;
+    }
+
+    return failures == 0 ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -1732,6 +1872,7 @@ int main(int argc, char ** argv) {
     bool test_mtp_kvarn = false;
     bool test_kvarn_restore = false;
     bool test_disk_swap = false;
+    bool test_swa_inplace = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -1809,6 +1950,8 @@ int main(int argc, char ** argv) {
             test_kvarn_restore = true;
         } else if (strcmp(argv[i], "--test-kvarn-disk-swap-restore") == 0) {
             test_disk_swap = true;
+        } else if (strcmp(argv[i], "--test-swa-inplace-current") == 0) {
+            test_swa_inplace = true;
         } else {
             LOG_ERR("%s: unknown argument: %s\n", __func__, argv[i]);
             usage(argv);
@@ -1833,6 +1976,9 @@ int main(int argc, char ** argv) {
         }
         if (!out.empty()) {
             return save_models(arch_filter, seed, stdev, verbosity, out);
+        }
+        if (test_swa_inplace) {
+            return test_swa_inplace_current(seed);
         }
         if (test_kvarn_restore) {
             return test_kvarn_state_restore(seed);

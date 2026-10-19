@@ -3264,7 +3264,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     params.kv_tail_tokens_requested,
                                     params.kv_tail_tokens_swa_requested,
                                     params.kv_tail_rollback_tokens,
-                                    params.kv_tail_native_exact_swa);
+                                    params.kv_tail_native_exact_swa,
+                                    params.kv_swa_inplace_current);
                         } else {
                             res = new llama_kv_cache_iswa(
                                     *this,
@@ -3290,7 +3291,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     params.kv_tail_tokens_requested,
                                     params.kv_tail_tokens_swa_requested,
                                     params.kv_tail_rollback_tokens,
-                                    params.kv_tail_native_exact_swa);
+                                    params.kv_tail_native_exact_swa,
+                                    params.kv_swa_inplace_current);
                         }
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());

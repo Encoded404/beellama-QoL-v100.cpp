@@ -124,7 +124,8 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                  uint32_t tail_tokens_requested,
                  uint32_t tail_tokens_swa_requested,
                  uint32_t tail_rollback_tokens,
-                     bool tail_native_exact_swa) :
+                     bool tail_native_exact_swa,
+                     bool swa_inplace_current) :
     llama_kv_cache_iswa(
             model, model.hparams,
             type_k, type_v,
@@ -132,7 +133,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
             kv_size, n_seq_max, n_batch, n_ubatch, n_pad,
             mem_other, filter, reuse, share, kvarn, tail_tokens, tail_tokens_swa, tail_type,
             tail_tokens_requested, tail_tokens_swa_requested, tail_rollback_tokens,
-            tail_native_exact_swa) {
+            tail_native_exact_swa, swa_inplace_current) {
 }
 
 llama_kv_cache_iswa::llama_kv_cache_iswa(
@@ -160,7 +161,8 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                  uint32_t tail_tokens_requested,
                  uint32_t tail_tokens_swa_requested,
                  uint32_t tail_rollback_tokens,
-                     bool tail_native_exact_swa) : unified(unified) {
+                     bool tail_native_exact_swa,
+                     bool swa_inplace_current) : unified(unified) {
 
     if (tail_tokens_requested == UINT32_MAX) {
         tail_tokens_requested = tail_tokens;
@@ -190,7 +192,9 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
 
     // note: the SWA cache is always padded to 256 for performance
     //       https://github.com/ggml-org/llama.cpp/issues/17037
-    uint32_t size_swa = GGML_PAD(std::min(size_base, hparams.n_swa*(unified ? n_seq_max : 1) + n_ubatch), 256);
+    uint32_t size_swa = swa_inplace_current ?
+            GGML_PAD(std::min(size_base, hparams.n_swa + tail_rollback_tokens), 256) :
+            GGML_PAD(std::min(size_base, hparams.n_swa*(unified ? n_seq_max : 1) + n_ubatch), 256);
 
     const bool use_kvarn = kvarn.type != LLAMA_KVARN_TYPE_DISABLED;
     if (tail_type == GGML_TYPE_COUNT && use_kvarn) {
@@ -310,7 +314,8 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                 v_trans, offload, unified, size, n_seq_max, n_pad,
                 n_swa, swa_type, cache_mem_other, layer_filter, reuse, cache_share,
                 n_ubatch, exact_tokens, tail_type, exact_requested,
-                false, tail_rollback_tokens);
+                false, tail_rollback_tokens, 0, "", false,
+                swa_inplace_current && is_swa_group);
     };
 
     LLAMA_LOG_INFO("%s: creating non-SWA KV cache, size = %u cells\n", __func__, size_base);
