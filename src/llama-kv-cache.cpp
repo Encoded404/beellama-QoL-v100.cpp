@@ -3437,8 +3437,24 @@ void llama_kv_cache::set_input_suffix_idxs(ggml_tensor * dst, const slot_info & 
     int64_t * data = (int64_t *) dst->data;
     const int64_t offs = sinfo.strm[0]*get_size();
 
+    int64_t lo = INT64_MAX;
+    int64_t hi = INT64_MIN;
     for (uint32_t i = 0; i < sinfo.size(); ++i) {
         data[i] = offs + sinfo.idxs[0][i];
+        lo = std::min(lo, data[i]);
+        hi = std::max(hi, data[i]);
+    }
+
+    const char * env_debug = getenv("LLAMA_SWA_INPLACE_DEBUG");
+    if (env_debug && env_debug[0] != '\0' && strcmp(env_debug, "0") != 0) {
+        static int logged = 0;
+        if (logged < 8) {
+            ++logged;
+            LLAMA_LOG_WARN("%s: suffix write: n_keep = %u, cells [%lld, %lld], cache rows = %u, "
+                    "offset = %lld\n", __func__, uint32_t(sinfo.size()),
+                    (long long) lo, (long long) hi, get_size(), (long long) offs);
+        }
+        GGML_ASSERT(hi < int64_t(get_size()) && "suffix cell index outside the ring");
     }
 }
 

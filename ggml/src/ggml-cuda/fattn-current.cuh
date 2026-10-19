@@ -149,4 +149,5 @@ static void ggml_cuda_flash_attn_ext_current(ggml_backend_cuda_context & ctx, gg
         cur_pass.nb[1], cur_pass.nb[2], cur_pass.nb[3],
         dst->nb[1], dst->nb[2], dst->nb[3]);
     CUDA_CHECK(cudaGetLastError());
+    check_launch("merge");
 }
