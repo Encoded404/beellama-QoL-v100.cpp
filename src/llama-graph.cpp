@@ -1054,7 +1054,7 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
             (self_tail_query_order_swa->ne[0] == q_max && self_tail_query_order_swa->ne[1] == n_active);
     // in-place current segment: both inputs are sized by the ubatch
     if (self_kq_mask_current_swa) {
-        res &= self_kq_mask_current_swa->ne[0] == int64_t(params.ubatch.n_tokens) &&
+        res &= self_kq_mask_current_swa->ne[0] == GGML_PAD(int64_t(params.ubatch.n_tokens), 256) &&
                self_kq_mask_current_swa->ne[1] == int64_t(params.ubatch.n_tokens);
         res &= mctx->get_swa()->is_swa_ring();
     }
@@ -3516,6 +3516,23 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             // sources are [n_embd_head, n_rows, n_head]. The permute is a view.
             ggml_tensor * k_cur_rows = ggml_permute(ctx0, k_current, 0, 2, 1, 3);
             ggml_tensor * v_cur_rows = ggml_permute(ctx0, v_current, 0, 2, 1, 3);
+            // Same tiling constraint as the mask: the kernel touches whole
+            // FATTN_KQ_STRIDE row blocks, so pad the extent when the ubatch is
+            // not already a multiple of it. The padded rows are zero and their
+            // mask entries are -inf, so they contribute nothing.
+            const int64_t n_cur_pad = GGML_PAD(k_cur_rows->ne[1], 256);
+            const int64_t n_cur_pad_rows = n_cur_pad - k_cur_rows->ne[1];
+            if (n_cur_pad_rows > 0) {
+                k_cur_rows = ggml_pad(ctx0, k_cur_rows, 0, n_cur_pad_rows, 0, 0);
+                v_cur_rows = ggml_pad(ctx0, v_cur_rows, 0, n_cur_pad_rows, 0, 0);
+            } else {
+                // Already tile-aligned, but still hand the kernels a contiguous
+                // segment: the permuted view has a smaller head stride than row
+                // stride, which nothing else in the attention path produces.
+                k_cur_rows = ggml_cont(ctx0, k_cur_rows);
+                v_cur_rows = ggml_cont(ctx0, v_cur_rows);
+            }
+            GGML_ASSERT(kq_mask_current->ne[0] == n_cur_pad);
             ggml_flash_attn_ext_set_kv_current(cur, k_cur_rows, v_cur_rows, kq_mask_current);
         }
 
@@ -5092,8 +5109,11 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
             // body + in-place current: the body mask covers the ring and the
             // current mask covers the ubatch's own rows
             GGML_ASSERT(cparams.flash_attn && cparams.kv_unified);
+            // The FlashAttention kernels read K/V in full FATTN_KQ_STRIDE tiles,
+            // so the K/V extent and the mask width must both be padded to 256.
+            const int64_t n_cur_pad = GGML_PAD(int64_t(ubatch.n_tokens), 256);
             inp->self_kq_mask_current_swa = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16,
-                    ubatch.n_tokens, ubatch.n_tokens, 1, 1);
+                    n_cur_pad, ubatch.n_tokens, 1, 1);
             ggml_set_input(inp->self_kq_mask_current_swa);
             ggml_set_name(inp->self_kq_mask_current_swa, "attn_inp_kq_mask_current");
             inp->self_suffix_idxs_swa = mctx_cur->get_swa()->build_input_suffix_idxs(ctx0, ubatch);

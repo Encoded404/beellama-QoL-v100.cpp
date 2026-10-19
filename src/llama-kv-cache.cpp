@@ -4186,7 +4186,7 @@ template<typename T>
 static void set_input_kq_mask_current_impl(
         uint8_t * base, const llama_ubatch * ubatch, bool causal,
         uint32_t n_swa, llama_swa_type swa_type,
-        int64_t n_tps, int64_t nb0, int64_t nb1, int64_t nb3, int64_t n_stream) {
+        int64_t n_tps, int64_t n_kv, int64_t nb0, int64_t nb1, int64_t nb3, int64_t n_stream) {
     const T keep = llama_cast<T>(0.0f);
     const T drop = llama_cast<T>(-INFINITY);
 
@@ -4196,13 +4196,19 @@ static void set_input_kq_mask_current_impl(
         for (int64_t i = 0; i < n_tps; ++i) {
             const llama_pos p1 = ubatch->pos[b + i];
 
-            for (int64_t j = 0; j < n_tps; ++j) {
-                const llama_pos p0 = ubatch->pos[b + j];
+            for (int64_t j = 0; j < n_kv; ++j) {
+                T value = drop;
 
-                const bool masked = (causal && p0 > p1) ||
-                        llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1);
+                // Rows past the ubatch are the FATTN_KQ_STRIDE padding; the
+                // attention kernels touch them as full tiles.
+                if (j < n_tps) {
+                    const llama_pos p0 = ubatch->pos[b + j];
+                    const bool masked = (causal && p0 > p1) ||
+                            llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1);
+                    value = masked ? drop : keep;
+                }
 
-                *reinterpret_cast<T *>(base + j*nb0 + i*nb1 + s*nb3) = masked ? drop : keep;
+                *reinterpret_cast<T *>(base + j*nb0 + i*nb1 + s*nb3) = value;
             }
         }
     }
@@ -4213,13 +4219,15 @@ void llama_kv_cache::set_input_kq_mask_current(
     const uint32_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
-    GGML_ASSERT(dst->ne[0] == n_tokens && dst->ne[1] == n_tokens);
+    GGML_ASSERT(dst->ne[1] == n_tokens);
+    GGML_ASSERT(dst->ne[0] == int64_t(GGML_PAD(int64_t(n_tokens), 256)));
     // The gate admits only unified single-sequence contexts, so the whole
-    // ubatch is one stream and the mask is a plain n_tokens x n_tokens block.
+    // ubatch is one stream and the mask is a plain n_tokens x n_kv block.
     GGML_ASSERT(dst->ne[3] == 1);
 
     const int64_t n_stream = 1;
     const int64_t n_tps    = n_tokens;
+    const int64_t n_kv     = dst->ne[0];
 
     // Same rule as the body: only the SWA group of a non-causal run is
     // bidirectional, and this builder is the SWA group's.
@@ -4229,10 +4237,10 @@ void llama_kv_cache::set_input_kq_mask_current(
 
     if (dst->type == GGML_TYPE_F16) {
         set_input_kq_mask_current_impl<ggml_fp16_t>((uint8_t *) dst->data, ubatch, causal_attn,
-                n_swa, swa_type, n_tps, dst->nb[0], dst->nb[1], dst->nb[3], n_stream);
+                n_swa, swa_type, n_tps, n_kv, dst->nb[0], dst->nb[1], dst->nb[3], n_stream);
     } else {
         set_input_kq_mask_current_impl<float>((uint8_t *) dst->data, ubatch, causal_attn,
-                n_swa, swa_type, n_tps, dst->nb[0], dst->nb[1], dst->nb[3], n_stream);
+                n_swa, swa_type, n_tps, n_kv, dst->nb[0], dst->nb[1], dst->nb[3], n_stream);
     }
 }
 
