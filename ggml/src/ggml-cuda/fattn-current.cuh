@@ -114,11 +114,29 @@ static void ggml_cuda_flash_attn_ext_current(ggml_backend_cuda_context & ctx, gg
     ggml_tensor body_meta = {};
     ggml_tensor cur_meta  = {};
 
+    // LLAMA_SWA_INPLACE_DEBUG=1 synchronizes after each launch so a fault is
+    // attributed to the pass that caused it instead of the next CUDA API call.
+    // It breaks CUDA graph capture, so it is strictly a debugging aid.
+    const char * env_debug = getenv("LLAMA_SWA_INPLACE_DEBUG");
+    const bool debug_sync = env_debug && env_debug[0] != '\0' && strcmp(env_debug, "0") != 0;
+    const auto check_launch = [&](const char * what) {
+        if (!debug_sync) {
+            return;
+        }
+        const cudaError_t err = cudaStreamSynchronize(ctx.stream());
+        if (err != cudaSuccess) {
+            GGML_ABORT("%s: CUDA error after the %s pass: %s\n",
+                    __func__, what, cudaGetErrorString(err));
+        }
+    };
+
     ggml_tensor body_pass = *dst;
     run_pass(body_pass, body_meta, kb, vb, mb, /*with_sinks =*/ true, body_meta_alloc, body_alloc);
+    check_launch("body");
 
     ggml_tensor cur_pass = *dst;
     run_pass(cur_pass, cur_meta, kc, vc, mc, /*with_sinks =*/ false, cur_meta_alloc, cur_alloc);
+    check_launch("current");
 
     // One logical softmax: both partials are normalized and joined in FP32.
     const dim3 grid(n_query, n_head, 1);
