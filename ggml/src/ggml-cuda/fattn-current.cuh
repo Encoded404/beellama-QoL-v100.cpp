@@ -103,9 +103,12 @@ static void ggml_cuda_flash_attn_ext_current(ggml_backend_cuda_context & ctx, gg
         ggml_cuda_flash_attn_ext_dispatch(ctx, &pass);
     };
 
+    // ggml_cuda_pool_leg requires deallocation in reverse order of allocation,
+    // and the destructors run in reverse declaration order. Declare them in the
+    // order run_pass below allocates them, not one type at a time.
     ggml_cuda_pool_alloc<float2> body_meta_alloc(pool);
-    ggml_cuda_pool_alloc<float2> cur_meta_alloc(pool);
     ggml_cuda_pool_alloc<uint8_t> body_alloc(pool);
+    ggml_cuda_pool_alloc<float2> cur_meta_alloc(pool);
     ggml_cuda_pool_alloc<uint8_t> cur_alloc(pool);
 
     ggml_tensor body_meta = {};
