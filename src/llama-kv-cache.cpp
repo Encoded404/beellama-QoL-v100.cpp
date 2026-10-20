@@ -1429,6 +1429,17 @@ void llama_kv_cache::clear(bool data) {
 }
 
 llama_memory_i::seq_rm_capability llama_kv_cache::get_seq_rm_capability() const {
+    if (swa_ring) {
+        // can_seq_rm() accepts a complete clear and suffix removals no deeper
+        // than the reserve the ring keeps on top of the window. Reporting it
+        // here keeps callers from asking for a range that can_seq_rm() rejects,
+        // which would otherwise abort on a failed seq_rm().
+        return {
+            /* .full_clear             = */ true,
+            /* .arbitrary_ranges       = */ false,
+            /* .suffix_rollback_tokens = */ ring_rollback_tokens(),
+        };
+    }
     // can_seq_rm() only applies tail_rollback_tokens to a bodyless exact tail.
     // A body-backed overlay, or metadata for a structured cache, can discard an
     // arbitrarily deep exact suffix without losing surviving positions.
@@ -1454,7 +1465,13 @@ bool llama_kv_cache::can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1)
         if (p1 >= 0 && p1 < pos_max) {
             return false; // interior removal is not expressible on a ring
         }
-        return p0 < 0 || p0 >= pos_max - llama_pos(get_size()) + 1;
+        if (p0 <= 0) {
+            return true;
+        }
+        // Removing the last k positions leaves size - k rows, and the next
+        // decode still needs the n_swa - 1 rows of pre-window history, so the
+        // deepest expressible suffix is size - n_swa + 1 positions.
+        return p0 >= pos_max - llama_pos(ring_rollback_tokens()) + 1;
     }
     if (!has_compact_tail()) {
         return true;
@@ -1844,6 +1861,14 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
     for (llama_seq_id current = 0; current < int32_t(n_seq_max); ++current) {
         rebuild_allocation_head(current);
     }
+}
+
+uint32_t llama_kv_cache::ring_rollback_tokens() const {
+    if (!swa_ring) {
+        return 0;
+    }
+    const llama_pos tokens = llama_pos(get_size()) - llama_pos(n_swa) + 1;
+    return tokens > 0 ? uint32_t(tokens) : 0;
 }
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
@@ -2917,6 +2942,12 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         return;
     }
 
+    if (swa_ring) {
+        // the ring write is deferred until after attention, so remember which
+        // row each destination cell is currently holding
+        ring_prev_pos.assign(v_cells[0].size(), LLAMA_KV_RING_NOT_DEST);
+    }
+
     // keep track of the max sequence position that we would overwrite with this ubatch
     // for non-SWA cache, this would be always empty
     llama_seq_id seq_pos_max_rm[LLAMA_MAX_SEQ];
@@ -2962,6 +2993,14 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             if (tail && !tail_preparing) {
                 const uint64_t generation = ++tail_generations[sinfo.strm[s]][idx];
                 tail->recycle(sinfo.strm[s], idx, generation);
+            }
+            if (swa_ring) {
+                // the previous occupant's row stays resident until the deferred
+                // write runs; -1 marks a row that is not reusable (empty cell,
+                // shared cell, or a different sequence's row)
+                const bool reuse = !cells.is_empty(idx) &&
+                    cells.seq_count(idx) == 1 && cells.seq_get(idx) == ubatch.seq_id[i][0];
+                ring_prev_pos[idx] = reuse ? cells.pos_get(idx) : -1;
             }
             if (!cells.is_empty(idx)) {
                 assert(cells.seq_count(idx) == 1);
@@ -3080,6 +3119,11 @@ void llama_kv_cache::finish_tail_batch(bool success, bool payload_may_be_modifie
 bool llama_kv_cache::get_can_shift() const {
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
     if (model.arch == LLM_ARCH_STEP35) {
+        return false;
+    }
+    // the ring addresses its rows by position (cell == pos % size), so a shift
+    // would silently alias live rows onto each other
+    if (swa_ring) {
         return false;
     }
     if (hparams.n_pos_per_embd() > 1) {
@@ -3933,9 +3977,16 @@ struct args_set_input_kq_mask {
     int64_t n_tps;
     const std::vector<int64_t> * read_cells;
 
-    // Position-mapped SWA ring: cells this ubatch already committed but whose
-    // rows are written only after attention. -1 disables the exclusion.
-    llama_pos pos_min_in_batch = -1;
+    // Position-mapped SWA ring: per cell, the position of the row that is
+    // physically resident. It differs from the committed position for the cells
+    // this ubatch is about to overwrite, because the ring write is deferred
+    // until after attention. nullptr for every other cache layout.
+    //
+    //   LLAMA_KV_RING_NOT_DEST      : the cell is not a write target of this ubatch
+    //   < 0                 : write target whose previous row is not reusable
+    //   >= 0                : write target whose previous row still holds this
+    //                         position
+    const std::vector<llama_pos> * ring_prev_pos = nullptr;
 };
 
 template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
@@ -3955,6 +4006,11 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
     const T mask_keep = llama_cast<T>(0.0f);
     const T mask_drop = llama_cast<T>(-INFINITY);
+
+    const std::vector<llama_pos> * ring_prev = args.ring_prev_pos;
+    if (ring_prev != nullptr && ring_prev->empty()) {
+        ring_prev = nullptr;
+    }
 
     // the min position in the batch for each sequence
     llama_pos seq_pos_min[LLAMA_MAX_SEQ];
@@ -4045,12 +4101,19 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
                 p0 = cells.pos_get(cell);
 
-                // The ubatch's destination cells carry this batch's positions
-                // but still hold the previous occupant's row, because the ring
-                // write is deferred until after attention. Those rows are
-                // contributed by the current segment instead.
-                if (args.pos_min_in_batch >= 0 && p0 >= args.pos_min_in_batch) {
-                    goto skip;
+                // The ubatch's destination cells still hold the previous
+                // occupant's row, because the ring write is deferred until after
+                // attention, so the mask has to use that row's position. It is
+                // real history: the current segment only contributes the tokens
+                // of this batch.
+                if (ring_prev != nullptr) {
+                    const llama_pos prev = ring_prev->at(cell);
+                    if (prev != LLAMA_KV_RING_NOT_DEST) {
+                        if (prev < 0) {
+                            goto skip;
+                        }
+                        p0 = prev;
+                    }
                 }
 
                 if (!alibi) {
@@ -4181,7 +4244,7 @@ void llama_kv_cache::set_input_kq_mask_mapped(
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
         /*.read_cells       =*/ read_cells.empty() ? nullptr : &read_cells,
-        /*.pos_min_in_batch =*/ swa_ring ? ubatch->pos[0] : -1,
+        /*.ring_prev_pos    =*/ swa_ring ? &ring_prev_pos : nullptr,
     };
 
     if (dst->type == GGML_TYPE_F16) {
@@ -6734,6 +6797,14 @@ bool llama_kv_cache::state_read_meta(
         // single sequence
         if (cell_count > cells.size()) {
             LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);
+            return false;
+        }
+        if (swa_ring && cell_count > get_size()) {
+            // the ring addresses rows by position, so it can only carry the
+            // trailing `size` positions of a saved state; a deeper state cannot
+            // be placed without leaving holes in the ring
+            LLAMA_LOG_ERROR("%s: saved state holds %u cells but the in-place SWA ring only has %u\n",
+                    __func__, cell_count, get_size());
             return false;
         }
 

@@ -1734,7 +1734,11 @@ static int test_swa_inplace_current(const size_t seed) {
 
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
-    tensor_data_params tensor_params = { seed, 1.0e-2f };
+    // gemma4 multiplies every layer by a per-layer `layer_scalar`, so the tiny
+    // model's default 1e-2 weights attenuate the residual stream to ~1e-15 and
+    // leave nothing measurable in the logits. 2.5e-1 keeps the logits O(1)
+    // while staying well conditioned enough for the parity threshold below.
+    tensor_data_params tensor_params = { seed, 2.5e-1f };
     llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_params, model_params));
     if (!model) {
         LOG_ERR("%s: failed to create the tiny gemma4 model\n", __func__);
@@ -1748,25 +1752,22 @@ static int test_swa_inplace_current(const size_t seed) {
     // because the write is deferred until after attention.
     constexpr uint32_t n_ubatch = 512;
     constexpr uint32_t n_prefill = 512;
+    // a second chunk longer than the ring minus the window: every ring cell
+    // becomes a destination, so the pre-window history has to survive through
+    // the still-unwritten rows rather than through committed metadata
+    constexpr uint32_t n_chunk2  = 512;
     constexpr uint32_t n_decode  = 4;
 
     const auto tokens_prefill = get_tokens(n_prefill, n_vocab, seed + 11);
     const auto tokens_decode  = get_tokens(n_decode,  n_vocab, seed + 12);
+    const auto tokens_chunk2  = get_tokens(n_chunk2,  n_vocab, seed + 13);
 
     struct run_result {
         std::vector<float> logits;
         uint32_t cells = 0;
     };
 
-    const auto run = [&](const bool inplace) -> run_result {
-        run_result result;
-
-        if (inplace) {
-            setenv("LLAMA_SWA_INPLACE_CURRENT", "1", 1);
-        } else {
-            unsetenv("LLAMA_SWA_INPLACE_CURRENT");
-        }
-
+    const auto make_ctx = [&]() {
         llama_context_params params = llama_context_default_params();
         params.n_ctx           = 4096;
         params.n_batch         = n_ubatch;
@@ -1785,36 +1786,94 @@ static int test_swa_inplace_current(const size_t seed) {
 
         llama_context_ptr ctx(llama_init_from_model(model.get(), params));
         if (!ctx) {
-            throw std::runtime_error(inplace ? "failed to create in-place context"
-                                             : "failed to create default context");
+            throw std::runtime_error("failed to create the in-place SWA test context");
         }
+        return ctx;
+    };
 
-        const auto decode = [&](const std::vector<llama_token> & tokens, llama_pos pos0, bool want_logits) {
-            common_batch batch(ctx.get());
-            for (size_t i = 0; i < tokens.size(); ++i) {
-                batch.add(tokens[i], pos0 + llama_pos(i), 0, want_logits && i + 1 == tokens.size());
-            }
-            if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
-                throw std::runtime_error("llama_process failed in the in-place SWA test");
-            }
-            if (want_logits) {
-                const float * l = llama_get_logits_ith(ctx.get(), -1);
-                if (!l) {
-                    throw std::runtime_error("no logits in the in-place SWA test");
-                }
-                result.logits.assign(l, l + n_vocab);
-            }
+    const auto decode = [&](llama_context * ctx, run_result & result,
+                            const std::vector<llama_token> & tokens, llama_pos pos0,
+                            const std::vector<int32_t> & out_idxs) {
+        common_batch batch(ctx);
+        const auto wants = [&](int32_t i) {
+            return std::find(out_idxs.begin(), out_idxs.end(), i) != out_idxs.end();
         };
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            batch.add(tokens[i], pos0 + llama_pos(i), 0, wants(int32_t(i)));
+        }
+        if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            throw std::runtime_error("llama_process failed in the in-place SWA test");
+        }
+        for (int32_t i : out_idxs) {
+            const float * l = llama_get_logits_ith(ctx, i);
+            if (!l) {
+                throw std::runtime_error("no logits in the in-place SWA test");
+            }
+            result.logits.insert(result.logits.end(), l, l + n_vocab);
+        }
+    };
 
-        decode(tokens_prefill, 0, false);
+    // the two chunks and the trailing decodes, driven on any context
+    const auto run_tail = [&](llama_context * ctx, run_result & result, const bool with_prefill) {
+        if (with_prefill) {
+            decode(ctx, result, tokens_prefill, 0, {});
+        }
+        // first and last token of the second chunk: the first one is the query
+        // whose window reaches back into the previous chunk
+        decode(ctx, result, tokens_chunk2, llama_pos(n_prefill), { 0, int32_t(n_chunk2) - 1 });
         for (uint32_t i = 0; i < n_decode; ++i) {
             const bool last = i + 1 == n_decode;
-            decode({ tokens_decode[i] }, llama_pos(n_prefill + i), last);
+            decode(ctx, result, { tokens_decode[i] }, llama_pos(n_prefill + n_chunk2 + i),
+                    last ? std::vector<int32_t>{ 0 } : std::vector<int32_t>{});
+        }
+        // resident SWA payload proves which cache layout was actually allocated
+        const llama_kv_memory_stats stats = llama_get_kv_memory_stats(ctx);
+        result.cells = uint32_t((stats.swa.k_payload_bytes + stats.swa.v_payload_bytes)/1024);
+    };
+
+    const auto run = [&](const bool inplace) -> run_result {
+        run_result result;
+
+        if (inplace) {
+            setenv("LLAMA_SWA_INPLACE_CURRENT", "1", 1);
+        } else {
+            unsetenv("LLAMA_SWA_INPLACE_CURRENT");
         }
 
-        // resident SWA payload proves which cache layout was actually allocated
-        const llama_kv_memory_stats stats = llama_get_kv_memory_stats(ctx.get());
-        result.cells = uint32_t((stats.swa.k_payload_bytes + stats.swa.v_payload_bytes)/1024);
+        auto ctx = make_ctx();
+        run_tail(ctx.get(), result, true);
+        unsetenv("LLAMA_SWA_INPLACE_CURRENT");
+
+        return result;
+    };
+
+    // Saving and restoring the ring must reproduce the uninterrupted result: the
+    // state carries the ring size in its group ID and the rows are re-laid by
+    // position, so the continuation has to be indistinguishable.
+    const auto run_restore = [&]() -> run_result {
+        run_result result;
+
+        setenv("LLAMA_SWA_INPLACE_CURRENT", "1", 1);
+
+        constexpr llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED;
+
+        auto ctx = make_ctx();
+        decode(ctx.get(), result, tokens_prefill, 0, {});
+        result.logits.clear();
+
+        std::vector<uint8_t> state(llama_state_seq_get_size_ext(ctx.get(), 0, flags));
+        if (state.empty() ||
+                llama_state_seq_get_data_ext(ctx.get(), state.data(), state.size(), 0, flags) != state.size()) {
+            throw std::runtime_error("failed to save the in-place SWA ring state");
+        }
+        ctx.reset();
+
+        auto restored_ctx = make_ctx();
+        if (llama_state_seq_set_data_ext(restored_ctx.get(), state.data(), state.size(), 0, flags) != state.size()) {
+            throw std::runtime_error("failed to restore the in-place SWA ring state");
+        }
+
+        run_tail(restored_ctx.get(), result, false);
         unsetenv("LLAMA_SWA_INPLACE_CURRENT");
 
         return result;
@@ -1838,6 +1897,13 @@ static int test_swa_inplace_current(const size_t seed) {
     LOG_INF("%s: max |dlogit| = %.3e, SWA payload %u KiB vs %u KiB\n", __func__, worst,
             base.cells, inplace.cells);
 
+    {
+        double amax = 0.0, asum = 0.0;
+        for (float v : base.logits) { amax = std::max(amax, double(std::fabs(v))); asum += std::fabs(v); }
+        LOG_INF("%s: base |logit| max %.3e mean %.3e (n = %zu)\n", __func__, amax,
+                asum/double(base.logits.size()), base.logits.size());
+    }
+
     if (!(worst < 5e-2)) {
         LOG_ERR("%s: in-place current segment changed the logits (max |dlogit| = %.3e)\n", __func__, worst);
         ++failures;
@@ -1850,6 +1916,65 @@ static int test_swa_inplace_current(const size_t seed) {
         LOG_ERR("%s: SWA cache did not shrink (%u KiB vs %u KiB) - the in-place mode did not engage\n",
                 __func__, base.cells, inplace.cells);
         ++failures;
+    }
+
+    // a saved ring state must restore byte-for-byte equivalent behaviour
+    const run_result restored = run_restore();
+    if (restored.logits.size() != inplace.logits.size()) {
+        LOG_ERR("%s: restored logit vector size mismatch\n", __func__);
+        return 1;
+    }
+
+    double worst_restore = 0.0;
+    for (size_t i = 0; i < inplace.logits.size(); ++i) {
+        worst_restore = std::max(worst_restore, double(std::fabs(inplace.logits[i] - restored.logits[i])));
+    }
+
+    LOG_INF("%s: restored max |dlogit| = %.3e, SWA payload %u KiB\n", __func__,
+            worst_restore, restored.cells);
+
+    if (!(worst_restore < 1e-5)) {
+        LOG_ERR("%s: restoring the ring state changed the logits (max |dlogit| = %.3e)\n",
+                __func__, worst_restore);
+        ++failures;
+    }
+
+    // The advertised removal capability has to describe what can_seq_rm()
+    // accepts, otherwise a caller that trusts it aborts on a failed seq_rm().
+    {
+        setenv("LLAMA_SWA_INPLACE_CURRENT", "1", 1);
+        auto ctx = make_ctx();
+        run_result scratch;
+        run_tail(ctx.get(), scratch, true);
+        unsetenv("LLAMA_SWA_INPLACE_CURRENT");
+
+        llama_memory_t mem = llama_get_memory(ctx.get());
+        const llama_memory_seq_rm_capability cap = llama_memory_get_seq_rm_capability(mem);
+
+        // ring size 256 minus the 16-cell window, plus one
+        constexpr uint32_t expect_rollback = 241;
+        const bool cap_ok = !cap.arbitrary_ranges && cap.full_clear &&
+                cap.suffix_rollback_tokens == expect_rollback;
+        if (!cap_ok) {
+            LOG_ERR("%s: ring capability is wrong (arbitrary=%d clear=%d rollback=%u, expected %u)\n",
+                    __func__, int(cap.arbitrary_ranges), int(cap.full_clear),
+                    cap.suffix_rollback_tokens, expect_rollback);
+            ++failures;
+        }
+
+        const llama_pos pos_last = llama_pos(n_prefill + n_chunk2 + n_decode) - 1;
+        const auto can = [&](llama_pos p0, llama_pos p1) {
+            return llama_memory_can_seq_rm(mem, 0, p0, p1);
+        };
+        const bool shallow_ok = can(pos_last - llama_pos(cap.suffix_rollback_tokens) + 1, -1);
+        const bool deep_ok    = can(pos_last - llama_pos(cap.suffix_rollback_tokens), -1);
+        const bool interior   = can(pos_last - 8, pos_last - 4);
+        const bool clear_ok   = can(-1, -1);
+        if (!shallow_ok || deep_ok || interior || !clear_ok) {
+            LOG_ERR("%s: ring removal bounds are wrong (shallow=%d deep=%d interior=%d clear=%d)\n",
+                    __func__, int(shallow_ok), int(deep_ok), int(interior), int(clear_ok));
+            ++failures;
+        }
     }
 
     return failures == 0 ? 0 : 1;

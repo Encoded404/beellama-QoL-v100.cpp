@@ -7,6 +7,7 @@
 #include "llama-memory.h"
 
 #include <atomic>
+#include <limits>
 #include <unordered_map>
 #include <vector>
 
@@ -18,6 +19,11 @@ struct llama_context;
 //
 // llama_kv_cache
 //
+
+// Sentinel for llama_kv_cache::ring_prev_pos: the cell is not a write target of
+// the ubatch whose mask is being built, so its committed position is also the
+// position of the row it holds.
+static constexpr llama_pos LLAMA_KV_RING_NOT_DEST = std::numeric_limits<llama_pos>::min();
 
 class llama_kv_cache : public llama_memory_i {
 public:
@@ -164,6 +170,10 @@ public:
     void clear(bool data) override;
 
     bool can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const override;
+
+    // deepest suffix the ring can drop while keeping the pre-window history the
+    // next decode needs: size - n_swa + 1
+    uint32_t ring_rollback_tokens() const;
     bool seq_rm_plan(
             llama_seq_id seq_id, llama_pos p0, llama_pos p1,
             llama_pos & planned_p0, llama_pos & planned_p1) const override;
@@ -453,6 +463,13 @@ private:
     // current ubatch is attended from the graph (see the KV tail planner's
     // current segment). Requires a single stream and no position shifts.
     const bool swa_ring = false;
+
+    // Per-cell snapshot, taken by apply_ubatch(), of the position of the row
+    // that is still physically resident in the cells the ubatch overwrites. The
+    // ring write is deferred until after attention, so the body mask must use
+    // this position rather than the freshly committed one. Empty when no
+    // snapshot is pending; only meaningful for swa_ring caches.
+    std::vector<llama_pos> ring_prev_pos;
 
     const uint32_t tail_tokens = 0;
     const uint32_t tail_rollback_tokens = 0;
