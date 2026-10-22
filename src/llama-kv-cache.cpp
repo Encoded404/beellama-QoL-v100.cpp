@@ -3973,6 +3973,8 @@ struct args_set_input_kq_mask {
     llama_swa_type swa_type;
 
     int64_t n_kv;
+    int64_t n_row;    // destination row stride in elements: n_kv - origin
+    int64_t origin;   // leading K/V columns that are absent from the mask
     int64_t n_stream;
     int64_t n_tps;
     const std::vector<int64_t> * read_cells;
@@ -4001,6 +4003,8 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     const llama_swa_type swa_type = args.swa_type;
 
     const int64_t n_kv     = args.n_kv;
+    const int64_t n_row    = args.n_row;
+    const int64_t origin   = args.origin;
     const int64_t n_stream = args.n_stream;
     const int64_t n_tps    = args.n_tps;
 
@@ -4041,7 +4045,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
             const llama_pos p1_x = is_2d ? ubatch->pos[i + ubatch->n_tokens*2] : 0;
             const llama_pos p1_y = is_2d ? ubatch->pos[i + ubatch->n_tokens]   : 0;
 
-            const uint64_t idst = n_kv*i;
+            const uint64_t idst = n_row*i;
 
             // for tokens of the same sequence, the mask is mostly the same, so we can reuse it
             // the only cells that could change are the ones that are with similar positions as the
@@ -4057,9 +4061,9 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 if (seq_srct.find(seq_id) != seq_srct.end()) {
                     const uint32_t srct = seq_srct[seq_id];
 
-                    const uint64_t idst_prev = n_kv*srct;
+                    const uint64_t idst_prev = n_row*srct;
 
-                    std::copy(data + idst_prev, data + idst_prev + n_kv, data + idst);
+                    std::copy(data + idst_prev, data + idst_prev + n_row, data + idst);
 
                     prev = true;
                 } else {
@@ -4070,17 +4074,18 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 }
             }
 
-            for (uint32_t jj = 0; jj < n_kv; ++jj) {
+            for (uint32_t jj = uint32_t(origin); jj < n_kv; ++jj) {
+                const uint32_t jj_rel = jj - uint32_t(origin);
                 uint32_t j = jj;
 
                 // we have an exiting mask for this sequence -> update just seq_idxs
                 if (!alibi) {
                     if (prev) {
-                        if (jj >= idxs.size()) {
+                        if (jj_rel >= idxs.size()) {
                             break;
                         }
 
-                        j = idxs[jj];
+                        j = idxs[jj_rel];
                     }
                 }
 
@@ -4153,14 +4158,14 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 }
 
                 if (alibi) {
-                    data[idst + j] = llama_cast<T>(static_cast<float>(-std::abs(p0 - p1)));
+                    data[idst + j - origin] = llama_cast<T>(static_cast<float>(-std::abs(p0 - p1)));
                 } else {
-                    data[idst + j] = mask_keep;
+                    data[idst + j - origin] = mask_keep;
                 }
 
                 continue;
 skip:
-                data[idst + j] = mask_drop;
+                data[idst + j - origin] = mask_drop;
             }
         }
     }
@@ -4205,6 +4210,71 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     }
 }
 
+// KQ mask origin: report the leading K/V cells whose mask value is provably
+// uniform for every query of this ubatch, so the mask tensor can omit them.
+// Only a causal, single-sequence, contiguous prefill over a dense same-sequence
+// prefix qualifies: cell i must hold position i of the ubatch's only sequence.
+// Everything else (SWA, ring, shared cells, Alibi, M-RoPE, mixed batches,
+// multiple sequences, a hole or a foreign row in the prefix) returns origin 0,
+// which is today's full-width mask.
+//
+// The origin is rounded down to the 256 alignment that n_kv already has, so the
+// mask extents only change when n_kv changes and graph reuse is unaffected.
+llama_kv_cache::kq_mask_prefix llama_kv_cache::get_kq_mask_prefix(
+        const llama_ubatch & ubatch, bool causal_attn) const {
+    kq_mask_prefix res;
+
+    if (!causal_attn || swa_type != LLAMA_SWA_TYPE_NONE || swa_ring || other != nullptr) {
+        return res;
+    }
+    if (n_stream != 1 || hparams.use_alibi) {
+        return res;
+    }
+    // prefill only, and only for a batch large enough that the decode-shaped
+    // kernels (which read the mask with absolute K/V columns) cannot be routed
+    if (ubatch.n_tokens < 32 || ubatch.n_seqs_unq != 1 || ubatch.is_pos_2d() || ubatch.is_mixed()) {
+        return res;
+    }
+
+    const llama_seq_id seq_id = ubatch.seq_id[0][0];
+    const llama_pos  p1_min   = ubatch.pos[0];
+    if (p1_min <= 0) {
+        return res;
+    }
+    for (uint32_t i = 1; i < ubatch.n_tokens; ++i) {
+        if (ubatch.seq_id[i][0] != seq_id || ubatch.pos[i] != p1_min + (llama_pos) i) {
+            return res;
+        }
+    }
+
+    if (size_t(seq_id) >= seq_to_stream.size()) {
+        return res;
+    }
+    const auto & cells = v_cells[seq_to_stream[seq_id]];
+    if (cells.size() == 0) {
+        return res;
+    }
+
+    const uint32_t align = 256;
+    const uint32_t limit = uint32_t(std::min<int64_t>(p1_min, cells.size()));
+    uint32_t dense = 0;
+    for (; dense < limit; ++dense) {
+        if (cells.is_empty(dense) || cells.pos_get(dense) != (llama_pos) dense ||
+                cells.seq_count(dense) != 1 || !cells.seq_has(dense, seq_id)) {
+            break;
+        }
+    }
+
+    const uint32_t origin = (dense / align) * align;
+    if (origin == 0) {
+        return res;
+    }
+
+    res.origin  = origin;
+    res.visible = true;
+    return res;
+}
+
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     set_input_kq_mask_mapped(dst, ubatch, causal_attn, {});
 }
@@ -4216,8 +4286,12 @@ void llama_kv_cache::set_input_kq_mask_mapped(
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
-    const int64_t n_kv     = dst->ne[0];
+    // the mask may omit the leading `origin` K/V columns, which are uniform
+    const int64_t origin   = ((const int32_t *) dst->op_params)[GGML_KQ_MASK_TENSOR_OP_PARAM_ORIGIN];
+    const int64_t n_row    = dst->ne[0];
+    const int64_t n_kv     = n_row + origin;
     const int64_t n_stream = dst->ne[3]; // num streams in the current ubatch
+    GGML_ASSERT(origin >= 0);
     GGML_ASSERT(read_cells.empty() || (n_stream == 1 && int64_t(read_cells.size()) == n_kv));
 
     GGML_ASSERT(n_tokens%n_stream == 0);
@@ -4241,6 +4315,8 @@ void llama_kv_cache::set_input_kq_mask_mapped(
         /*.n_swa            =*/ n_swa,
         /*.swa_type         =*/ swa_type,
         /*.n_kv             =*/ n_kv,
+        /*.n_row            =*/ n_row,
+        /*.origin           =*/ origin,
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
         /*.read_cells       =*/ read_cells.empty() ? nullptr : &read_cells,
@@ -7344,6 +7420,11 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+llama_kv_cache::kq_mask_prefix llama_kv_cache_context::get_kq_mask_prefix(
+        const llama_ubatch & ubatch, bool causal_attn) const {
+    return kv->get_kq_mask_prefix(ubatch, causal_attn);
 }
 
 llama_kv_cache * llama_kv_cache_context::get_kv() const {

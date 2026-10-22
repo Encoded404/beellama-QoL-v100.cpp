@@ -471,9 +471,31 @@ extern "C" {
         GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_HISTORY_SLOTS = 6,
         GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_WINDOW_CHUNK = 7,
         GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_NON_CAUSAL_MASK = 8,
-        // 9 and above are backend-private; the CUDA kernel selector keeps its
-        // own hint in slot 9, so graph-local current sources are signalled by
-        // src[10]/src[11] being non-NULL and nothing else.
+        // Core contract: the leading `origin` K/V columns of the batch
+        // (src[1]->ne[1] - src[3]->ne[0]) are absent from the mask. They all
+        // carry one uniform value selected by
+        // GGML_FLASH_ATTN_EXT_OP_PARAM_KQ_MASK_PREFIX_VISIBLE (1 => 0.0f, i.e.
+        // keep; 0 => -inf, i.e. drop), and src[3] column j holds the mask for
+        // K/V column origin + j. origin == 0 means "no origin": src[3] spans
+        // the whole of src[1], which is the only value every backend accepts.
+        GGML_FLASH_ATTN_EXT_OP_PARAM_KQ_MASK_ORIGIN         = 10,
+        GGML_FLASH_ATTN_EXT_OP_PARAM_KQ_MASK_PREFIX_VISIBLE = 11,
+        // 9 and 12..15 are backend-private. The CUDA kernel selector keeps its
+        // own hint in slot 9; slots 10/11 belong to the core mask-origin
+        // contract above, so further backend hints must use 12..15. Graph-local
+        // current sources are signalled by src[10]/src[11] being non-NULL and
+        // nothing else.
+        //
+        // note: slot 10 is also used privately by GGML_OP_KVARN_VIEW (indirect
+        // read flag), which is a different operation.
+    };
+
+    // A KQ mask tensor carries its own mask-origin metadata in its op_params so
+    // that the graph builder and the KV-cache fill cannot disagree. These are
+    // offsets into the mask tensor's op_params, not into the attention op's.
+    enum ggml_kq_mask_tensor_op_param {
+        GGML_KQ_MASK_TENSOR_OP_PARAM_ORIGIN         = 0,
+        GGML_KQ_MASK_TENSOR_OP_PARAM_PREFIX_VISIBLE = 1,
     };
 
     enum ggml_flash_attn_ext_kvarn_domain {
@@ -2584,6 +2606,22 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_set_n_kv_max(
             struct ggml_tensor * a,
             int32_t              n_kv_max);
+
+    // Declare that the leading `origin` K/V columns are uniform and therefore
+    // absent from the mask: src[3]->ne[0] must equal src[1]->ne[1] - origin.
+    // `prefix_visible` selects the uniform value (true => 0.0f / keep,
+    // false => -inf / drop). origin == 0 clears the contract.
+    // Requires a FlashAttention operation with a contiguous F16 mask and is
+    // incompatible with the sparse set declared by ggml_flash_attn_ext_set_n_kv_max.
+    GGML_API void ggml_flash_attn_ext_set_kq_mask_origin(
+            struct ggml_tensor * a,
+            int32_t              origin,
+            bool                 prefix_visible);
+
+    GGML_API void ggml_flash_attn_ext_get_kq_mask_origin(
+            const struct ggml_tensor * a,
+                  int32_t             * origin,
+                  bool                * prefix_visible);
 
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,

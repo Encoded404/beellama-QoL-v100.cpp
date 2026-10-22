@@ -106,6 +106,18 @@ struct llama_cparams {
     uint32_t  kv_tail_rollback_tokens = 0;
     ggml_type kv_tail_type   = GGML_TYPE_COUNT;
 
+    // KQ mask origin: the attention mask stores only the column range
+    // [origin, n_kv) and the leading `origin` columns carry one uniform value
+    // (see ggml_flash_attn_ext_set_kq_mask_origin). Resolved once per context
+    // from the backend capability proc, the model/ubatch eligibility rules and
+    // the --kq-mask-origin switch.
+    bool      kq_mask_origin = false;
+    // Non-zero while llama_context::sched_reserve builds its sizing graphs: the
+    // mask is then built with this many rows so the reserved compute buffers do
+    // not have to cover the full-width mask. Those graphs are only sized and
+    // split, never computed, so the synthetic origin values are never read.
+    uint32_t  kq_mask_reserve_rows = 0;
+
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
 

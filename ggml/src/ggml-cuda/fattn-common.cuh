@@ -2,6 +2,7 @@
 
 #include "common.cuh"
 #include "convert.cuh"
+#include "fattn-mask-origin.cuh"
 #include "vecdotq.cuh"
 
 #include <cstdint>
@@ -40,7 +41,8 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33);
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+                            const int32_t mask_origin, const half mask_prefix);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -1207,7 +1209,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
 template <int ncols1>
 __launch_bounds__(FATTN_KQ_STRIDE/2, 1)
 static __global__ void flash_attn_mask_to_KV_max(
-        const half2 * mask_ptr, int * KV_max_ptr, const int ne30, const int64_t s31, const int64_t s33) {
+        const half2 * mask_ptr, int * KV_max_ptr, const int ne30, const int64_t s31, const int64_t s33,
+        const int mask_origin, const half mask_prefix) {
     const half2 * GGML_CUDA_RESTRICT mask   = mask_ptr;
     int         * GGML_CUDA_RESTRICT KV_max = KV_max_ptr;
 
@@ -1218,6 +1221,11 @@ static __global__ void flash_attn_mask_to_KV_max(
 
     mask += sequence*s33 + jt*ncols1*s31;
 
+    // the launcher only scans when the origin is tile aligned, so every tile is
+    // either entirely below the origin (uniform, never read) or entirely inside
+    // the stored mask
+    const bool prefix_visible = __half2float(mask_prefix) == 0.0f;
+
     __shared__ int buf_iw[WARP_SIZE];
     if (tid < WARP_SIZE) {
         buf_iw[tid] = 1;
@@ -1227,11 +1235,20 @@ static __global__ void flash_attn_mask_to_KV_max(
 
     int KV_max_sj = (ne30 - 1) * FATTN_KQ_STRIDE;
     for (; KV_max_sj >= 0; KV_max_sj -= FATTN_KQ_STRIDE) {
+        if (KV_max_sj + FATTN_KQ_STRIDE <= mask_origin) {
+            // absent from the mask; stop on the first visible prefix tile,
+            // otherwise keep descending
+            if (prefix_visible) {
+                break;
+            }
+            continue;
+        }
+
         int all_inf = 1;
 
 #pragma unroll
         for (int j = 0; j < ncols1; ++j) {
-            const float2 tmp = __half22float2(mask[j*s31 + KV_max_sj/2 + tid]);
+            const float2 tmp = __half22float2(mask[j*s31 + (KV_max_sj - mask_origin)/2 + tid]);
             all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
         }
 
@@ -1253,6 +1270,14 @@ static __global__ void flash_attn_mask_to_KV_max(
     // If the break was triggered it's the lower edge of the tile with the first non-masked values.
     // In either case, walk back the decrementation by FATTN_KQ_STRIDE.
     KV_max_sj += FATTN_KQ_STRIDE;
+
+    // a visible prefix is part of the attention window even though it is absent
+    // from the mask, so the bound must cover it
+    if (prefix_visible) {
+        KV_max_sj = max(KV_max_sj, mask_origin);
+    } else {
+        KV_max_sj = max(KV_max_sj, 0);
+    }
 
     if (threadIdx.x != 0) {
         return;
@@ -1552,6 +1577,15 @@ void launch_fattn(
 
     ggml_tensor * KQV = dst;
 
+    // mask-origin contract: the first `mask_origin` K/V columns are absent from
+    // the mask and share `mask_prefix` (see fattn-mask-origin.cuh)
+    const fattn_mask_origin mask_origin_info = fattn_mask_origin_get(KQV);
+    const int32_t           mask_origin      = mask != nullptr ? mask_origin_info.origin : 0;
+    const half              mask_prefix      = mask_origin_info.prefix;
+
+    GGML_ASSERT(!use_sparse || mask_origin == 0);
+    GGML_ASSERT(!mask || mask->ne[0] + mask_origin == K->ne[1]);
+
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
     GGML_ASSERT(KQV->type == GGML_TYPE_F32);
 
@@ -1670,7 +1704,10 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    const bool scan_mask = !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
+    // With a mask origin the scan also needs the origin to be tile aligned so that no tile straddles it;
+    //     otherwise the scan is skipped and the full range is used, which is always correct.
+    const bool scan_mask = !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 &&
+        mask_origin % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
     if (scan_mask) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
@@ -1684,7 +1721,7 @@ void launch_fattn(
         KV_max.alloc(ne_KV_max);
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
         ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
-            (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
+            (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33, mask_origin, mask_prefix);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -1819,7 +1856,8 @@ void launch_fattn(
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        mask_origin, mask_prefix
     );
     CUDA_CHECK(cudaGetLastError());
 

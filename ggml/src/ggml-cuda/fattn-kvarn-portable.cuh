@@ -1,5 +1,6 @@
 #pragma once
 
+#include "fattn-mask-origin.cuh"
 #include "fattn-mma-kvarn-case-decl.cuh"
 #include "fattn-mma-kvarn-load.cuh"
 
@@ -161,7 +162,9 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
         int n_query,
         int n_query_heads,
         int n_kv_heads,
-        int n_splits) {
+        int n_splits,
+        int mask_origin,
+        half mask_prefix) {
     static_assert(D == 64 || D == 128 || D == 256 || D == 512,
         "portable KVarN attention supports 64/128/256/512-wide heads");
     constexpr int RECORD_DIM = D == 64 ? 64 : GGML_CUDA_FATTN_KVARN_DIM;
@@ -283,9 +286,9 @@ static __global__ void ggml_cuda_fattn_kvarn_portable_kernel(
             float mask_value = 0.0f;
             if (mask_data != nullptr) {
                 const half * mask = (const half *) (
-                    mask_data + token * nbm0 + query * nbm1 +
+                    mask_data + max(token - mask_origin, 0) * nbm0 + query * nbm1 +
                     (query_head % nmask2) * nbm2 + (body_stream % nmask3) * nbm3);
-                mask_value = slope * __half2float(*mask);
+                mask_value = token < mask_origin ? slope * __half2float(mask_prefix) : slope * __half2float(*mask);
             }
 
             float score = reduction[0] * scale;
@@ -522,7 +525,9 @@ static __global__ void ggml_cuda_fattn_kvarn_d64_gqa_kernel(
         int n_query,
         int n_query_heads,
         int n_kv_heads,
-        int n_splits) {
+        int n_splits,
+        int mask_origin,
+        half mask_prefix) {
     static_assert(GQA == 1 || GQA == 2 || GQA == 4 || GQA == 8,
         "D64 portable GQA kernel supports power-of-two ratios through 8");
     const int query = (int) blockIdx.x % n_query;
@@ -662,9 +667,9 @@ static __global__ void ggml_cuda_fattn_kvarn_d64_gqa_kernel(
                 float mask_value = 0.0f;
                 if (mask_data != nullptr) {
                     const half * mask = (const half *) (
-                        mask_data + token * nbm0 + query * nbm1 +
+                        mask_data + max(token - mask_origin, 0) * nbm0 + query * nbm1 +
                         (query_head % nmask2) * nbm2 + (stream % nmask3) * nbm3);
-                    mask_value = slopes[h] * __half2float(*mask);
+                    mask_value = token < mask_origin ? slopes[h] * __half2float(mask_prefix) : slopes[h] * __half2float(*mask);
                 }
                 float score = scores[h] * scale;
                 if (logit_softcap != 0.0f) {
@@ -856,6 +861,12 @@ static void ggml_cuda_fattn_kvarn_portable_launch(
     const bool tail_attached = kt != nullptr;
     const ggml_tensor * qo = tail_attached ? aux : nullptr;
     const ggml_tensor * body_meta = tail_attached ? nullptr : aux;
+
+    // mask-origin contract: the leading columns are absent from the body mask
+    const fattn_mask_origin mask_origin_info = fattn_mask_origin_get(dst);
+    const int32_t           mask_origin      = mask_origin_info.origin;
+    const half              mask_prefix      = mask_origin_info.prefix;
+
     float scale = 1.0f;
     float max_bias = 0.0f;
     float logit_softcap = 0.0f;
@@ -916,7 +927,7 @@ static void ggml_cuda_fattn_kvarn_portable_launch(
                     mask ? mask->ne[2] : 1, mask ? mask->ne[3] : 1, \
                     dst->nb[1], dst->nb[2], dst->nb[3], \
                     plan.n_kv, (int) q->ne[1], (int) q->ne[2], \
-                    plan.n_kv_heads, n_splits)
+                    plan.n_kv_heads, n_splits, mask_origin, mask_prefix)
             switch (gqa) {
                 case 1: GGML_CUDA_FATTN_KVARN_D64_GQA_LAUNCH(1); break;
                 case 2: GGML_CUDA_FATTN_KVARN_D64_GQA_LAUNCH(2); break;
@@ -968,7 +979,7 @@ static void ggml_cuda_fattn_kvarn_portable_launch(
             vt && vt->type == GGML_TYPE_BF16,
             v_original_domain,
             plan.n_kv, (int) q->ne[1], (int) q->ne[2],
-            plan.n_kv_heads, n_splits);
+            plan.n_kv_heads, n_splits, mask_origin, mask_prefix);
         CUDA_CHECK(cudaGetLastError());
     }
 

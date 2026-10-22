@@ -126,7 +126,8 @@ static __global__ void flash_attn_ext_vec(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33) {
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+                            const int32_t mask_origin, const half mask_prefix) {
     ggml_cuda_pdl_lc();
 #ifdef FLASH_ATTN_AVAILABLE
     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
@@ -149,7 +150,7 @@ static __global__ void flash_attn_ext_vec(
                   nb11, nb12, nb13,
                   nb21, nb22, nb23,
                   ne31, ne32, ne33,
-                  nb31, nb32, nb33);
+                  nb31, nb32, nb33, mask_origin, mask_prefix);
         NO_DEVICE_CODE;
         return;
     }
@@ -205,6 +206,7 @@ static __global__ void flash_attn_ext_vec(
     K += nb13*sequence + nb12*(head / gqa_ratio);
     V += nb23*sequence + nb22*(head / gqa_ratio);
 
+    // mask row base, column 0 of the row is K/V column `mask_origin`
     const half * maskh  = (const half  *) (mask + nb33*(sequence % ne33) + nb31*ic0);
 
     // Column addressing: token mode strides columns over Q->ne[1] (tokens);
@@ -212,7 +214,9 @@ static __global__ void flash_attn_ext_vec(
     const int64_t q_col_stride    = gqa_shared ? nb02 : nb01;
     const int     col0            = gqa_shared ? head : ic0;
     const int     col_max         = gqa_shared ? int(ne02) : int(ne01.z);
-    const int64_t mask_col_stride = gqa_shared ? 0 : ne11;
+    // the mask row is strided by its own leading dimension, not by K->ne[1]:
+    // with a mask origin the row is shorter than the K/V range
+    const int64_t mask_col_stride = gqa_shared ? 0 : nb31/sizeof(half);
 
     const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
 
@@ -357,10 +361,10 @@ static __global__ void flash_attn_ext_vec(
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
     K     += blockIdx.y*nthreads_active * nb11;
     V     += blockIdx.y*nthreads_active * nb21;
-    maskh += blockIdx.y*nthreads_active;
+    // maskh is not advanced with K/V: with a mask origin its columns are offset
     for (int k_VKQ_0 = blockIdx.y*nthreads_active; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nthreads_active,
              // Increment pointers after each loop:
-             K += gridDim.y*nthreads_active*nb11, V += gridDim.y*nthreads_active*nb21, maskh += gridDim.y*nthreads_active) {
+             K += gridDim.y*nthreads_active*nb11, V += gridDim.y*nthreads_active*nb21) {
 
         // Calculate KQ tile and keep track of new maximum KQ values:
         float KQ_reg[ncols]; // KQ in registers.
@@ -385,7 +389,12 @@ static __global__ void flash_attn_ext_vec(
                 }
 
                 if (mask && (ncols == 1 || col0 + j < col_max)) {
-                    sum += slope*__half2float(maskh[j*mask_col_stride + i_KQ]);
+                    const int64_t ik = k_VKQ_0 + i_KQ;
+                    if (ik < mask_origin) {
+                        sum += slope*__half2float(mask_prefix);
+                    } else {
+                        sum += slope*__half2float(maskh[j*mask_col_stride + (ik - mask_origin)]);
+                    }
                 }
 
                 KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
@@ -657,7 +666,8 @@ static __global__ void flash_attn_ext_vec(
               nb11, nb12, nb13,
               nb21, nb22, nb23,
               ne31, ne32, ne33,
-              nb31, nb32, nb33);
+              nb31, nb32, nb33,
+              mask_origin, mask_prefix);
     NO_DEVICE_CODE;
 #endif // FLASH_ATTN_AVAILABLE
 }

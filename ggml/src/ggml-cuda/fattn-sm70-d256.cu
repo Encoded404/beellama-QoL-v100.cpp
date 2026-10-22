@@ -136,8 +136,9 @@ bool ggml_cuda_sm70_d256_supported(const int cc, const ggml_tensor * dst) {
     }
     // Same mask contract the exact-tail body pass uses. The mask must be F16 (the stock
     // kernel asserts the same) and its batch axis must broadcast or match exactly.
+    const int32_t mask_origin = ggml_get_op_params_i32(dst, GGML_FLASH_ATTN_EXT_OP_PARAM_KQ_MASK_ORIGIN);
     if (mask->type != GGML_TYPE_F16 ||
-            mask->ne[0] != K->ne[1] || mask->ne[1] < Q->ne[1] || mask->ne[2] != 1 ||
+            mask->ne[0] + mask_origin != K->ne[1] || mask->ne[1] < Q->ne[1] || mask->ne[2] != 1 ||
             (mask->ne[3] != 1 && mask->ne[3] != Q->ne[3])) {
         sm70_d256_probe("REJECT: mask shape / type", cc, dst);
         return false;
@@ -255,6 +256,10 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
     float scale = 1.0f;
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
 
+    const fattn_mask_origin mask_origin_info = fattn_mask_origin_get(dst);
+    const int32_t           mask_origin      = mask_origin_info.origin;
+    const half              mask_prefix      = mask_origin_info.prefix;
+
     const int q_len  = (int) Q->ne[1];
     const int kv_len = (int) K->ne[1];
     const int gqa    = (int) (Q->ne[2] / K->ne[2]);
@@ -298,6 +303,7 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
     ggml_cuda_pool_alloc<int> kv_max_alloc(ctx.pool());
     const bool use_kv_max =
         K->ne[1] % FATTN_KQ_STRIDE == 0 &&                  // 256-column scan tiles
+        mask_origin % FATTN_KQ_STRIDE == 0 &&               // no scan tile straddles the origin
         mask->nb[0] == sizeof(half) &&                      // columns contiguous in half
         mask->nb[1] % (int64_t) sizeof(half2) == 0 &&       // rows half2-aligned
         mask->nb[3] % (int64_t) sizeof(half2) == 0 &&       // mask batches half2-aligned
@@ -309,7 +315,8 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
         ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<kBlockM>,
             ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, stream),
             (const half2 *) mask->data, kv_max_alloc.ptr, (int) (K->ne[1] / FATTN_KQ_STRIDE),
-            mask->nb[1] / (int64_t) sizeof(half2), mask->nb[3] / (int64_t) sizeof(half2));
+            mask->nb[1] / (int64_t) sizeof(half2), mask->nb[3] / (int64_t) sizeof(half2),
+            mask_origin, mask_prefix);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -321,6 +328,7 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
             vv.row_stride, vv.head_stride, vv.batch_stride,
             mask->nb[1] / (int64_t) sizeof(half),
             mask->nb[3] / (int64_t) sizeof(half), mask_n_batch,
+            mask_origin, mask_prefix,
             use_kv_max ? kv_max_alloc.ptr : nullptr,
             (float2 *) (dst->src[8] != nullptr ? dst->src[8]->data : nullptr),
             // dst is not laid out like Q: ggml_flash_attn_ext returns permute(0, 2, 1, 3), so the

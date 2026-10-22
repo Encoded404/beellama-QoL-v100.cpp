@@ -6348,6 +6348,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_kvarn_ops") == 0) {
         return (void *)ggml_backend_cuda_kvarn_ops;
     }
+    if (strcmp(name, "ggml_backend_flash_attn_mask_origin_supported") == 0) {
+        // Dense prefill FlashAttention (vec, tile, mma-f16) and the sm70-D256 path
+        // read the mask through the origin contract. The exact-tail, current and
+        // KVarN routes reject a mask origin in ggml_cuda_flash_attn_ext_supported.
+        return (void *) +[]() { return true; };
+    }
     if (strcmp(name, "ggml_backend_kv_tail_attention_supported") == 0) {
         return (void *)ggml_cuda_flash_attn_ext_tail_supported;
     }

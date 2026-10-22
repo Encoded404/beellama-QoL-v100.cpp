@@ -801,6 +801,21 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;
         return (void *)fct;
     }
+    if (strcmp(name, "ggml_backend_flash_attn_mask_origin_supported") == 0) {
+        // The chunked and tiled CPU FlashAttention reference paths read the mask
+        // through the origin contract. The exact-tail and KVarN reference routes
+        // do not, and the graph never asks for a mask origin there.
+#ifdef GGML_USE_CPU_RISCV64_SPACEMIT
+        // The SpacemiT extra buffer type routes FLASH_ATTN_EXT to the RVV kernels
+        // before the generic dispatch, and those index the mask with absolute K/V
+        // columns. Advertise the contract only when that route cannot take the op;
+        // it accepts F16 K/V with D <= 128, which is exactly the common case, so
+        // the backend stays conservative here.
+        return (void *) +[]() { return false; };
+#else
+        return (void *) +[]() { return true; };
+#endif
+    }
     if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {
         ggml_backend_dev_get_extra_bufts_t fct = ggml_backend_cpu_device_get_extra_buffers_type;
         return (void *)fct;

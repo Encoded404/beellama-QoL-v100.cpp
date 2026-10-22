@@ -5707,8 +5707,56 @@ void ggml_flash_attn_ext_set_n_kv_max(
         int32_t              n_kv_max) {
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
     GGML_ASSERT(n_kv_max >= 0);
+    // the sparse set describes the mask itself, which the mask-origin contract
+    // shrinks; the two representations cannot be combined
+    GGML_ASSERT(n_kv_max == 0 ||
+            ggml_get_op_params_i32(a, GGML_FLASH_ATTN_EXT_OP_PARAM_KQ_MASK_ORIGIN) == 0);
 
     ggml_set_op_params_i32(a, 4, n_kv_max);
+}
+
+void ggml_flash_attn_ext_set_kq_mask_origin(
+        struct ggml_tensor * a,
+        int32_t              origin,
+        bool                 prefix_visible) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(origin >= 0);
+
+    if (origin == 0) {
+        ggml_set_op_params_i32(a, GGML_FLASH_ATTN_EXT_OP_PARAM_KQ_MASK_ORIGIN,         0);
+        ggml_set_op_params_i32(a, GGML_FLASH_ATTN_EXT_OP_PARAM_KQ_MASK_PREFIX_VISIBLE, 0);
+        return;
+    }
+
+    GGML_ASSERT(origin > 0);
+    GGML_ASSERT(a->src[1] != NULL && "mask origin requires a K source");
+    GGML_ASSERT(a->src[3] != NULL && "mask origin requires a mask");
+    GGML_ASSERT(a->src[3]->type == GGML_TYPE_F16);
+    GGML_ASSERT(ggml_is_contiguous(a->src[3]));
+    GGML_ASSERT(a->src[3]->ne[2] == 1 && "mask origin requires a per-sequence mask");
+    GGML_ASSERT(a->src[3]->ne[0] + origin == a->src[1]->ne[1] &&
+            "mask origin must account for exactly the mask columns that are absent");
+    // incompatible with the sparse finite-entry set
+    GGML_ASSERT(ggml_get_op_params_i32(a, 4) == 0);
+
+    ggml_set_op_params_i32(a, GGML_FLASH_ATTN_EXT_OP_PARAM_KQ_MASK_ORIGIN,         origin);
+    ggml_set_op_params_i32(a, GGML_FLASH_ATTN_EXT_OP_PARAM_KQ_MASK_PREFIX_VISIBLE,
+            prefix_visible ? 1 : 0);
+}
+
+void ggml_flash_attn_ext_get_kq_mask_origin(
+        const struct ggml_tensor * a,
+              int32_t             * origin,
+              bool                * prefix_visible) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+
+    if (origin != NULL) {
+        *origin = ggml_get_op_params_i32(a, GGML_FLASH_ATTN_EXT_OP_PARAM_KQ_MASK_ORIGIN);
+    }
+    if (prefix_visible != NULL) {
+        *prefix_visible =
+                ggml_get_op_params_i32(a, GGML_FLASH_ATTN_EXT_OP_PARAM_KQ_MASK_PREFIX_VISIBLE) != 0;
+    }
 }
 
 void ggml_flash_attn_ext_add_sinks(

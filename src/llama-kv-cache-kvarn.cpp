@@ -1271,6 +1271,15 @@ void llama_kv_cache_kvarn_context::set_input_k_shift(ggml_tensor * dst) const {
     base()->set_input_k_shift(dst);
 }
 
+llama_kv_cache::kq_mask_prefix llama_kv_cache_kvarn_context::get_kq_mask_prefix(
+        const llama_ubatch & ubatch, bool causal_attn) const {
+    GGML_UNUSED(ubatch);
+    GGML_UNUSED(causal_attn);
+    // the compressed-record and materialized-view routes address absolute K/V
+    // columns, so their masks must stay full width
+    return {};
+}
+
 void llama_kv_cache_kvarn_context::set_input_kq_mask(
         ggml_tensor * dst,
         const llama_ubatch * ubatch,

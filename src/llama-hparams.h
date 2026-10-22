@@ -235,6 +235,13 @@ struct llama_hparams {
     bool attn_soft_cap = false;
     bool use_kq_norm   = false;
 
+    // Whether this architecture can use the KQ mask-origin representation for
+    // its body attention mask (see ggml_flash_attn_ext_set_kq_mask_origin).
+    // Cleared by the model builder for architectures that consume the body mask
+    // with absolute K/V columns, derive further masks from it, or run an
+    // MLA/indexer path.
+    bool kq_mask_origin_ok = true;
+
     // for Classifiers
     uint32_t n_cls_out = 1;
 

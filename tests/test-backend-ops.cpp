@@ -8313,6 +8313,10 @@ struct test_flash_attn_ext : public test_case {
     const bool kv_view; // create K/V as views of a larger buffer (like a KV cache)
     const bool v_is_view_of_k;
     const int64_t n_kv_max;
+    // KQ mask origin: the mask omits the leading `mask_origin` K/V columns,
+    // which all carry `mask_prefix_visible ? 0.0f : -inf`
+    int64_t mask_origin;
+    bool mask_prefix_visible;
 
     std::string vars() override {
         return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max) +
@@ -8327,7 +8331,9 @@ struct test_flash_attn_ext : public test_case {
             " segmented_equivalence=" + std::to_string(int(segmented_equivalence)) +
             " scale=" + std::to_string(scale) +
             " n_tail_active=" + std::to_string(n_tail_active) +
-            " n_tail_history_slots=" + std::to_string(n_tail_history_slots);
+            " n_tail_history_slots=" + std::to_string(n_tail_history_slots) +
+            " mask_origin=" + std::to_string(mask_origin) +
+            " mask_prefix_visible=" + std::to_string(int(mask_prefix_visible));
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -8389,7 +8395,7 @@ struct test_flash_attn_ext : public test_case {
                         int64_t n_tail_current = 0, bool segmented_equivalence = false,
                         float scale = 0.0f, int64_t n_tail_active = -1,
                         int64_t n_tail_history_slots = 0, bool kv_view = true, bool v_is_view_of_k = false,
-                        int64_t n_kv_max = 0)
+                        int64_t n_kv_max = 0, int64_t mask_origin = 0, bool mask_prefix_visible = true)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
           type_K(type_K), type_V(type_V), permute(permute), n_tail(n_tail), tail_only(tail_only), type_tail_k(type_tail_k),
           type_tail_v(type_tail_v == GGML_TYPE_COUNT ? type_tail_k : type_tail_v), tail_interleaved(tail_interleaved),
@@ -8397,7 +8403,8 @@ struct test_flash_attn_ext : public test_case {
           full_coverage_equivalence(full_coverage_equivalence), split_equivalence(split_equivalence),
           n_tail_current(n_tail_current), segmented_equivalence(segmented_equivalence), scale(scale),
           n_tail_active(n_tail_active), n_tail_history_slots(n_tail_history_slots), kv_view(kv_view),
-          v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max) {}
+          v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max), mask_origin(mask_origin),
+          mask_prefix_visible(mask_prefix_visible) {}
 
     test_flash_attn_ext(int64_t hsk, int64_t hsv, int64_t nh, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb,
                         bool mask, bool sinks, float max_bias, float logit_softcap, ggml_prec prec,
@@ -8452,9 +8459,11 @@ struct test_flash_attn_ext : public test_case {
         }
         ggml_set_name(v, "v");
 
+        const int64_t mask_rows = kv - mask_origin;
+
         ggml_tensor * m = nullptr;
         if (mask) {
-            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
+            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, mask_rows, nb, 1, nr23[1]);
             ggml_set_name(m, "m");
         }
 
@@ -8466,6 +8475,12 @@ struct test_flash_attn_ext : public test_case {
 
         const float attn_scale = scale > 0.0f ? scale : 1.0f/sqrtf(hsk);
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, attn_scale, max_bias, logit_softcap);
+        // the exact-tail and current routes do not accept a mask origin and the
+        // sparse set is incompatible with it
+        if (mask_origin > 0) {
+            GGML_ASSERT(n_tail == 0 && n_tail_current == 0 && n_kv_max == 0);
+            ggml_flash_attn_ext_set_kq_mask_origin(out, (int32_t) mask_origin, mask_prefix_visible);
+        }
         ggml_tensor * exact = nullptr;
         if (n_tail > 0) {
             const int64_t n_tail_used = n_tail_active >= 0 ? n_tail_active : n_tail;
@@ -12249,6 +12264,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, false));
 
+    // KQ mask origin: the leading columns are absent from the mask and share one
+    // uniform value. A visible prefix must reproduce the full-mask result; the
+    // dropped prefix exercises the -inf side.
+    for (const int64_t origin : { int64_t(512), int64_t(2048), int64_t(4096 - 256) }) {
+        for (const bool visible : { true, false }) {
+            auto * tc = new test_flash_attn_ext(128, 128, 8, {1, 1}, 4096, 512, true, false, 0, 0, GGML_PREC_F32,
+                    GGML_TYPE_F16, GGML_TYPE_F16);
+            tc->mask_origin         = origin;
+            tc->mask_prefix_visible = visible;
+            test_cases.emplace_back(tc);
+        }
+    }
+
     // D256 in the layout the FA graph actually builds: the KV cache is dense
     // [D][n_head_kv][n_kv] and is permuted to [D][n_kv][n_head_kv], so it is gapless
     // (kv-minor) rather than dense in ne order. launch_fattn converts those with the
@@ -13154,6 +13182,20 @@ static bool run_fa_vec_slice(ggml_backend_t backend, ggml_backend_t backend_cpu,
     return n_fail == 0;
 }
 
+// Mask-origin cases are only meaningful on a backend that implements the
+// contract: the others accept FLASH_ATTN_EXT without inspecting the mask width
+// and would read a shortened mask as if it spanned the whole K/V range.
+static bool backend_supports_kq_mask_origin(ggml_backend_dev_t dev) {
+    const ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (!reg) {
+        return false;
+    }
+    using proc_t = bool (*)();
+    const auto proc = reinterpret_cast<proc_t>(ggml_backend_reg_get_proc_address(
+            reg, "ggml_backend_flash_attn_mask_origin_supported"));
+    return proc != nullptr && proc();
+}
+
 static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mode mode, const char * op_names_filter, const char * params_filter,
                          printer * output_printer, const char * test_file_path, int parallel_workers) {
     auto filter_test_cases = [](std::vector<std::unique_ptr<test_case>> & test_cases, const char * params_filter) {
@@ -13188,6 +13230,14 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
         }
     } else {
         test_cases = make_test_cases_from_file(test_file_path);
+    }
+
+    if (!backend_supports_kq_mask_origin(dev)) {
+        const std::regex origin_re("mask_origin=([1-9][0-9]*)");
+        test_cases.erase(std::remove_if(test_cases.begin(), test_cases.end(),
+            [&origin_re](const std::unique_ptr<test_case> & tc) {
+                return std::regex_search(tc->vars(), origin_re);
+            }), test_cases.end());
     }
 
     filter_test_cases(test_cases, params_filter);

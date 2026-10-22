@@ -390,6 +390,21 @@ public:
     void set_input_kq_mask_current(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
 
     bool is_swa_ring() const { return swa_ring; }
+
+    // KQ mask origin contract: the leading `origin` K/V cells of the mask are
+    // uniform (all visible) and can be omitted from the mask tensor. Reported
+    // only for the cases that are provably uniform; everything else returns
+    // origin == 0, i.e. today's full-width mask.
+    struct kq_mask_prefix {
+        uint32_t origin  = 0;
+        bool     visible = false;
+    };
+
+    bool              is_swa         () const { return swa_type != LLAMA_SWA_TYPE_NONE; }
+    llama_swa_type    get_swa_type   () const { return swa_type; }
+    uint32_t          get_n_swa      () const { return n_swa; }
+
+    kq_mask_prefix get_kq_mask_prefix(const llama_ubatch & ubatch, bool causal_attn) const;
     void set_input_kq_mask_mapped(
             ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn,
             const std::vector<int64_t> & read_cells) const;
@@ -693,6 +708,7 @@ public:
     //
 
     virtual uint32_t get_n_kv() const;
+    virtual llama_kv_cache::kq_mask_prefix get_kq_mask_prefix(const llama_ubatch & ubatch, bool causal_attn) const;
     virtual llama_kv_cache * get_kv() const;
     virtual const llama_kv_cache::slot_info & current_sinfo() const;
     virtual const slot_info_vec_t & get_sinfos() const;

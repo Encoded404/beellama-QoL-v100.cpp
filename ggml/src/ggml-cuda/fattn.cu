@@ -1139,6 +1139,16 @@ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     const bool has_exact_tail = dst->src[5] != nullptr && dst->src[6] != nullptr && dst->src[7] != nullptr &&
         dst->src[8] != nullptr && dst->src[9] != nullptr;
 
+    // Mask origin is implemented for the prefill paths: the dense kernels (vec,
+    // tile, mMA), sm70-D256, and the KVarN routes (generic MMA, portable, and the
+    // chunked window partial kernel). The exact-tail and current-segment routes
+    // address absolute K/V columns and the decode kernels are never given an
+    // origin, so they reject it and the graph keeps a full-width mask instead.
+    const int32_t mask_origin = ggml_get_op_params_i32(dst, GGML_FLASH_ATTN_EXT_OP_PARAM_KQ_MASK_ORIGIN);
+    if (mask_origin > 0 && (has_exact_tail || dst->src[10] != nullptr || dst->src[0]->ne[1] < 32)) {
+        return false;
+    }
+
     if (!has_exact_tail && dst->src[10] != nullptr) {
         return ggml_cuda_flash_attn_ext_current_supported(device, dst);
     }

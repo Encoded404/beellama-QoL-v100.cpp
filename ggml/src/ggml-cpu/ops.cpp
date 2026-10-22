@@ -9072,6 +9072,22 @@ static bool ggml_compute_forward_flash_attn_ext_kvarn(
         const ggml_compute_params * params,
         ggml_tensor * dst);
 
+// Mask-origin contract: with an origin the first `origin` K/V columns are
+// absent from the mask and all share one uniform value. Read it once per
+// invocation, never per mask element.
+struct ggml_cpu_fattn_mask_prefix {
+    int64_t origin;
+    float   value;
+};
+
+static ggml_cpu_fattn_mask_prefix ggml_cpu_fattn_mask_prefix_get(const ggml_tensor * dst) {
+    const int32_t origin  = ggml_get_op_params_i32(dst, GGML_FLASH_ATTN_EXT_OP_PARAM_KQ_MASK_ORIGIN);
+    const bool    visible = ggml_get_op_params_i32(dst, GGML_FLASH_ATTN_EXT_OP_PARAM_KQ_MASK_PREFIX_VISIBLE) != 0;
+
+    GGML_ASSERT(origin >= 0);
+    return { int64_t(origin), visible ? 0.0f : -INFINITY };
+}
+
 static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const ggml_compute_params * params,
         ggml_tensor * dst,
@@ -9154,6 +9170,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     GGML_ASSERT((                            q_to_vec_dot) && "fattn: unsupported K-type");
     GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float  ) && "fattn: unsupported V-type");
 
+    const ggml_cpu_fattn_mask_prefix mask_prefix = ggml_cpu_fattn_mask_prefix_get(dst);
+
     int ith = params->ith;
 
     for (int ir = ir0; ir < ir1; ++ir) {
@@ -9197,7 +9215,11 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
-            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+            // columns below the mask origin are absent from the mask and share
+            // one uniform value
+            const float mv = mp ? slope*(ic < mask_prefix.origin
+                    ? mask_prefix.value
+                    : GGML_CPU_FP16_TO_FP32(mp[ic - mask_prefix.origin])) : 0.0f;
             if (mv == -INFINITY) {
                 continue;
             }
@@ -9356,6 +9378,8 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     GGML_ASSERT(k->type == v->type);
     const ggml_type kv_type = k->type;
 
+    const ggml_cpu_fattn_mask_prefix mask_prefix = ggml_cpu_fattn_mask_prefix_get(dst);
+
 
     // broadcast factors
     const int64_t rk2 = neq2/nek2;
@@ -9462,7 +9486,12 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                 for (int tq = 0; tq < tile_rows; tq++) {
                     const ggml_fp16_t * mp_row = (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
                     for (int tk = 0; tk < kv_tile; tk++) {
-                        mask32[tq * KV_TILE_SZ + tk] = slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
+                        const int64_t ik = ic + tk;
+                        // columns below the mask origin are absent from the mask
+                        // and share one uniform value
+                        mask32[tq * KV_TILE_SZ + tk] = slope * (ik < mask_prefix.origin
+                                ? mask_prefix.value
+                                : GGML_CPU_FP16_TO_FP32(mp_row[ik - mask_prefix.origin]));
                         if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
                             can_skip = false;
                         }
@@ -9814,6 +9843,11 @@ static void ggml_compute_forward_flash_attn_ext_tail_ref(
     const ggml_tensor * v  = dst->src[2];
     const ggml_tensor * mb = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+
+    // the body mask is re-materialized through the run descriptor's body map,
+    // which addresses absolute K/V columns; mask origin is not supported here
+    GGML_ASSERT(ggml_get_op_params_i32(dst, GGML_FLASH_ATTN_EXT_OP_PARAM_KQ_MASK_ORIGIN) == 0 &&
+            "mask origin is not supported by the exact-tail reference path");
     const ggml_tensor * kt = dst->src[5];
     const ggml_tensor * vt = dst->src[6];
     const ggml_tensor * mt = dst->src[7];
@@ -12945,6 +12979,11 @@ static bool ggml_compute_forward_flash_attn_ext_kvarn(
     if (!has_k && !has_v) {
         return false;
     }
+
+    // the compressed-record route addresses absolute K/V columns through the
+    // run descriptor; mask origin is not implemented for it yet
+    GGML_ASSERT(ggml_get_op_params_i32(dst, GGML_FLASH_ATTN_EXT_OP_PARAM_KQ_MASK_ORIGIN) == 0 &&
+            "mask origin is not supported by the KVarN reference path");
 
     GGML_ASSERT(has_k && has_v);
     GGML_ASSERT(!k.value && v.value);

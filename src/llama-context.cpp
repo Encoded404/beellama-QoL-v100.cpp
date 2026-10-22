@@ -323,6 +323,52 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+// Whether `dev` implements the KQ mask-origin contract. Only the presence of
+// the opt-in backend proc is checked; the per-op question is answered by
+// ggml_backend_dev_supports_op on the built attention node.
+// Architectures that read the body mask with absolute K/V columns or derive
+// further masks from it keep the full-width mask.
+static bool kq_mask_origin_arch_supported(const llama_model & model) {
+    if (model.hparams.is_mla() || !model.hparams.kq_mask_origin_ok) {
+        return false;
+    }
+    switch (model.arch) {
+        case LLM_ARCH_DEEPSEEK32:
+        case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_GLM_DSA:
+        case LLM_ARCH_GLM5_NEXT:
+        case LLM_ARCH_QWEN4EXP:
+        case LLM_ARCH_MINIMAX_M3:
+        case LLM_ARCH_T5:
+        case LLM_ARCH_T5ENCODER:
+            return false;
+        default:
+            break;
+    }
+    return true;
+}
+
+static bool kq_mask_origin_device_supported(ggml_backend_dev_t dev) {
+    if (dev == nullptr) {
+        dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    }
+    if (dev && ggml_backend_dev_is_meta(dev)) {
+        const size_t count = ggml_backend_meta_device_count(dev);
+        for (size_t i = 0; i < count; ++i) {
+            if (!kq_mask_origin_device_supported(ggml_backend_meta_device_get(dev, i))) {
+                return false;
+            }
+        }
+        return count > 0;
+    }
+    const auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (!reg) {
+        return false;
+    }
+    return ggml_backend_reg_get_proc_address(
+            reg, "ggml_backend_flash_attn_mask_origin_supported") != nullptr;
+}
+
 // Whether `dev` provides a NATIVE KV-tail attention kernel.
 //
 // Only the presence of the entry point is checked, not whether it accepts a
@@ -752,6 +798,50 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+
+    // KQ mask origin: one decision for the whole context. The mask then stores
+    // only its query-dependent rows. Anything that can make the leading columns
+    // non-uniform, or that reads the mask with absolute K/V columns, keeps
+    // today's full-width mask.
+    {
+        const char * env     = getenv("LLAMA_KQ_MASK_ORIGIN");
+        const bool   request = env == nullptr || atoi(env) != 0;
+
+        const char * why = nullptr;
+        if (!request) {
+            why = "disabled by LLAMA_KQ_MASK_ORIGIN";
+        } else if (!cparams.flash_attn) {
+            why = "requires flash attention";
+        } else if (!cparams.kv_unified) {
+            why = "requires a unified KV cache";
+        } else if (!kq_mask_origin_arch_supported(model)) {
+            why = "unsupported architecture";
+        } else if (cparams.kv_tail_tokens > 0 || cparams.kv_tail_tokens_swa > 0) {
+            why = "KV tail is enabled";
+        } else if (model.n_devices() != 1) {
+            why = "requires a single device";
+        } else {
+            for (uint32_t il = 0; il < hparams.n_layer_all && why == nullptr; ++il) {
+                if (!hparams.has_kv(il)) {
+                    continue;
+                }
+                // FLASH_ATTN_EXT follows its inputs rather than the weight
+                // placement, so the layer device is what runs the mask read even
+                // when the K/V stay on the host
+                if (!kq_mask_origin_device_supported(model.dev_layer(il))) {
+                    why = "a KV layer's backend does not implement mask origin";
+                }
+            }
+        }
+
+        cparams.kq_mask_origin = why == nullptr;
+        if (cparams.kq_mask_origin) {
+            LLAMA_LOG_INFO("%s: KQ mask origin enabled\n", __func__);
+        } else {
+            LLAMA_LOG_INFO("%s: KQ mask origin disabled: %s\n", __func__, why);
+        }
+    }
+
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -1248,6 +1338,12 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     if (cparams.auto_fa) {
         resolve(llm_fused_op_flash_attn_probe, cparams.flash_attn);
         cparams.auto_fa = false;
+
+        // the mask-origin representation is a FlashAttention-only contract
+        if (!cparams.flash_attn && cparams.kq_mask_origin) {
+            LLAMA_LOG_WARN("%s: KQ mask origin disabled: flash attention is not available\n", func);
+            cparams.kq_mask_origin = false;
+        }
     }
 
     if (cparams.auto_fgdn) {
@@ -1349,6 +1445,13 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", __func__, n_tokens, n_seqs, n_outputs);
 
+    // The reserve graphs only decide buffer sizes and the backend split; they are
+    // never filled or computed. Size the mask-origin mask for its runtime extent
+    // instead of the full cache width so the reserved buffers can be smaller.
+    if (cparams.kq_mask_origin && cparams.n_seq_max == 1) {
+        cparams.kq_mask_reserve_rows = GGML_PAD(n_tokens + 512, 256);
+    }
+
     resolve_fused_ops(mctx.get(), n_seqs);
 
     // reserve worst-case graph
@@ -1427,6 +1530,8 @@ void llama_context::sched_reserve() {
         }
         record_backend_private_workspace(gf);
     }
+
+    cparams.kq_mask_reserve_rows = 0;
 
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
         ggml_backend_t             backend = backend_ptrs[i];

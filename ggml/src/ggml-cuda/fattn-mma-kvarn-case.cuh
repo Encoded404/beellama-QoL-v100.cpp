@@ -79,7 +79,8 @@ static __global__ void ggml_cuda_fattn_kvarn_window_f16_partial_kernel(
         const int32_t ne10, const int32_t ne11, const int32_t ne12, const int32_t ne13,
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
-                            const int32_t ne33, const int32_t nb31, const int64_t nb33) {
+                            const int32_t ne33, const int32_t nb31, const int64_t nb33,
+                            const int32_t mask_origin, const half mask_prefix) {
 #if defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
     constexpr int ncols = ncols1 * ncols2;
     constexpr int nbatch_fa = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols);
@@ -116,12 +117,13 @@ static __global__ void ggml_cuda_fattn_kvarn_window_f16_partial_kernel(
         (Q_f2, K_h2, V_h2, mask_h, nullptr, sinks_f, dstk, partial_ptr, nullptr, scale, slope, logit_softcap,
          ne01, ne02, gqa_ratio, ne11, nb01 / (int32_t) sizeof(float2), nb02 / (int32_t) sizeof(float2),
          nb11 / (int32_t) sizeof(half2), nb21 / (int32_t) sizeof(half2), nb31 / (int32_t) sizeof(half),
+         mask_origin, mask_prefix,
          jt, zt_gqa, 0, iter_k);
 #else
     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, partial_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
         ne00, ne01, ne02, ne03, nb01, nb02, nb03,
-        ne10, ne11, ne12, ne13, nb11, nb12, nb13, nb21, nb22, nb23, ne33, nb31, nb33);
+        ne10, ne11, ne12, ne13, nb11, nb12, nb13, nb21, nb22, nb23, ne33, nb31, nb33, mask_origin, mask_prefix);
     NO_DEVICE_CODE;
 #endif
 }
@@ -146,7 +148,8 @@ static __global__ void ggml_cuda_fattn_kvarn_window_f16_direct_kernel(
         const int32_t ne10, const int32_t ne11, const int32_t ne12, const int32_t ne13,
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
-                            const int32_t ne33, const int32_t nb31, const int64_t nb33) {
+                            const int32_t ne33, const int32_t nb31, const int64_t nb33,
+                            const int32_t mask_origin, const half mask_prefix) {
 #if defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
     constexpr int ncols = ncols1 * ncols2;
     constexpr int nbatch_fa = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols);
@@ -183,12 +186,13 @@ static __global__ void ggml_cuda_fattn_kvarn_window_f16_direct_kernel(
         (Q_f2, K_h2, V_h2, mask_h, nullptr, sinks_f, dstk, nullptr, nullptr, scale, slope, logit_softcap,
          ne01, ne02, gqa_ratio, ne11, nb01 / (int32_t) sizeof(float2), nb02 / (int32_t) sizeof(float2),
          nb11 / (int32_t) sizeof(half2), nb21 / (int32_t) sizeof(half2), nb31 / (int32_t) sizeof(half),
+         mask_origin, mask_prefix,
          jt, zt_gqa, 0, iter_k);
 #else
     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, dst_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
         ne00, ne01, ne02, ne03, nb01, nb02, nb03,
-        ne10, ne11, ne12, ne13, nb11, nb12, nb13, nb21, nb22, nb23, ne33, nb31, nb33);
+        ne10, ne11, ne12, ne13, nb11, nb12, nb13, nb21, nb22, nb23, ne33, nb31, nb33, mask_origin, mask_prefix);
     NO_DEVICE_CODE;
 #endif
 }
@@ -328,6 +332,11 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * mask = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+
+    // mask-origin contract; the chunked paths below rebase it per chunk
+    const fattn_mask_origin mask_origin_info = fattn_mask_origin_get(dst);
+    const int32_t           mask_origin      = mask_origin_info.origin;
+    const half              mask_prefix      = mask_origin_info.prefix;
     float2 * const dst_meta = dst->src[8] != nullptr ? (float2 *) dst->src[8]->data : nullptr;
     const enum ggml_flash_attn_ext_kvarn_domain domain = ggml_cuda_fattn_kvarn_domain(dst);
     if (!ggml_cuda_fattn_kvarn_window_enabled() ||
@@ -417,7 +426,8 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
     // is bounded by window_chunk and kept as a transient scratch allocation.
     // It is not a graph-level KVarN materialize fallback.
     if (window_chunk >= plan.n_kv) {
-        const int chunk_len = plan.n_kv;
+        const int chunk_len    = plan.n_kv;
+        const int chunk_origin = (int) mask_origin;
         const dim3 dequant_grid((uint32_t) chunk_len, (uint32_t) plan.n_kv_heads, (uint32_t) plan.n_stream);
         ggml_cuda_kernel_launch_params dequant_params(dequant_grid, dequant_block, 0, stream);
         ggml_cuda_kernel_launch(dequant_kernel, dequant_params,
@@ -493,7 +503,8 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
             (int64_t) plan.n_kv_heads * chunk_len * DV * (int64_t) sizeof(half),
             mask ? (int32_t) mask->ne[3] : 1,
             mask ? (int32_t) mask->nb[1] : 0,
-            mask ? (int64_t) mask->nb[3] : 0);
+            mask ? (int64_t) mask->nb[3] : 0,
+            chunk_origin, mask_prefix);
         ggml_cuda_kernel_launch_params single_finalize_params(merge_grid, merge_block, 0, stream);
         ggml_cuda_kernel_launch(ggml_cuda_fattn_kvarn_window_single_finalize_kernel<DV, ncols1, ncols2>, single_finalize_params,
             partial.get(), (float *) dst->data, dst_meta, ne01, Q->ne[2], plan.n_kv_heads, gqa_ratio, ntiles_dst);
@@ -507,12 +518,17 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
     bool init = true;
     for (int chunk_begin = 0; chunk_begin < plan.n_kv; chunk_begin += window_chunk) {
         const int chunk_len = std::min(window_chunk, plan.n_kv - chunk_begin);
+        // this chunk covers K/V columns [chunk_begin, chunk_begin+chunk_len); the
+        // chunk-relative origin is the part of the omitted prefix inside it
+        const int chunk_origin = (int) std::min<int64_t>(
+                std::max<int64_t>(int64_t(mask_origin) - chunk_begin, 0), chunk_len);
         const dim3 dequant_grid((uint32_t) chunk_len, (uint32_t) plan.n_kv_heads, (uint32_t) plan.n_stream);
         ggml_cuda_kernel_launch_params dequant_params(dequant_grid, dequant_block, 0, stream);
         ggml_cuda_kernel_launch(dequant_kernel, dequant_params,
             k_desc.get(), v_desc.get(), k_f16.get(), v_f16.get(), chunk_begin, chunk_len, plan.n_kv_heads);
 
-        const char * mask_data = mask ? (const char *) mask->data + (size_t) chunk_begin * mask->nb[0] : nullptr;
+        const char * mask_data = mask ? (const char *) mask->data +
+            (size_t) std::max<int64_t>(int64_t(chunk_begin) - mask_origin, 0) * mask->nb[0] : nullptr;
         ggml_cuda_kernel_launch_params partial_params(partial_grid, partial_block, nbytes_shared_total, stream);
         ggml_cuda_kernel_launch(ggml_cuda_fattn_kvarn_window_f16_partial_kernel<DKQ, DV, ncols1, ncols2, use_logit_softcap>,
             partial_params,
@@ -533,7 +549,8 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
             (int64_t) plan.n_kv_heads * chunk_len * DV * (int64_t) sizeof(half),
             mask ? (int32_t) mask->ne[3] : 1,
             mask ? (int32_t) mask->nb[1] : 0,
-            mask ? (int64_t) mask->nb[3] : 0);
+            mask ? (int64_t) mask->nb[3] : 0,
+            chunk_origin, mask_prefix);
 
         ggml_cuda_kernel_launch_params merge_params(merge_grid, merge_block, 0, stream);
         ggml_cuda_kernel_launch(ggml_cuda_fattn_kvarn_window_merge_kernel<DV, ncols1, ncols2>, merge_params,

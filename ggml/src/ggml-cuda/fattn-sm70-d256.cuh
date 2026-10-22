@@ -132,7 +132,8 @@ static __device__ __forceinline__ void sm70_d256_fill_mask_tile(
         const int64_t mask_batch_stride,
         const int     mask_n_batch,       // mask batch count; broadcasts when 1
         const int batch, const int q_tile0, const int q_len,
-        const int kv0, const int kv_len, const int tid) {
+        const int kv0, const int kv_len, const int tid,
+        const int mask_origin, const half mask_prefix) {
 #pragma unroll 4
     for (int i = tid; i < kSmemMask_Halfs; i += kThreads) {
         const int r  = i / kBlockN;
@@ -143,8 +144,10 @@ static __device__ __forceinline__ void sm70_d256_fill_mask_tile(
         if (kv < kv_len && qr < q_len) {
             // The mask carries its own batch axis, which broadcasts when it is 1;
             // the stock kernel offsets the same way (mask + nb33*(sequence % ne33)).
+            // Columns below the mask origin are absent and share mask_prefix.
             const int mb = batch % mask_n_batch;
-            m = mask[(int64_t) mb * mask_batch_stride + (int64_t) qr * mask_stride + kv];
+            m = kv < mask_origin ? mask_prefix :
+                mask[(int64_t) mb * mask_batch_stride + (int64_t) qr * mask_stride + (kv - mask_origin)];
         }
         smem_mask[i] = m;
     }
@@ -201,6 +204,8 @@ void sm70_d256_splitd_kernel(
         const int64_t mask_stride,         // stride between Q rows, in half units
         const int64_t mask_batch_stride,   // stride between mask batches, in half units
         const int     mask_n_batch,        // mask batch count; the mask broadcasts when 1
+        const int     mask_origin,         // leading K/V columns absent from the mask
+        const half    mask_prefix,         // uniform value of those columns
         const int   * __restrict__ kv_max, // [mask batch][Q tile] exclusive KV supremum, or nullptr
         float2      * __restrict__ dst_meta, // [2][heads_q][q_len][batch] final (row_max, row_sum), or nullptr
         const int64_t dst_row_stride,      // strides in float2 units; dst is head-inner, so the
@@ -309,7 +314,7 @@ void sm70_d256_splitd_kernel(
         sm70_d256_fill_kv_tile((half2 *) smem_K0, k_base, k_row_stride, 0, kv_len, tid);
         sm70_d256_fill_kv_tile((half2 *) smem_V0, v_base, v_row_stride, 0, kv_len, tid);
         sm70_d256_fill_mask_tile(smem_mask, mask, mask_stride, mask_batch_stride, mask_n_batch,
-            batch, q_tile0, q_len, 0, kv_len, tid);
+            batch, q_tile0, q_len, 0, kv_len, tid, mask_origin, mask_prefix);
     }
     __syncthreads();
 
@@ -365,7 +370,7 @@ void sm70_d256_splitd_kernel(
             sm70_d256_fill_kv_tile((half2 *) next_K, k_base, k_row_stride, kv0_next, kv_len, tid);
             sm70_d256_fill_kv_tile((half2 *) next_V, v_base, v_row_stride, kv0_next, kv_len, tid);
             sm70_d256_fill_mask_tile(smem_mask, mask, mask_stride, mask_batch_stride, mask_n_batch,
-                batch, q_tile0, q_len, kv0_next, kv_len, tid);
+                batch, q_tile0, q_len, kv0_next, kv_len, tid, mask_origin, mask_prefix);
         }
 
         // -------------------------------------------------------------- softmax
@@ -478,7 +483,7 @@ void sm70_d256_splitd_kernel(
         v_row_stride, v_head_stride, v_batch_stride,
         mask_stride, mask_batch_stride, mask_n_batch, kv_max, dst_meta,
         dst_row_stride, dst_head_stride, dst_batch_stride,
-        q_len, kv_len, gqa, scale);
+        q_len, kv_len, gqa, scale, mask_origin, mask_prefix);
     NO_DEVICE_CODE;
 #endif // defined(VOLTA_MMA_AVAILABLE)
 }

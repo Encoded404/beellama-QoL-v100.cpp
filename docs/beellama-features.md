@@ -936,6 +936,50 @@ process exit as a failed measurement rather than a score.
 The base file is tied to its vocabulary, evaluation tokens, and context size.
 It is a measurement artifact, not a portable model format.
 
+## KQ mask origin (narrower FlashAttention mask)
+
+The FlashAttention mask is a host-written graph input. Without a mask origin it
+spans the full KV cache: at 48k context with `-ub 4096` the base mask alone is
+48128x4096x2 = 376 MiB in device memory, again in the pinned `CUDA_Host`
+compute buffer, plus a 376 MiB host-to-device copy per ubatch.
+
+With a mask origin the leading `origin` K/V columns are known to carry one
+uniform value (all visible), so the mask stores only `[origin, n_kv)`. For a
+dense single-sequence causal prefill that is the batch itself: 32 MiB instead of
+376 MiB, with the host fill and the copy shrinking by the same factor.
+
+`origin` travels on the attention op as
+`GGML_FLASH_ATTN_EXT_OP_PARAM_KQ_MASK_ORIGIN` (plus
+`..._KQ_MASK_PREFIX_VISIBLE` for the uniform value), so the mask tensor is
+narrower while the K/V sources keep their full length.
+
+Enabled automatically when every precondition holds, and disabled (with one log
+line naming the reason) otherwise:
+
+- FlashAttention on, causal attention, a unified KV cache, one sequence per
+  ubatch, contiguous ascending positions, one device, no layer split;
+- a dense, single-sequence KV prefix whose cells hold positions `0..origin-1`;
+- no sliding window, no SWA ring, no KV precision tail, no Alibi, no M-RoPE,
+  no mixed token/embedding batch, no shared-cell cache;
+- none of the MLA/indexer/MSA architectures that consume the body mask with
+  absolute columns;
+- a backend that implements the contract. CUDA (vector, tile, MMA-F16, the
+  sm70-D256 split-D path, and the KVarN direct, portable and chunked-window
+  routes) and the CPU reference do; Vulkan, Metal, the SpacemiT RVV CPU kernels
+  and the other backends do not, so they keep the full-width mask.
+
+Mask origin applies to prefill batches only; decode masks are a few hundred KiB
+and stay as they are. Set `LLAMA_KQ_MASK_ORIGIN=0` to force the full-width mask,
+for example to A/B the change.
+
+Because the compute buffers are sized from a reserve graph that has no batch
+positions, the reserve graph is built with a synthetic mask extent so the
+reserved buffers shrink too. The reserve graphs are only sized and split, never
+filled or computed, and the synthetic extent is always at least as large as any
+runtime mask. The allocator never shrinks a chunk, so a later non-compact
+prefill graph (for example a resumed multi-sequence batch) grows the buffers
+back to the full-width size; the saving then returns only after a restart.
+
 ## Removed systems
 
 TurboQuant/TCQ, DDTree, CopySpec, the fork DFlash ring/capture/tape and reduced
