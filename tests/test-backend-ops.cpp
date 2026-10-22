@@ -8332,8 +8332,10 @@ struct test_flash_attn_ext : public test_case {
             " scale=" + std::to_string(scale) +
             " n_tail_active=" + std::to_string(n_tail_active) +
             " n_tail_history_slots=" + std::to_string(n_tail_history_slots) +
-            " mask_origin=" + std::to_string(mask_origin) +
-            " mask_prefix_visible=" + std::to_string(int(mask_prefix_visible));
+            // only name the origin on the cases that use one, so that -p filters
+            // do not match every FlashAttention case
+            (mask_origin > 0 ? " mask_origin=" + std::to_string(mask_origin) +
+                               " mask_prefix_visible=" + std::to_string(int(mask_prefix_visible)) : std::string());
     }
 
     std::string op_desc(ggml_tensor * t) override {
