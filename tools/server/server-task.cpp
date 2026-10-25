@@ -12,7 +12,9 @@
 #include "server-prompt-persist.h"
 
 #include <chrono>
+#include <filesystem>
 #include <sstream>
+#include <system_error>
 
 //
 // task_params
@@ -1875,7 +1877,9 @@ size_t server_prompt_cache::n_tokens_ram() const {
     size_t res = 0;
 
     for (const auto & state : states) {
-        if (!state.disk.on_disk()) {
+        // a materialized persist entry owns a RAM payload even though its file
+        // still exists, so it counts against the RAM token budget
+        if (!state.disk.on_disk() || !state.data.main.empty()) {
             res += state.prompt.n_tokens();
         }
     }
@@ -2034,10 +2038,10 @@ bool server_prompt_cache::demote_oldest_ram() {
         return false;
     }
 
-    // Disk-resident entries contribute nothing to the RAM budget, so skip them
-    // instead of rewriting a file that cannot relieve any pressure.
+    // Entries without a RAM payload contribute nothing to the RAM budget, so
+    // skip them instead of rewriting a file that cannot relieve any pressure.
     auto it = std::find_if(states.begin(), states.end(), [](const server_prompt_cache_state & state) {
-        return !state.disk.on_disk();
+        return !state.data.main.empty();
     });
 
     if (it == states.end()) {
@@ -2048,6 +2052,23 @@ bool server_prompt_cache::demote_oldest_ram() {
     }
 
     server_prompt_data & data = it->data;
+
+    // A persist entry materialized at startup is already backed by its file.
+    // Reclaim the RAM copy and leave the entry lazily restorable instead of
+    // spilling a second copy into the session swap tier.
+    if (it->disk.persist_tier && it->disk.on_disk()) {
+        const float size_mib = it->accounted_size() / (1024.0f * 1024.0f);
+        std::vector<uint8_t>().swap(data.main);
+        std::vector<uint8_t>().swap(data.drft);
+        std::vector<uint8_t>().swap(data.spec);
+        for (auto & ckpt : it->prompt.checkpoints) {
+            ckpt.clear_tgt();
+            ckpt.clear_dft();
+            std::vector<uint8_t>().swap(ckpt.data_spec);
+        }
+        SRV_WRN(" - releasing RAM copy of persisted entry (size = %.3f MiB)\n", size_mib);
+        return true;
+    }
 
     const llama_tokens & toks = it->prompt.tokens.get_tokens();
 
@@ -2094,7 +2115,7 @@ void server_prompt_cache::enforce_disk_budget() {
     }
 
     for (auto it = states.begin(); it != states.end() && disk.bytes_on_disk() > disk.limit_bytes();) {
-        if (!it->disk.on_disk()) {
+        if (!it->disk.on_disk() || it->disk.persist_tier) {
             ++it;
             continue;
         }
@@ -2311,15 +2332,17 @@ bool server_prompt_cache::load(
 
         auto & data = it_best->data;
 
-        // A demoted entry owns no RAM payload; materialize it from disk. The
-        // mapping must outlive the restore transaction because the transaction
-        // reads tensor data straight out of it.
+        // A demoted entry owns no RAM payload; materialize it from disk. A
+        // persist entry materialized at startup already holds its payload in
+        // RAM, so it must not be read again here. The mapping must outlive the
+        // restore transaction because the transaction reads tensor data
+        // straight out of it.
         std::unique_ptr<server_prompt_disk::mapping> mapping;
         const uint8_t * p_main = data.main.data(); size_t n_main = data.main.size();
         const uint8_t * p_drft = data.drft.data(); size_t n_drft = data.drft.size();
         const uint8_t * p_spec = data.spec.data(); size_t n_spec = data.spec.size();
 
-        if (it_best->disk.on_disk()) {
+        if (it_best->disk.on_disk() && data.main.empty()) {
             const int64_t t_read_start = ggml_time_us();
             // materialize from whichever tier owns the entry's file; the
             // persistent tier's read path validates identity the same way
@@ -2442,7 +2465,8 @@ void server_prompt_cache::update() {
     for (const auto & state : states) {
         SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB%s\n",
                 (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(),
-                state.accounted_size() / (1024.0 * 1024.0), state.disk.on_disk() ? " [disk]" : "");
+                state.accounted_size() / (1024.0 * 1024.0),
+                !state.disk.on_disk() ? "" : (state.data.main.empty() ? " [disk]" : " [disk+ram]"));
     }
 }
 
@@ -2458,6 +2482,57 @@ std::string persist_file_name(const std::string & path) {
 }
 
 } // namespace
+
+// Materialize an adopted persist entry's payload into RAM so the entry behaves
+// like any other cache entry: it is counted as RAM, it is a normal eviction
+// candidate, and a restore serves it without touching the file. The file stays
+// in place as the crash fallback, and persist_save() re-indexes it instead of
+// rewriting the payload.
+bool server_prompt_cache::persist_materialize(server_prompt_cache_state & state) {
+    std::unique_ptr<server_prompt_disk::mapping> mapping = persist.open(state.disk);
+    if (!mapping) {
+        // open() already invalidated and erased the entry on a validation failure
+        return false;
+    }
+
+    std::vector<uint8_t> main;
+    std::vector<uint8_t> drft;
+    std::vector<uint8_t> spec;
+    std::list<common_prompt_checkpoint> checkpoints;
+
+    try {
+        main.assign(mapping->main(), mapping->main() + mapping->main_size());
+        drft.assign(mapping->drft(), mapping->drft() + mapping->drft_size());
+        spec.assign(mapping->spec(), mapping->spec() + mapping->spec_size());
+
+        bool parsed = true;
+        size_t n_ckpt_consumed = 0;
+        if (mapping->ckpt_size() > 0) {
+            parsed = server_prompt_disk::read_checkpoints(
+                    mapping->ckpt(), mapping->ckpt_size(), checkpoints, SIZE_MAX, &n_ckpt_consumed);
+        }
+        const bool matches = parsed && n_ckpt_consumed == mapping->ckpt_size() &&
+                server_prompt_disk::checkpoints_match_prompt(
+                        checkpoints, state.prompt.checkpoints.size(),
+                        state.prompt.n_tokens(), state.prompt.tokens.pos_next());
+        if (!matches) {
+            // the serialized KV payload is still valid, only the appendix is not
+            SRV_WRN("persisted prompt cache: unusable checkpoint appendix in '%s', dropping checkpoints\n",
+                    state.disk.path.c_str());
+            checkpoints.clear();
+        }
+    } catch (const std::bad_alloc &) {
+        // stay lazy; the file still owns the payload
+        return false;
+    }
+
+    state.data.main = std::move(main);
+    state.data.drft = std::move(drft);
+    state.data.spec = std::move(spec);
+    state.prompt.checkpoints = std::move(checkpoints);
+
+    return true;
+}
 
 bool server_prompt_cache::persist_load(bool with_mmproj) {
     if (!persist.enabled()) {
@@ -2479,7 +2554,16 @@ bool server_prompt_cache::persist_load(bool with_mmproj) {
     std::vector<server_prompt_persist::record> adopted;
     adopted.reserve(records.size());
 
-    for (auto & rec : records) {
+    // Eager load: newest first, materialize while the payload fits in the
+    // --cache-ram budget. Older entries stay metadata-only (lazy) and are
+    // restored through the disk path if a request ever matches them, so
+    // startup RSS is bounded by the budget instead of the directory size.
+    const bool limited = limit_size > 0;
+    size_t budget = limit_size;
+    size_t n_eager = 0;
+
+    for (auto it = records.rbegin(); it != records.rend(); ++it) {
+        server_prompt_persist::record & rec = *it;
         if (rec.tokens.size() % sizeof(llama_token) != 0 || rec.tokens.empty()) {
             server_prompt_persist::remove_file(dir + rec.name);
             continue;
@@ -2538,9 +2622,29 @@ bool server_prompt_cache::persist_load(bool with_mmproj) {
             continue;
         }
 
-        // keep the save order: records are oldest first, and the list expects
-        // the same order so eviction semantics carry over the restart
-        states.push_back(std::move(state));
+        if (limited) {
+            std::error_code ec;
+            const auto fsize = std::filesystem::file_size(std::filesystem::u8path(e.path), ec);
+            const size_t estimate = (!ec && fsize > server_prompt_disk::HEADER_SIZE)
+                    ? size_t(fsize) - server_prompt_disk::HEADER_SIZE : SIZE_MAX;
+            if (estimate > budget) {
+                // keep the metadata only; a later request can still restore it
+                states.push_front(std::move(state));
+                adopted.push_back(std::move(rec));
+                continue;
+            }
+        }
+
+        if (persist_materialize(state)) {
+            budget -= std::min(budget, state.accounted_size());
+            ++n_eager;
+        } else if (!state.disk.on_disk()) {
+            // materialization invalidated the file; nothing left to keep
+            continue;
+        }
+
+        // reverse iteration + push_front keeps the oldest-first eviction order
+        states.push_front(std::move(state));
         adopted.push_back(std::move(rec));
     }
 
@@ -2548,9 +2652,9 @@ bool server_prompt_cache::persist_load(bool with_mmproj) {
     const size_t removed = server_prompt_persist::remove_stale_files(dir, adopted);
     refresh_accounted_bytes();
 
-    SRV_INF("persisted prompt cache loaded: %zu entr%s (%.3f MiB), %zu stale file(s) removed\n",
+    SRV_INF("persisted prompt cache loaded: %zu entr%s (%.3f MiB), %zu RAM-resident, %zu stale file(s) removed\n",
             adopted.size(), adopted.size() == 1 ? "y" : "ies",
-            persist.bytes_on_disk() / (1024.0 * 1024.0), removed);
+            persist.bytes_on_disk() / (1024.0 * 1024.0), n_eager, removed);
 
     return !states.empty();
 }

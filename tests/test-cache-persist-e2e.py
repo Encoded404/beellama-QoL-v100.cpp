@@ -168,8 +168,9 @@ def test_persist_round_trip(server: Path, model: Path, workdir: Path) -> None:
     assert n_saved == len(persisted), (
         f"the index must reference exactly the published files: saved {n_saved}, files {persisted}")
 
-    # --- run 2: the rehydrated cache must serve the same prompt from disk,
-    # including the entry that was promoted from the swap tier
+    # --- run 2: the persisted cache must serve the same prompt, either from
+    # the RAM copy materialized at startup or lazily from the entry file (the
+    # budget may leave an entry metadata-only)
     log_2 = workdir / "roundtrip-run2.log"
     process = start_server(server, model, port_2, log_2, [
         "--cache-ram", "1",
@@ -187,7 +188,7 @@ def test_persist_round_trip(server: Path, model: Path, workdir: Path) -> None:
         timings = post(url_2, "/completion", {
             "prompt": prompts[0], "n_predict": 1, "temperature": 0, "cache_prompt": True,
         }).get("timings", {})
-        assert timings.get("cache_source") == "disk", (
+        assert timings.get("cache_source") in ("ram", "disk"), (
             f"a persisted restore must be served from the cached state, got {timings.get('cache_source')!r}")
         assert timings.get("prompt_n", 10**9) < 10, (
             f"a persisted restore must skip prompt processing, got prompt_n={timings.get('prompt_n')!r}")

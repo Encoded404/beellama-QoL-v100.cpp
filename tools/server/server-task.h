@@ -1096,6 +1096,15 @@ struct server_prompt_cache {
 private:
     server_prompt_cache_state * admit(server_prompt_cache_state && candidate);
 
+    // Materialize an adopted persist entry's payload into RAM so the entry
+    // behaves like any other cache entry: it is counted as RAM, it is a normal
+    // eviction candidate, and a restore serves it without touching the file.
+    // The file stays in place as the crash fallback, and persist_save()
+    // re-indexes it instead of rewriting the payload. Returns false when the
+    // entry stays lazy (allocation or validation failure); a validation
+    // failure also erases the file.
+    bool persist_materialize(server_prompt_cache_state & state);
+
     // Free RAM under pressure. Spills the oldest RAM-resident entry to disk when
     // possible and drops it otherwise, so the entry list keeps its LRU order for
     // the entries that actually hold RAM. Returns true when an entry was spilled.

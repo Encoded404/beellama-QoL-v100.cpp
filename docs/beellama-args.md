@@ -262,15 +262,22 @@ only the device-to-host transfer underneath the spill and restore.
 `--cache-persist DIR` (default: disabled; requires `--cache-ram`; must not be
 the same directory as `--cache-disk`) adds a persistent tier on top: on a clean
 shutdown the whole prompt cache is persisted there, and the next startup with
-the same layout and models rehydrates it. An entry the session swap tier already
-holds is promoted by a rename plus an in-place 128-byte header re-stamp; the
-payload is never read or rewritten. A RAM-resident entry is written once from
-its already-serialized buffers. A small sidecar `index.bin` records the entry
-order, the serialized token sequences, and the checkpoint metadata — the parts
-that live only in RAM otherwise. The index is published atomically last, so an
-interrupted shutdown loses the save instead of leaving a stale partial one, and
-leftover entry files without an index record are removed at the next startup.
-Restores served from the persisted state are reported as `cache_source = "disk"`.
+the same layout and models rehydrates it. At startup the newest entries are
+materialized into RAM while they fit in `--cache-ram`; older entries stay
+metadata-only and are read lazily if a request matches them. A materialized
+entry is an ordinary RAM-resident cache entry: it counts against the RAM budget,
+becomes a normal eviction candidate, and a restore serves it from RAM
+(`cache_source = "ram"`). Its file stays in place as the crash fallback, so a
+shutdown re-indexes it instead of rewriting the payload. An entry the session
+swap tier already holds is promoted by a rename plus an in-place 128-byte header
+re-stamp; the payload is never read or rewritten. A RAM-resident entry is
+written once from its already-serialized buffers. A small sidecar `index.bin`
+records the entry order, the serialized token sequences, and the checkpoint
+metadata — the parts that live only in RAM otherwise. The index is published
+atomically last, so an interrupted shutdown loses the save instead of leaving a
+stale partial one, and leftover entry files without an index record are removed
+at the next startup. Restores served lazily from a persisted entry file are
+reported as `cache_source = "disk"`.
 
 The persist tier reuses the swap file format and its full validation chain
 (magic, version, identity, token correlation, section layout, payload hash), and
