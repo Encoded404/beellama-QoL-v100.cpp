@@ -5,8 +5,8 @@ model's next-token distribution truncated at a nucleus threshold and capped at
 a hard limit. Unlike `--dump-hidden`, this needs only logits, so it works for
 any architecture and it does not require the target to expose `t_h_nextn`.
 
-A targets-only dump is roughly **20 bytes per token** instead of ~24 KB, which
-is what makes a corpus-scale distillation set practical:
+A targets-only dump is roughly **45 to 70 bytes per token** instead of ~24 KB,
+which is what makes a corpus-scale distillation set practical:
 
 ```bash
 llama-embedding-dump -m teacher.gguf --jsonl corpus.jsonl --output-dir targets \
@@ -18,8 +18,8 @@ llama-embedding-dump -m teacher.gguf --jsonl corpus.jsonl --output-dir targets \
 | option | default | meaning |
 | --- | --- | --- |
 | `--dump-targets` | off | record the per-position distribution |
-| `--target-top-p` | `0.80` | keep the smallest id set whose mass reaches this |
-| `--target-top-k` | `128` | hard cap on kept ids per position |
+| `--target-top-p` | `0.85` | keep the smallest id set whose mass reaches this |
+| `--target-top-k` | `256` | hard cap on kept ids per position (max 4096) |
 | `--target-table-depth` | `auto` | id table depth: `auto`, `128`, `1152` or `9344` |
 | `--target-probs-dtype` | `f16` | `f16` stores `p`, `i8` stores `-16·ln(p)` |
 
@@ -122,22 +122,53 @@ def decode(path):
     return out
 ```
 
+## Choosing the threshold and the cap
+
+The two options do different jobs. `--target-top-p` decides how much of the
+distribution is modelled at all; `--target-top-k` only decides what happens to
+positions too flat to reach that mass within the cap. A cap costs bytes only on
+the positions that reach it, so raising it is nearly free at a fixed threshold,
+while raising the threshold is charged on every position.
+
+Measured on 32,768 positions of a chat corpus with teacher logits reconstructed
+through the final softcap, `f16` probabilities:
+
+| setting | ids/pos | p90 | capped | mass on capped | B/pos | 250 M |
+| --- | --- | --- | --- | --- | --- | --- |
+| `0.80 / 128` | 10.6 | 23 | 2.6 % | 0.728 | 44 | 11.0 GB |
+| `0.85 / 128` | 14.1 | 38 | 4.4 % | 0.769 | 57 | 14.2 GB |
+| **`0.85 / 256`** | 18.0 | 38 | 2.2 % | 0.793 | 71 | 17.7 GB |
+| `0.90 / 128` | 19.3 | 74 | 7.3 % | 0.813 | 76 | 18.9 GB |
+
+The median position keeps 2-3 ids; the mean is set by a minority of flat
+positions. At `0.85` the cap of 256 truncates *fewer* positions than the old
+`0.80 / 128` default did while modelling more mass, which is why it is now the
+default; `0.90 / 128` is worse than `0.85 / 256` on both axes.
+
+Truncation is not silent: a truncated position is exactly one whose
+`target_counts` equals the cap while its kept mass, summed from `target_probs`,
+stays below `target_top_p`. A consumer can drop those positions, downweight
+them, or renormalize over what is there, but it cannot recover the ids that were
+never written.
+
 ## Storage
 
-Measured on a chat corpus at `--target-top-p 0.80`, `--target-top-k 128`:
-10.6 kept ids per position on average (median 2, p90 23, 2.5 % at the cap), so
+At `--target-top-p 0.85`, `--target-top-k 256`, a position costs:
 
 | component | per position |
 | --- | --- |
 | counts (`u2`) | 2 B |
 | logsumexp (`f4`) | 4 B |
-| ids, `auto` depth | 1.5–2 B per id |
+| ids, `auto` depth | 1.5-2 B per id |
 | probabilities, `f16` | 2 B per id |
 | probabilities, `i8` | 1 B per id |
-| **total** | **~43 B (`f16`) / ~32 B (`i8`)** |
 
-250 M positions is therefore ~10.8 GB at `f16` and ~8.2 GB at `i8`, against
-~6 TB for the same corpus dumped with hidden states and K/V.
+So ~71 B at `f16` (~17.7 GB for 250 M positions) and ~53 B at `i8` (~13.2 GB).
+`i8` rounds `-16·ln p` to a byte, which costs ~3 % relative error per
+probability and maps everything above 0.97 to `p = 1`.
+
+For reference, the same corpus dumped with hidden states and K/V would be
+~6 TB.
 
 ## Behaviour worth knowing
 

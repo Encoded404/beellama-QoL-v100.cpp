@@ -1292,8 +1292,10 @@ int main(int argc, char ** argv) {
             LOG_ERR("%s: --target-top-p must be in (0, 1], got %g\n", __func__, (double) params.target_top_p);
             return 1;
         }
-        if (params.target_top_k < 1 || params.target_top_k > 255) {
-            LOG_ERR("%s: --target-top-k must be in [1, 255] (the per-position count is stored as u16), got %d\n",
+        // target_counts is u16, so the cap can be anything that fits; 4096 keeps a
+        // bad invocation from asking for a heap large enough to stall a document.
+        if (params.target_top_k < 1 || params.target_top_k > 4096) {
+            LOG_ERR("%s: --target-top-k must be in [1, 4096] (the per-position count is stored as u16), got %d\n",
                     __func__, params.target_top_k);
             return 1;
         }

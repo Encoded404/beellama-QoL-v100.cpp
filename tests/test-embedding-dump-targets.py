@@ -221,6 +221,15 @@ def main() -> None:
     wide_doc = check_document(wide[0])
     assert wide_doc["counts"].sum() >= ref["counts"].sum(), "top-p 0.95 kept fewer ids than 0.80"
 
+    # --- the cap is a u16, not a byte ---------------------------------------
+    # target_counts is stored as u2, so a cap above 255 has to round-trip: it
+    # must not be clamped by the codec or by the count array.
+    big = dump_ok(dump, model, corpus, work / "cap300",
+                  ["-b", "128", "--target-top-p", "0.99", "--target-top-k", "300"])
+    big_doc = check_document(big[0])
+    assert big_doc["top_k"] == 300, f"cap recorded as {big_doc['top_k']}"
+    assert big_doc["counts"].max() > 255, "a cap of 300 never produced a count above 255"
+
     # --- probability modes ---------------------------------------------------
     # i8 stores q = round(-16*ln p); the two dumps must describe one distribution
     i8 = dump_ok(dump, model, corpus, work / "i8", ["-b", "128", "--target-probs-dtype", "i8"])

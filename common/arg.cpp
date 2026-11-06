@@ -5565,7 +5565,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "  works for any architecture (unlike --dump-hidden, which needs t_h_nextn). each\n"
             "  document gains target_counts, target_lse, target_ids, target_probs, target_table\n"
             "  and target_meta; with --no-dump-hidden and no K/V layers the whole file is about\n"
-            "  20 bytes per token instead of 24 KB\n"
+            "  45 to 70 bytes per token instead of 24 KB, depending on --target-top-p\n"
             "  target_lse is the full-vocabulary logsumexp, so a reader can see exactly how much\n"
             "  mass the truncation dropped and renormalize deliberately. dropping it would let a\n"
             "  small top-p masquerade as a near-greedy teacher",
@@ -5585,9 +5585,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_TARGET_TOP_P"));
     add_opt(common_arg(
         {"--target-top-k"}, "N",
-        string_format("hard cap on the ids kept per position for --dump-targets (default: %d, max 255)\n"
+        string_format("hard cap on the ids kept per position for --dump-targets (default: %d, max 4096)\n"
             "  positions whose nucleus is wider than this are truncated and recorded with the cap\n"
-            "  as their count; target_lse is what tells a reader how much mass that cost",
+            "  as their count; target_lse is what tells a reader how much mass that cost\n"
+            "  the cap only costs bytes on the positions that reach it, so raise it rather than\n"
+            "  --target-top-p when the goal is to stop truncating wide, flat positions",
             params.target_top_k),
         [](common_params & params, const std::string & value) {
             params.target_top_k = std::stoi(value);

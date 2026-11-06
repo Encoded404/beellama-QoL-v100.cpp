@@ -748,8 +748,8 @@ struct common_params {
 
     // distillation targets (llama-embedding-dump --dump-targets)
     bool        dump_targets       = false;  // record the next-token distribution of every position
-    float       target_top_p       = 0.80f;  // nucleus threshold: keep the smallest id set covering this mass
-    int32_t     target_top_k       = 128;    // hard cap on the kept ids per position
+    float       target_top_p       = 0.85f;  // nucleus threshold: keep the smallest id set covering this mass
+    int32_t     target_top_k       = 256;    // hard cap on the kept ids per position
     std::string target_table_depth = "auto"; // per-document id table depth: "auto", "128", "1152" or "9344"
     std::string target_probs_dtype = "f16";  // "f16" (probabilities) or "i8" (log-probabilities)
 
