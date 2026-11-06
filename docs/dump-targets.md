@@ -143,7 +143,22 @@ Measured on a chat corpus at `--target-top-p 0.80`, `--target-top-k 128`:
 
 * **Deterministic.** Ties in the top-k selection break on the lower id, and the
   table is a stable ordering, so re-dumping a document is byte-identical — which
-  is what the `--dump-verify-writes` comparison depends on.
+  is what the `--dump-verify-writes` comparison depends on. Identical *within*
+  one binary: the partition function is summed by an AVX2 loop on machines that
+  have it and by a portable loop elsewhere, and the two agree to about 2e-6 in
+  `target_lse` (three orders of magnitude inside the `f16` the probabilities are
+  stored as, but enough to move a value across an `f16` rounding boundary now and
+  then). `LLAMA_DUMP_TARGET_LOOP=portable` forces the fallback, which is how the
+  test compares the two.
+* **The partition function is dense.** Truncating terms far below the maximum
+  cannot make `target_lse` cheap: on real rows only ~0.06 % of the vocabulary is
+  more than 30 nats down, because the sum is set by the bulk of the distribution
+  rather than by its head. The cost is therefore one pass of `n_vocab` `exp`
+  evaluations per position, and the implementation is built around that — a
+  single cache-blocked pass, f64 lanes for the sum, and a top-k that only walks
+  the eight lanes whose group can still beat the worst kept candidate. Measured
+  at ~41 µs per position at 16 threads on a Threadripper 2950X, against ~200 µs
+  for the straight per-element formulation.
 * **Batching is capped.** Every token requests logits, and the context keeps
   `n_vocab · n_outputs_max` floats of host output buffer, so a targets run caps
   the output batch at 512 tokens. `-b` larger than that is reduced, with a log

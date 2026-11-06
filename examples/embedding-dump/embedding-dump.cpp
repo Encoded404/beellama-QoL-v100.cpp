@@ -13,6 +13,7 @@
 #include <cfloat>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <sstream>
@@ -26,6 +27,22 @@
 #else
 #include <fcntl.h>
 #include <unistd.h>
+#endif
+
+// The target-selection loop has an AVX2 clone that is selected at run time. The
+// clone is compiled per function instead of for the whole file, because examples
+// are built without -march=native: a compile-time switch would be dead code in
+// every default build, and forcing -mavx2 on the target would fault on machines
+// that do not have it.
+#if defined(_MSC_VER)
+#  if defined(__AVX2__)
+#    include <immintrin.h>
+#    define TARGET_HAVE_AVX2 1   // /arch:AVX2 already pins the whole binary to AVX2
+#  endif
+#elif (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(__i386__))
+#  include <immintrin.h>
+#  define TARGET_HAVE_AVX2 1
+#  define TARGET_AVX2_ATTR __attribute__((target("avx2,fma")))
 #endif
 
 namespace fs = std::filesystem;
@@ -645,47 +662,28 @@ struct target_worst_first {
     }
 };
 
-// The next-token distribution of one position, truncated and capped.
-static void target_row(
-        const float * logits, int32_t n_vocab, float top_p, int32_t top_k,
-        std::vector<std::pair<float, int32_t>> & heap,
-        uint32_t * out_ids, float * out_probs, int32_t & out_k, float & out_lse) {
-    float m = -FLT_MAX;
-    for (int32_t i = 0; i < n_vocab; ++i) {
-        if (logits[i] > m) {
-            m = logits[i];
-        }
+// One kept candidate at a time: the heap holds the best top_k logits seen so
+// far, and its front is the worst of them.
+static inline void target_push(
+        std::vector<std::pair<float, int32_t>> & heap, float val, int32_t idx, int32_t top_k) {
+    if ((int32_t) heap.size() < top_k) {
+        heap.emplace_back(val, idx);
+        std::push_heap(heap.begin(), heap.end(), target_worst_first{});
+        return;
     }
 
-    heap.clear();
-    heap.reserve(top_k);
-
-    // One pass carries both the full-vocabulary partition and the top-k. exp()
-    // is skipped for terms more than 30 nats below the maximum: at most n_vocab
-    // of them, each below 1e-13, so the sum is unaffected in f32 terms, but a
-    // peaked distribution skips almost all of the work.
-    double s = 0.0;
-    for (int32_t i = 0; i < n_vocab; ++i) {
-        const float d = logits[i] - m;
-        if (d > -30.0f) {
-            s += std::exp((double) d);
-        }
-
-        if ((int32_t) heap.size() < top_k) {
-            heap.emplace_back(logits[i], i);
-            std::push_heap(heap.begin(), heap.end(), target_worst_first{});
-        } else if (!heap.empty()) {
-            const auto & w = heap.front();
-            if (logits[i] > w.first || (logits[i] == w.first && i < w.second)) {
-                std::pop_heap(heap.begin(), heap.end(), target_worst_first{});
-                heap.back() = { logits[i], i };
-                std::push_heap(heap.begin(), heap.end(), target_worst_first{});
-            }
-        }
+    const auto & w = heap.front();
+    if (val > w.first || (val == w.first && idx < w.second)) {
+        std::pop_heap(heap.begin(), heap.end(), target_worst_first{});
+        heap.back() = { val, idx };
+        std::push_heap(heap.begin(), heap.end(), target_worst_first{});
     }
+}
 
-    out_lse = m + (float) std::log(s > 0.0 ? s : 1.0);
-
+// The kept ids, descending by logit, from the heap.
+static inline void target_finish(
+        std::vector<std::pair<float, int32_t>> & heap, float top_p,
+        uint32_t * out_ids, float * out_probs, int32_t & out_k, float lse) {
     std::sort(heap.begin(), heap.end(), [](const auto & a, const auto & b) {
         if (a.first != b.first) {
             return a.first > b.first;
@@ -696,7 +694,7 @@ static void target_row(
     int32_t k = 0;
     double cum = 0.0;
     for (const auto & c : heap) {
-        const double p = std::exp((double) c.first - (double) out_lse);
+        const double p = std::exp((double) c.first - (double) lse);
         out_ids[k]   = (uint32_t) c.second;
         out_probs[k] = (float) p;
         cum += p;
@@ -705,8 +703,272 @@ static void target_row(
             break;
         }
     }
-
     out_k = k;
+}
+
+// Rows are split into blocks that fit in L1. Each block is walked twice: once
+// for its maximum, then once for the partition function and the candidates.
+// The second walk re-reads the block from cache, so the row still costs a single
+// trip through memory instead of the two full passes a max-first formulation
+// would make.
+static constexpr int32_t TARGET_BLOCK = 4096;
+
+// Terms more than this many nats below the maximum are dropped from the sum.
+// This is a numerical guard, not a shortcut: on real rows only about 0.06% of
+// the vocabulary falls below it, because the partition function is set by the
+// bulk of the distribution rather than by its head. Even 2^18 of the smallest
+// surviving terms add up to less than 1e-8 of the total.
+static constexpr float TARGET_TAIL_CUT = -30.0f;
+
+// 2^f on (-1, 0], degree 6 minimax fit, max relative error 4.4e-9. Written as
+// plain arithmetic over the exponent split so that it costs a handful of FMAs
+// and no libm call - a call pins the lanes to scalar registers.
+//
+// The clamp keeps 2^k inside the normal f32 range: everything below -87 nats
+// is under 1e-37 of the maximum and cannot influence a sum that is at least 1.
+static inline float target_exp_neg(float x) {
+    x = x < -87.0f ? -87.0f : x;
+
+    const float t  = x * 1.4426950408889634f; // x * log2(e)
+    const float kf = (float) (int32_t) t;    // truncation toward zero; t <= 0
+    const float f  = t - kf;                 // (-1, 0]
+
+    float p = 1.084172015e-04f;
+    p = p*f + 1.272400007e-03f;
+    p = p*f + 9.575735726e-03f;
+    p = p*f + 5.548836111e-02f;
+    p = p*f + 2.402235655e-01f;
+    p = p*f + 6.931469507e-01f;
+    p = p*f + 9.999999956e-01f;
+
+    const uint32_t bits = (uint32_t) ((int32_t) kf + 127) << 23;
+    float sc;
+    memcpy(&sc, &bits, sizeof(sc));
+    return p * sc;
+}
+
+#if TARGET_HAVE_AVX2
+static inline TARGET_AVX2_ATTR __m256 target_exp_neg8(__m256 x) {
+    x = _mm256_max_ps(x, _mm256_set1_ps(-87.0f));
+
+    const __m256 t  = _mm256_mul_ps(x, _mm256_set1_ps(1.4426950408889634f));
+    const __m256i k = _mm256_cvttps_epi32(t);          // truncation, t <= 0
+    const __m256  r  = _mm256_sub_ps(t, _mm256_cvtepi32_ps(k)); // (-1, 0]
+
+    __m256 p = _mm256_set1_ps(1.084172015e-04f);
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.272400007e-03f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(9.575735726e-03f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(5.548836111e-02f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(2.402235655e-01f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(6.931469507e-01f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(9.999999956e-01f));
+
+    const __m256 sc = _mm256_castsi256_ps(
+            _mm256_slli_epi32(_mm256_add_epi32(k, _mm256_set1_epi32(127)), 23));
+    return _mm256_mul_ps(p, sc);
+}
+
+static inline TARGET_AVX2_ATTR float target_hmax8(__m256 v) {
+    __m128 a = _mm_max_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    a = _mm_max_ps(a, _mm_movehl_ps(a, a));
+    a = _mm_max_ss(a, _mm_shuffle_ps(a, a, 1));
+    return _mm_cvtss_f32(a);
+}
+
+// The selection is the reason this is not simply a max and a sum: the top-k has
+// to come out of the same walk, and a heap update per element is what makes the
+// original loop expensive. Instead the eight lanes are tested as a group - one
+// horizontal max against the current worst kept candidate - and the lanes are
+// only walked when that group can still contribute. On a peaked row the test
+// fails for all but a handful of groups, so the heap costs one compare per eight
+// logits and the arithmetic stays in vector registers.
+static TARGET_AVX2_ATTR void target_row_avx2(
+        const float * logits, int32_t n_vocab, float top_p, int32_t top_k,
+        std::vector<std::pair<float, int32_t>> & heap,
+        uint32_t * out_ids, float * out_probs, int32_t & out_k, float & out_lse) {
+    heap.clear();
+    heap.reserve(top_k);
+
+    double s    = 0.0;
+    float  m    = -FLT_MAX;
+    float  pmin = -FLT_MAX; // smallest logit currently kept
+
+    for (int32_t base = 0; base < n_vocab; base += TARGET_BLOCK) {
+        const int32_t n = std::min<int32_t>(TARGET_BLOCK, n_vocab - base);
+        const float * z = logits + base;
+
+        __m256 vmax = _mm256_set1_ps(-FLT_MAX);
+        int32_t i = 0;
+        for (; i + 8 <= n; i += 8) {
+            vmax = _mm256_max_ps(vmax, _mm256_loadu_ps(z + i));
+        }
+        float mb = target_hmax8(vmax);
+        for (; i < n; ++i) {
+            mb = z[i] > mb ? z[i] : mb;
+        }
+
+        // a new block maximum rescales what is already summed; rare enough that
+        // the accurate libm exp is fine here
+        if (mb > m) {
+            s *= std::exp((double) m - (double) mb);
+            m  = mb;
+        }
+
+        const __m256  vm = _mm256_set1_ps(m);
+        const __m256  vc = _mm256_set1_ps(TARGET_TAIL_CUT);
+        __m256d a0 = _mm256_setzero_pd();
+        __m256d a1 = _mm256_setzero_pd();
+
+        i = 0;
+        for (; i + 8 <= n; i += 8) {
+            const __m256 v = _mm256_loadu_ps(z + i);
+            const __m256 d = _mm256_sub_ps(v, vm);
+            __m256 p = target_exp_neg8(d);
+            p = _mm256_and_ps(p, _mm256_cmp_ps(d, vc, _CMP_GT_OQ));
+
+            // f64 lanes rather than one f32 accumulator: 2048 terms per lane at
+            // block granularity would leave ~3e-5 of relative error, which is
+            // larger than the f16 the probabilities are stored as
+            a0 = _mm256_add_pd(a0, _mm256_cvtps_pd(_mm256_castps256_ps128(p)));
+            a1 = _mm256_add_pd(a1, _mm256_cvtps_pd(_mm256_extractf128_ps(p, 1)));
+
+            if ((int32_t) heap.size() < top_k || target_hmax8(v) >= pmin) {
+                for (int32_t k = 0; k < 8; ++k) {
+                    target_push(heap, z[i + k], base + i + k, top_k);
+                }
+                pmin = (int32_t) heap.size() < top_k ? -FLT_MAX : heap.front().first;
+            }
+        }
+
+        const __m256d vs = _mm256_add_pd(a0, a1);
+        const __m128d h  = _mm_add_pd(_mm256_castpd256_pd128(vs), _mm256_extractf128_pd(vs, 1));
+        s += _mm_cvtsd_f64(_mm_hadd_pd(h, h));
+
+        for (; i < n; ++i) {
+            const float d = z[i] - m;
+            if (d > TARGET_TAIL_CUT) {
+                s += (double) target_exp_neg(d);
+            }
+            target_push(heap, z[i], base + i, top_k);
+            pmin = (int32_t) heap.size() < top_k ? -FLT_MAX : heap.front().first;
+        }
+    }
+
+    out_lse = m + (float) std::log(s > 0.0 ? s : 1.0);
+    target_finish(heap, top_p, out_ids, out_probs, out_k, out_lse);
+}
+#endif
+
+// Portable version of the same walk: the eight lanes are written out so a
+// compiler with no intrinsics in reach can still keep them side by side, and
+// the group test keeps the heap off the hot path. This is what non-x86 builds
+// and builds without AVX2 use.
+static void target_row_scalar(
+        const float * logits, int32_t n_vocab, float top_p, int32_t top_k,
+        std::vector<std::pair<float, int32_t>> & heap,
+        uint32_t * out_ids, float * out_probs, int32_t & out_k, float & out_lse) {
+    heap.clear();
+    heap.reserve(top_k);
+
+    double s    = 0.0;
+    float  m    = -FLT_MAX;
+    float  pmin = -FLT_MAX;
+
+    for (int32_t base = 0; base < n_vocab; base += TARGET_BLOCK) {
+        const int32_t n = std::min<int32_t>(TARGET_BLOCK, n_vocab - base);
+        const float * z = logits + base;
+
+        float mb = -FLT_MAX;
+        for (int32_t i = 0; i < n; ++i) {
+            mb = z[i] > mb ? z[i] : mb;
+        }
+        if (mb > m) {
+            s *= std::exp((double) m - (double) mb);
+            m  = mb;
+        }
+
+        const int32_t n8 = (n / 8) * 8;
+        for (int32_t i = 0; i < n8; i += 8) {
+            const float * q = z + i;
+
+            const float d0 = q[0] - m, d1 = q[1] - m, d2 = q[2] - m, d3 = q[3] - m;
+            const float d4 = q[4] - m, d5 = q[5] - m, d6 = q[6] - m, d7 = q[7] - m;
+
+            const float e0 = target_exp_neg(d0), e1 = target_exp_neg(d1);
+            const float e2 = target_exp_neg(d2), e3 = target_exp_neg(d3);
+            const float e4 = target_exp_neg(d4), e5 = target_exp_neg(d5);
+            const float e6 = target_exp_neg(d6), e7 = target_exp_neg(d7);
+
+            s += (double) (((d0 > TARGET_TAIL_CUT ? e0 : 0.0f) + (d1 > TARGET_TAIL_CUT ? e1 : 0.0f)) +
+                           ((d2 > TARGET_TAIL_CUT ? e2 : 0.0f) + (d3 > TARGET_TAIL_CUT ? e3 : 0.0f))) +
+                 (double) (((d4 > TARGET_TAIL_CUT ? e4 : 0.0f) + (d5 > TARGET_TAIL_CUT ? e5 : 0.0f)) +
+                           ((d6 > TARGET_TAIL_CUT ? e6 : 0.0f) + (d7 > TARGET_TAIL_CUT ? e7 : 0.0f)));
+
+            const float g = std::max(std::max(std::max(q[0], q[1]), std::max(q[2], q[3])),
+                                     std::max(std::max(q[4], q[5]), std::max(q[6], q[7])));
+            if ((int32_t) heap.size() < top_k || g >= pmin) {
+                for (int32_t k = 0; k < 8; ++k) {
+                    target_push(heap, q[k], base + i + k, top_k);
+                }
+                pmin = (int32_t) heap.size() < top_k ? -FLT_MAX : heap.front().first;
+            }
+        }
+
+        for (int32_t i = n8; i < n; ++i) {
+            const float d = z[i] - m;
+            if (d > TARGET_TAIL_CUT) {
+                s += (double) target_exp_neg(d);
+            }
+            target_push(heap, z[i], base + i, top_k);
+            pmin = (int32_t) heap.size() < top_k ? -FLT_MAX : heap.front().first;
+        }
+    }
+
+    out_lse = m + (float) std::log(s > 0.0 ? s : 1.0);
+    target_finish(heap, top_p, out_ids, out_probs, out_k, out_lse);
+}
+
+// The next-token distribution of one position, truncated and capped.
+//
+// Both walks above produce the same ids and the same counts as the earlier
+// per-element formulation; target_lse moves by ~2e-6, which is three orders of
+// magnitude below the f16 the probabilities are quantized to.
+// Which inner loop runs. LLAMA_DUMP_TARGET_LOOP=portable forces the fallback so a
+// test can dump one document through both and compare them; it is not a tuning
+// knob, and asking for avx2 on a machine without it still falls back.
+static bool target_loop_forced_portable() {
+    static const bool forced = [] {
+        const char * e = getenv("LLAMA_DUMP_TARGET_LOOP");
+        return e != nullptr && strcmp(e, "portable") == 0;
+    }();
+    return forced;
+}
+
+static bool target_uses_avx2() {
+#if defined(TARGET_HAVE_AVX2) && defined(TARGET_AVX2_ATTR)
+    if (target_loop_forced_portable()) {
+        return false;
+    }
+    static const bool ok = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+    return ok;
+#elif defined(TARGET_HAVE_AVX2)
+    return !target_loop_forced_portable(); // MSVC with /arch:AVX2
+#else
+    return false;
+#endif
+}
+
+static void target_row(
+        const float * logits, int32_t n_vocab, float top_p, int32_t top_k,
+        std::vector<std::pair<float, int32_t>> & heap,
+        uint32_t * out_ids, float * out_probs, int32_t & out_k, float & out_lse) {
+#if defined(TARGET_HAVE_AVX2)
+    if (target_uses_avx2()) {
+        target_row_avx2(logits, n_vocab, top_p, top_k, heap, out_ids, out_probs, out_k, out_lse);
+        return;
+    }
+#endif
+    target_row_scalar(logits, n_vocab, top_p, top_k, heap, out_ids, out_probs, out_k, out_lse);
 }
 
 // Collect the targets of one chunk. Rows are independent, so they split across
@@ -1110,6 +1372,8 @@ int main(int argc, char ** argv) {
                 __func__, (double) params.target_top_p, params.target_top_k,
                 params.target_table_depth == "auto" ? "auto" : params.target_table_depth.c_str(),
                 params.target_probs_dtype.c_str());
+        LOG_INF("%s: target selection uses the %s inner loop\n", __func__,
+                target_uses_avx2() ? "avx2" : "portable");
     }
 
     // per-layer K/V capture. the layers are named explicitly instead of being

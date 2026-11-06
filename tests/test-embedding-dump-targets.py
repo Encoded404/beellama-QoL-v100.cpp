@@ -25,6 +25,7 @@ implementation: each check is a property the format has to satisfy on its own.
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -46,14 +47,14 @@ CORPUS = [
 BASE_ARGS = ["--dump-targets", "--no-dump-hidden", "--dump-kv-layers", "none", "-c", "256", "-t", "2"]
 
 
-def run_dump(dump, model, corpus, outdir, extra):
+def run_dump(dump, model, corpus, outdir, extra, env=None):
     outdir.mkdir(parents=True, exist_ok=True)
     cmd = [str(dump), "-m", str(model), "--jsonl", str(corpus), "--output-dir", str(outdir), *BASE_ARGS, *extra]
-    return subprocess.run(cmd, capture_output=True, text=True)
+    return subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, **(env or {})})
 
 
-def dump_ok(dump, model, corpus, outdir, extra):
-    proc = run_dump(dump, model, corpus, outdir, extra)
+def dump_ok(dump, model, corpus, outdir, extra, env=None):
+    proc = run_dump(dump, model, corpus, outdir, extra, env)
     assert proc.returncode == 0, f"dump failed ({proc.returncode}):\n{proc.stdout}\n{proc.stderr}"
 
     files = sorted(outdir.glob("*.npz"))
@@ -194,6 +195,26 @@ def main() -> None:
     again = dump_ok(dump, model, corpus, work / "again", ["-b", "128"])
     assert base[0].read_bytes() == again[0].read_bytes(), \
         "two identical runs produced different bytes (selection is not deterministic)"
+
+    # --- the vectorised inner loop agrees with the portable one ---------------
+    # both paths run over the same document. the ids and counts come out of the
+    # same comparisons and must match exactly; the partition function is summed
+    # by different code, so it may move by a few ulp - far inside the f16 the
+    # probabilities are stored as.
+    port = dump_ok(dump, model, corpus, work / "portable", ["-b", "128"],
+                   env={"LLAMA_DUMP_TARGET_LOOP": "portable"})
+    a = np.load(base[0])
+    b = np.load(port[0])
+    assert np.array_equal(a["target_counts"], b["target_counts"]), \
+        "the avx2 and portable inner loops kept different id counts"
+    assert np.array_equal(a["target_ids"], b["target_ids"]), \
+        "the avx2 and portable inner loops selected different ids"
+    dl = np.abs(a["target_lse"].astype(np.float64) - b["target_lse"].astype(np.float64))
+    assert dl.max() <= 1e-4, f"target_lse differs by {dl.max():.3e} between the inner loops"
+    pa = a["target_probs"].astype(np.float64)
+    pb = b["target_probs"].astype(np.float64)
+    rel = np.abs(pa - pb) / np.maximum(pa, 1e-12)
+    assert np.all(rel <= 1e-3), f"probabilities differ by {rel.max():.3e} between the inner loops"
 
     # --- a wider nucleus must keep at least as much ------------------------
     wide = dump_ok(dump, model, corpus, work / "wide", ["-b", "128", "--target-top-p", "0.95"])
