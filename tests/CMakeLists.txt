@@ -595,6 +595,23 @@ if (LLAMA_BUILD_EXAMPLES)
         FIXTURES_REQUIRED test-download-model)
 endif()
 
+# Behavioural test for the distillation-target dump of llama-embedding-dump:
+# decodes the packed id stream and checks the nucleus property, chunk
+# invariance, determinism and the probability-mode round trip.
+if (LLAMA_BUILD_EXAMPLES)
+    add_test(
+        NAME test-embedding-dump-targets
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-embedding-dump-targets.py
+            --dump ${CMAKE_BINARY_DIR}/bin/llama-embedding-dump
+            --model ${MODEL_DEST}
+            --workdir ${CMAKE_BINARY_DIR}/embedding-dump-targets-test)
+    set_tests_properties(test-embedding-dump-targets PROPERTIES
+        LABELS model
+        SKIP_RETURN_CODE 77
+        FIXTURES_REQUIRED test-download-model)
+endif()
+
 llama_build_and_test(test-arg-parser.cpp)
 llama_build_and_test(test-kv-history.cpp)
 target_include_directories(test-kv-history PRIVATE ${PROJECT_SOURCE_DIR}/src)

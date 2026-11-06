@@ -5556,6 +5556,67 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.dump_hidden_dtype = value;
         }
     ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_DUMP_HIDDEN_DTYPE"));
+    add_opt(common_arg(
+        {"--dump-targets"},
+        {"--no-dump-targets"},
+        string_format("record the model's next-token distribution for every position, truncated at\n"
+            "  --target-top-p and capped at --target-top-k (default: %s)\n"
+            "  this is a distillation target, not a hidden state: it needs logits only, so it\n"
+            "  works for any architecture (unlike --dump-hidden, which needs t_h_nextn). each\n"
+            "  document gains target_counts, target_lse, target_ids, target_probs, target_table\n"
+            "  and target_meta; with --no-dump-hidden and no K/V layers the whole file is about\n"
+            "  20 bytes per token instead of 24 KB\n"
+            "  target_lse is the full-vocabulary logsumexp, so a reader can see exactly how much\n"
+            "  mass the truncation dropped and renormalize deliberately. dropping it would let a\n"
+            "  small top-p masquerade as a near-greedy teacher",
+            params.dump_targets ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.dump_targets = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_DUMP_TARGETS"));
+    add_opt(common_arg(
+        {"--target-top-p"}, "FLOAT",
+        string_format("nucleus threshold for --dump-targets (default: %.2f)\n"
+            "  keep the smallest set of ids whose cumulative probability reaches this value",
+            params.target_top_p),
+        [](common_params & params, const std::string & value) {
+            params.target_top_p = std::stof(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_TARGET_TOP_P"));
+    add_opt(common_arg(
+        {"--target-top-k"}, "N",
+        string_format("hard cap on the ids kept per position for --dump-targets (default: %d, max 255)\n"
+            "  positions whose nucleus is wider than this are truncated and recorded with the cap\n"
+            "  as their count; target_lse is what tells a reader how much mass that cost",
+            params.target_top_k),
+        [](common_params & params, const std::string & value) {
+            params.target_top_k = std::stoi(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_TARGET_TOP_K"));
+    add_opt(common_arg(
+        {"--target-table-depth"}, "{auto,128,1152,9344}",
+        string_format("depth of the per-document id table used by --dump-targets (default: %s)\n"
+            "  ids are coded against a table built from this document's kept ids: 8 bits for the\n"
+            "  first 128, 12 for the next 1024, 16 for the next 8192, and a raw 24-bit id beyond\n"
+            "  that. the table is stored with the document, so a deeper table costs 4 bytes per\n"
+            "  entry. 'auto' picks per document by minimizing packed-id bytes plus table bytes;\n"
+            "  the depth actually used is recorded in target_meta",
+            params.target_table_depth.c_str()),
+        [](common_params & params, const std::string & value) {
+            params.target_table_depth = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_TARGET_TABLE_DEPTH"));
+    add_opt(common_arg(
+        {"--target-probs-dtype"}, "{f16,i8}",
+        string_format("on-disk dtype of target_probs for --dump-targets (default: %s)\n"
+            "  f16 stores the probability directly (2 bytes per id). i8 stores a log-probability\n"
+            "  as q = clamp(round(-16*ln(p)), 0, 255), i.e. p = exp(-q/16): 1 byte per id, 15.9\n"
+            "  nats of range and at most 3.2%% relative error, with no per-position scale needed",
+            params.target_probs_dtype.c_str()),
+        [](common_params & params, const std::string & value) {
+            params.target_probs_dtype = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_TARGET_PROBS_DTYPE"));
 
     return ctx_arg;
 }

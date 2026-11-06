@@ -10,12 +10,15 @@
 #include <algorithm>
 #include <cmath>
 #include <clocale>
+#include <cfloat>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 #if defined(_WIN32)
@@ -566,6 +569,415 @@ static void build_role_labels(
     }
 }
 
+//
+// distillation targets (--dump-targets)
+//
+// For every position, record the model's next-token distribution truncated at
+// --target-top-p and capped at --target-top-k, plus the full-vocabulary
+// logsumexp. The lse is what makes a low top-p usable: it records exactly how
+// much mass the truncation dropped, so a reader can renormalize deliberately.
+// Without it a small top-p silently turns the target into a near-greedy one and
+// nothing downstream can tell.
+//
+// Ids are coded against a per-document table built from the kept ids of that
+// same document. That is the table that matches what is being coded: fitted to
+// the document's own *text* frequency it lands several bits per id worse, and a
+// shared table is worse again once the corpus mixes domains.
+//
+// Stream layout (MSB-first, records concatenated in position order, ids within a
+// position in descending probability):
+//
+//   0   + 7 bits  -> table[0 .. 127]          8 bits
+//   10  + 10      -> table[128 .. 1151]     12 bits
+//   110 + 13      -> table[1152 .. 9343]    16 bits
+//   111 + 21      -> raw token id           24 bits
+//
+// The raw tier carries 21 payload bits rather than a full 32: the vocabulary is
+// 2^18, so 24 bits round-trips any id while staying byte-aligned.
+//
+static constexpr int32_t TARGET_TIER1 = 128;
+static constexpr int32_t TARGET_TIER2 = 1152;   // 128 + 1024
+static constexpr int32_t TARGET_TIER3 = 9344;   // 1152 + 8192
+static constexpr int32_t TARGET_TAIL_PAYLOAD_BITS = 21;
+static constexpr int32_t TARGET_CODEC_VERSION = 1;
+
+// per-document accumulation across chunks
+struct target_doc {
+    std::vector<uint32_t> ids;    // kept ids, position order, descending probability
+    std::vector<float>    probs;  // parallel to ids
+    std::vector<uint16_t> counts; // kept ids per position
+    std::vector<float>    lse;    // logsumexp of the full vocabulary, per position
+};
+
+struct bit_writer {
+    std::vector<uint8_t> buf;
+    uint64_t acc   = 0;
+    int      nbits = 0;
+
+    void put(uint32_t value, int bits) {
+        acc = (acc << bits) | (uint64_t) (value & ((bits == 32) ? 0xFFFFFFFFu : ((1u << bits) - 1u)));
+        nbits += bits;
+        while (nbits >= 8) {
+            nbits -= 8;
+            buf.push_back((uint8_t) ((acc >> nbits) & 0xFFu));
+        }
+        acc &= (nbits > 0) ? ((1ull << nbits) - 1ull) : 0ull;
+    }
+
+    void flush() {
+        if (nbits > 0) {
+            buf.push_back((uint8_t) ((acc << (8 - nbits)) & 0xFFu));
+            acc   = 0;
+            nbits = 0;
+        }
+    }
+};
+
+// Orders the heap so that its top (front) is the *worst* candidate kept so far.
+// Equal logits break on the lower id, so a re-dump of the same document produces
+// a byte-identical stream and the CRCs stay comparable.
+struct target_worst_first {
+    bool operator()(const std::pair<float, int32_t> & a, const std::pair<float, int32_t> & b) const {
+        if (a.first != b.first) {
+            return a.first > b.first; // a is better than b
+        }
+        return a.second < b.second;
+    }
+};
+
+// The next-token distribution of one position, truncated and capped.
+static void target_row(
+        const float * logits, int32_t n_vocab, float top_p, int32_t top_k,
+        std::vector<std::pair<float, int32_t>> & heap,
+        uint32_t * out_ids, float * out_probs, int32_t & out_k, float & out_lse) {
+    float m = -FLT_MAX;
+    for (int32_t i = 0; i < n_vocab; ++i) {
+        if (logits[i] > m) {
+            m = logits[i];
+        }
+    }
+
+    heap.clear();
+    heap.reserve(top_k);
+
+    // One pass carries both the full-vocabulary partition and the top-k. exp()
+    // is skipped for terms more than 30 nats below the maximum: at most n_vocab
+    // of them, each below 1e-13, so the sum is unaffected in f32 terms, but a
+    // peaked distribution skips almost all of the work.
+    double s = 0.0;
+    for (int32_t i = 0; i < n_vocab; ++i) {
+        const float d = logits[i] - m;
+        if (d > -30.0f) {
+            s += std::exp((double) d);
+        }
+
+        if ((int32_t) heap.size() < top_k) {
+            heap.emplace_back(logits[i], i);
+            std::push_heap(heap.begin(), heap.end(), target_worst_first{});
+        } else if (!heap.empty()) {
+            const auto & w = heap.front();
+            if (logits[i] > w.first || (logits[i] == w.first && i < w.second)) {
+                std::pop_heap(heap.begin(), heap.end(), target_worst_first{});
+                heap.back() = { logits[i], i };
+                std::push_heap(heap.begin(), heap.end(), target_worst_first{});
+            }
+        }
+    }
+
+    out_lse = m + (float) std::log(s > 0.0 ? s : 1.0);
+
+    std::sort(heap.begin(), heap.end(), [](const auto & a, const auto & b) {
+        if (a.first != b.first) {
+            return a.first > b.first;
+        }
+        return a.second < b.second;
+    });
+
+    int32_t k = 0;
+    double cum = 0.0;
+    for (const auto & c : heap) {
+        const double p = std::exp((double) c.first - (double) out_lse);
+        out_ids[k]   = (uint32_t) c.second;
+        out_probs[k] = (float) p;
+        cum += p;
+        ++k;
+        if (cum >= (double) top_p) {
+            break;
+        }
+    }
+
+    out_k = k;
+}
+
+// Collect the targets of one chunk. Rows are independent, so they split across
+// threads; each thread keeps its own heap.
+static void extract_targets(
+        struct llama_context * ctx, int32_t n_chunk, int32_t n_vocab,
+        float top_p, int32_t top_k, int32_t n_threads, target_doc & out) {
+    if (n_chunk <= 0) {
+        return;
+    }
+
+    std::vector<uint32_t> ids((size_t) n_chunk * (size_t) top_k);
+    std::vector<float>    prb((size_t) n_chunk * (size_t) top_k);
+    std::vector<int32_t>  cnt(n_chunk, 0);
+    std::vector<float>    lse(n_chunk, 0.0f);
+
+    const auto run = [&](int32_t lo, int32_t hi) {
+        std::vector<std::pair<float, int32_t>> heap;
+        for (int32_t r = lo; r < hi; ++r) {
+            const float * z = llama_get_logits_ith(ctx, r);
+            if (z == nullptr) {
+                cnt[r] = 0;
+                lse[r] = 0.0f;
+                continue;
+            }
+            target_row(z, n_vocab, top_p, top_k, heap,
+                       ids.data() + (size_t) r * (size_t) top_k,
+                       prb.data() + (size_t) r * (size_t) top_k,
+                       cnt[r], lse[r]);
+        }
+    };
+
+    const int32_t nthreads = std::max<int32_t>(1, std::min<int32_t>(n_threads, n_chunk));
+    if (nthreads <= 1) {
+        run(0, n_chunk);
+    } else {
+        std::vector<std::thread> pool;
+        pool.reserve(nthreads);
+        const int32_t step = (n_chunk + nthreads - 1) / nthreads;
+        for (int32_t t = 0; t < nthreads; ++t) {
+            const int32_t lo = t*step;
+            const int32_t hi = std::min(n_chunk, lo + step);
+            if (lo >= hi) {
+                break;
+            }
+            pool.emplace_back(run, lo, hi);
+        }
+        for (auto & th : pool) {
+            th.join();
+        }
+    }
+
+    for (int32_t r = 0; r < n_chunk; ++r) {
+        out.counts.push_back((uint16_t) cnt[r]);
+        out.lse.push_back(lse[r]);
+        for (int32_t j = 0; j < cnt[r]; ++j) {
+            out.ids.push_back(ids[(size_t) r * (size_t) top_k + j]);
+            out.probs.push_back(prb[(size_t) r * (size_t) top_k + j]);
+        }
+    }
+}
+
+// The table for one document: its kept ids by descending frequency, ties on the
+// lower id. Every depth is a prefix of this one ordering, which is why the auto
+// depth can be evaluated without rebuilding anything.
+static std::vector<uint32_t> target_build_table(const std::vector<uint32_t> & ids, size_t max_entries) {
+    std::vector<uint32_t> sorted = ids;
+    std::sort(sorted.begin(), sorted.end());
+
+    std::vector<std::pair<uint32_t, uint32_t>> by_count; // (count, id)
+    for (size_t i = 0; i < sorted.size();) {
+        size_t j = i + 1;
+        while (j < sorted.size() && sorted[j] == sorted[i]) {
+            ++j;
+        }
+        by_count.emplace_back((uint32_t) (j - i), sorted[i]);
+        i = j;
+    }
+
+    const auto cmp = [](const std::pair<uint32_t, uint32_t> & a, const std::pair<uint32_t, uint32_t> & b) {
+        if (a.first != b.first) {
+            return a.first > b.first;
+        }
+        return a.second < b.second;
+    };
+
+    const size_t n = std::min(by_count.size(), max_entries);
+    std::partial_sort(by_count.begin(), by_count.begin() + n, by_count.end(), cmp);
+
+    std::vector<uint32_t> tbl(n);
+    for (size_t i = 0; i < n; ++i) {
+        tbl[i] = by_count[i].second;
+    }
+    return tbl;
+}
+
+static int32_t target_code_bits(uint32_t rank, size_t depth) {
+    if (rank < (uint32_t) TARGET_TIER1) {
+        return 8;
+    }
+    if (depth >= (size_t) TARGET_TIER2 && rank < (uint32_t) TARGET_TIER2) {
+        return 12;
+    }
+    if (depth >= (size_t) TARGET_TIER3 && rank < (uint32_t) TARGET_TIER3) {
+        return 16;
+    }
+    return 3 + TARGET_TAIL_PAYLOAD_BITS;
+}
+
+static void target_put_code(bit_writer & w, uint32_t id, uint32_t rank, size_t depth) {
+    if (rank < (uint32_t) TARGET_TIER1) {
+        w.put(0u, 1);
+        w.put(rank, 7);
+    } else if (depth >= (size_t) TARGET_TIER2 && rank < (uint32_t) TARGET_TIER2) {
+        w.put(2u, 2);
+        w.put(rank - (uint32_t) TARGET_TIER1, 10);
+    } else if (depth >= (size_t) TARGET_TIER3 && rank < (uint32_t) TARGET_TIER3) {
+        w.put(6u, 3);
+        w.put(rank - (uint32_t) TARGET_TIER2, 13);
+    } else {
+        w.put(7u, 3);
+        w.put(id, TARGET_TAIL_PAYLOAD_BITS);
+    }
+}
+
+// Pack one document's targets into npz entries.
+// table_depth == 0 means auto: pick the depth minimizing packed-id bytes plus
+// the 4-byte-per-entry table, over this document's actual codes.
+static bool add_target_arrays(
+        std::vector<std::pair<std::string, std::vector<uint8_t>>> & entries,
+        const target_doc & d,
+        float top_p, int32_t top_k, int32_t table_depth, bool probs_i8) {
+    if (d.counts.empty()) {
+        return true;
+    }
+
+    const std::vector<uint32_t> tbl = target_build_table(d.ids, (size_t) TARGET_TIER3);
+
+    std::unordered_map<uint32_t, uint32_t> lut;
+    lut.reserve(tbl.size() * 2 + 16);
+    for (uint32_t i = 0; i < (uint32_t) tbl.size(); ++i) {
+        lut.emplace(tbl[i], i);
+    }
+
+    const uint32_t NOT_IN_TABLE = 0xFFFFFFFFu;
+    std::vector<uint32_t> rank(d.ids.size(), NOT_IN_TABLE);
+    for (size_t i = 0; i < d.ids.size(); ++i) {
+        const auto it = lut.find(d.ids[i]);
+        if (it != lut.end()) {
+            rank[i] = it->second;
+        }
+    }
+
+    size_t depth = (size_t) table_depth;
+    if (depth == 0) {
+        size_t best = SIZE_MAX;
+        for (size_t cand : { (size_t) TARGET_TIER1, (size_t) TARGET_TIER2, (size_t) TARGET_TIER3 }) {
+            size_t bits = 0;
+            for (size_t i = 0; i < d.ids.size(); ++i) {
+                bits += (size_t) target_code_bits(rank[i], cand);
+            }
+            const size_t bytes = (bits + 7) / 8 + 4 * std::min(cand, tbl.size());
+            if (bytes < best) {
+                best  = bytes;
+                depth = cand;
+            }
+        }
+    }
+
+    bit_writer bw;
+    bw.buf.reserve(d.ids.size() * 2);
+    for (size_t i = 0; i < d.ids.size(); ++i) {
+        target_put_code(bw, d.ids[i], rank[i], depth);
+    }
+    bw.flush();
+
+    // store only the part of the table the codes can actually reference
+    const size_t n_tbl = std::min(depth, tbl.size());
+
+    std::vector<int32_t> meta = {
+        TARGET_CODEC_VERSION,
+        (int32_t) std::lround((double) top_p * 1000.0),
+        top_k,
+        (int32_t) depth,
+        (int32_t) d.ids.size(),
+        probs_i8 ? 1 : 0,
+    };
+
+    entries.push_back({ "target_meta",
+            make_npy("<i4", { (int64_t) meta.size() }, meta.data(), meta.size() * sizeof(int32_t)) });
+    entries.push_back({ "target_counts",
+            make_npy("<u2", { (int64_t) d.counts.size() }, d.counts.data(), d.counts.size() * sizeof(uint16_t)) });
+    entries.push_back({ "target_lse",
+            make_npy("<f4", { (int64_t) d.lse.size() }, d.lse.data(), d.lse.size() * sizeof(float)) });
+    entries.push_back({ "target_ids",
+            make_npy("<u1", { (int64_t) bw.buf.size() }, bw.buf.data(), bw.buf.size()) });
+    entries.push_back({ "target_table",
+            make_npy("<u4", { (int64_t) n_tbl }, tbl.data(), n_tbl * sizeof(uint32_t)) });
+
+    if (probs_i8) {
+        std::vector<uint8_t> q(d.probs.size());
+        for (size_t i = 0; i < d.probs.size(); ++i) {
+            const double p = std::max((double) d.probs[i], 1e-300);
+            long v = std::lround(-16.0 * std::log(p));
+            q[i] = (uint8_t) std::min<long>(255, std::max<long>(0, v));
+        }
+        entries.push_back({ "target_probs",
+                make_npy("<u1", { (int64_t) q.size() }, q.data(), q.size()) });
+    } else {
+        std::vector<ggml_fp16_t> half(d.probs.size());
+        ggml_fp32_to_fp16_row(d.probs.data(), half.data(), (int64_t) d.probs.size());
+        entries.push_back({ "target_probs",
+                make_npy("<f2", { (int64_t) half.size() }, half.data(), half.size() * sizeof(ggml_fp16_t)) });
+    }
+
+    return true;
+}
+
+// Does this npz already carry every array the current options would write?
+// --skip-existing used to check the file name alone, so resuming with different
+// options left a directory mixing two array sets with no marker saying so.
+static bool npz_has_entries(const std::string & path, const std::vector<std::string> & names) {
+    FILE * f = fopen(path.c_str(), "rb");
+    if (f == nullptr) {
+        return false;
+    }
+
+    bool ok = false;
+    if (fseek(f, -22, SEEK_END) == 0) {
+        uint8_t eocd[22];
+        if (fread(eocd, 1, sizeof(eocd), f) == sizeof(eocd) && eocd[0] == 'P' && eocd[1] == 'K' && eocd[2] == 0x05 && eocd[3] == 0x06) {
+            const uint16_t n_entries = (uint16_t) (eocd[10] | (eocd[11] << 8));
+            const uint32_t cd_offset = (uint32_t) (eocd[16] | (eocd[17] << 8) | (eocd[18] << 16) | ((uint32_t) eocd[19] << 24));
+
+            if (fseek(f, (long) cd_offset, SEEK_SET) == 0) {
+                std::vector<std::string> present;
+                present.reserve(n_entries);
+                bool parsed = true;
+                for (uint16_t i = 0; i < n_entries; ++i) {
+                    uint8_t h[46];
+                    if (fread(h, 1, sizeof(h), f) != sizeof(h)) { parsed = false; break; }
+                    const uint16_t fnlen = (uint16_t) (h[28] | (h[29] << 8));
+                    const uint16_t extlen = (uint16_t) (h[30] | (h[31] << 8));
+                    const uint16_t cmtlen = (uint16_t) (h[32] | (h[33] << 8));
+                    std::string name(fnlen, '\0');
+                    if (fnlen && fread(&name[0], 1, fnlen, f) != fnlen) { parsed = false; break; }
+                    if (extlen && fseek(f, extlen, SEEK_CUR) != 0) { parsed = false; break; }
+                    if (cmtlen && fseek(f, cmtlen, SEEK_CUR) != 0) { parsed = false; break; }
+                    if (name.size() > 4 && name.compare(name.size() - 4, 4, ".npy") == 0) {
+                        name.resize(name.size() - 4);
+                    }
+                    present.push_back(name);
+                }
+
+                if (parsed) {
+                    ok = true;
+                    for (const auto & want : names) {
+                        if (std::find(present.begin(), present.end(), want) == present.end()) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fclose(f);
+    return ok;
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -606,6 +1018,50 @@ int main(int argc, char ** argv) {
     // by default it follows the general dtype rather than being quantized with it
     const std::string hidden_dtype = params.dump_hidden_dtype.empty() ? params.dump_dtype : params.dump_hidden_dtype;
 
+    // distillation targets: validate the codec parameters, and cap the batching.
+    // the target dump asks for logits on every token, and the context keeps
+    // n_vocab*n_outputs_max floats on the host for them: 2048 tokens is 2.1 GiB,
+    // so a targets run uses a smaller effective batch. the chunk size follows
+    // n_outputs_max below, so the graph never reserves fewer rows than are asked
+    // for.
+    int32_t target_table_depth = 0; // 0 = auto, resolved per document
+    if (params.dump_targets) {
+        if (!(params.target_top_p > 0.0f && params.target_top_p <= 1.0f)) {
+            LOG_ERR("%s: --target-top-p must be in (0, 1], got %g\n", __func__, (double) params.target_top_p);
+            return 1;
+        }
+        if (params.target_top_k < 1 || params.target_top_k > 255) {
+            LOG_ERR("%s: --target-top-k must be in [1, 255] (the per-position count is stored as u16), got %d\n",
+                    __func__, params.target_top_k);
+            return 1;
+        }
+        if (params.target_table_depth != "auto" &&
+            params.target_table_depth != "128" &&
+            params.target_table_depth != "1152" &&
+            params.target_table_depth != "9344") {
+            LOG_ERR("%s: invalid --target-table-depth '%s' (expected auto, 128, 1152 or 9344)\n",
+                    __func__, params.target_table_depth.c_str());
+            return 1;
+        }
+        if (params.target_probs_dtype != "f16" && params.target_probs_dtype != "i8") {
+            LOG_ERR("%s: invalid --target-probs-dtype '%s' (expected f16 or i8)\n",
+                    __func__, params.target_probs_dtype.c_str());
+            return 1;
+        }
+        if (params.target_table_depth != "auto") {
+            target_table_depth = std::stoi(params.target_table_depth);
+        }
+
+        const int32_t target_batch_max = std::min<int32_t>(params.n_batch > 0 ? params.n_batch : 512, 512);
+        if (params.n_outputs_max == 0 || params.n_outputs_max > target_batch_max) {
+            if (params.n_batch > target_batch_max) {
+                LOG_INF("%s: --dump-targets keeps logits for every token; capping the output batch "
+                        "to %d tokens (from -b %d)\n", __func__, target_batch_max, params.n_batch);
+            }
+            params.n_outputs_max = target_batch_max;
+        }
+    }
+
     // nextn hidden states require per-token (unpooled) output
     params.embedding   = false;
     params.pooling_type = LLAMA_POOLING_TYPE_NONE;
@@ -638,8 +1094,23 @@ int main(int argc, char ** argv) {
     const int32_t n_ctx       = llama_n_ctx(ctx);
     const int32_t n_batch     = llama_n_batch(ctx);
     const int32_t n_embd_out  = llama_model_n_embd_out(model);
+    const int32_t n_vocab     = (int32_t) llama_vocab_n_tokens(vocab);
 
-    LOG_INF("%s: n_ctx = %d, n_batch = %d, n_embd_out = %d\n", __func__, n_ctx, n_batch, n_embd_out);
+    // a targets chunk requests logits for every one of its tokens, so it cannot
+    // exceed the rows the output buffer was sized for
+    const int32_t n_chunk_max = params.dump_targets
+            ? std::min<int32_t>(n_batch, params.n_outputs_max > 0 ? params.n_outputs_max : 512)
+            : n_batch;
+
+    LOG_INF("%s: n_ctx = %d, n_batch = %d, n_embd_out = %d, n_vocab = %d\n",
+            __func__, n_ctx, n_batch, n_embd_out, n_vocab);
+
+    if (params.dump_targets) {
+        LOG_INF("%s: recording distillation targets: top-p %.3f, top-k %d, table depth %s, %s probabilities\n",
+                __func__, (double) params.target_top_p, params.target_top_k,
+                params.target_table_depth == "auto" ? "auto" : params.target_table_depth.c_str(),
+                params.target_probs_dtype.c_str());
+    }
 
     // per-layer K/V capture. the layers are named explicitly instead of being
     // derived from the architecture, so any model whose attention goes through
@@ -733,6 +1204,34 @@ int main(int argc, char ** argv) {
 
     common_batch batch(ctx);
 
+    // every array this run would write into a document. --skip-existing checks
+    // these rather than the file name, so resuming with different options cannot
+    // leave a directory that mixes two array sets with nothing saying so.
+    std::vector<std::string> required_entries = { "input_ids", "labels" };
+    if (params.dump_format == "roles" || params.dump_format == "turns") {
+        required_entries.push_back("roles");
+    }
+    if (params.dump_format == "turns") {
+        required_entries.push_back("turn_id");
+    }
+    if (params.dump_hidden) {
+        required_entries.push_back("hidden");
+    }
+    if (!kv_layers.empty()) {
+        required_entries.push_back("kv_layers");
+        required_entries.push_back("kv_basis");
+        for (int32_t il : kv_layers) {
+            // v_l is absent for a K-only layer, so only the K side is required
+            required_entries.push_back("k_l" + std::to_string(il));
+        }
+    }
+    if (params.dump_targets) {
+        for (const char * name : { "target_meta", "target_counts", "target_lse",
+                                   "target_ids", "target_probs", "target_table" }) {
+            required_entries.push_back(name);
+        }
+    }
+
     const llama_token eos_token = llama_vocab_eos(vocab);
 
     size_t n_skipped = 0;
@@ -752,9 +1251,20 @@ int main(int argc, char ** argv) {
 
         const std::string fpath = params.dump_outdir + "/" + base;
 
+        // skip only when the document carries every array this run would write;
+        // a file left by a run with different options is replaced, and it is
+        // replaced through a verifying write to <name>.part + rename, so a
+        // verified document is only ever swapped for another verified one
+        bool overwrite = false;
         if (params.dump_skip_existing && fs::exists(fpath)) {
-            ++n_skipped;
-            continue;
+            if (npz_has_entries(fpath, required_entries)) {
+                ++n_skipped;
+                continue;
+            }
+            overwrite = true;
+            LOG_WRN("%s: doc %zu: %s exists but is missing arrays this run writes "
+                    "(--skip-existing with different options); replacing it\n",
+                    __func__, doc_idx, fpath.c_str());
         }
 
         const auto & msgs = docs[doc_idx];
@@ -797,6 +1307,9 @@ int main(int argc, char ** argv) {
         std::vector<float> hidden;
         hidden.reserve(tokens.size() * (size_t) n_embd_out);
 
+        // distillation targets, accumulated across chunks
+        target_doc tgt;
+
         // per selected layer, the K/V rows accumulated across chunks as
         // [n_total, n_embd_k/v]. a layer that does not produce a tensor (it
         // caches K only, or reuses an earlier layer's K/V) stays empty.
@@ -812,13 +1325,14 @@ int main(int argc, char ** argv) {
         llama_memory_clear(llama_get_memory(ctx), true);
 
         while (offset < n_total) {
-            const int64_t n_chunk = std::min<int64_t>(n_batch, n_total - offset);
+            const int64_t n_chunk = std::min<int64_t>(n_chunk_max, n_total - offset);
 
             batch.clear();
             for (int64_t i = 0; i < n_chunk; ++i) {
-                // logits only needed on the last token of the whole sequence;
+                // logits are needed on the last token of the sequence, and on
+                // every token when the next-token distributions are recorded;
                 // hidden states are extracted for every token regardless
-                const bool want_logits = (offset + i == n_total - 1);
+                const bool want_logits = params.dump_targets || (offset + i == n_total - 1);
                 batch.add(tokens[offset + i], offset + i, 0, want_logits);
             }
 
@@ -871,6 +1385,15 @@ int main(int argc, char ** argv) {
                 if (const float * v = llama_get_kv_dump_v(ctx, i)) {
                     kv_v[i].insert(kv_v[i].end(), v, v + (size_t) n_chunk * nv);
                 }
+            }
+
+            // the next-token distribution of every position in this chunk. this
+            // reads the logits the context already copied to the host, so it does
+            // not touch the backend.
+            if (params.dump_targets) {
+                extract_targets(ctx, (int32_t) n_chunk, n_vocab,
+                                params.target_top_p, params.target_top_k,
+                                params.cpuparams.n_threads, tgt);
             }
 
             offset += n_chunk;
@@ -965,24 +1488,48 @@ int main(int argc, char ** argv) {
             entries.push_back({ "turn_id", std::move(npy_turn) });
         }
 
+        // distillation targets: the truncated next-token distributions, the
+        // per-position logsumexp, and the per-document id table the codes index
+        if (params.dump_targets) {
+            if (!add_target_arrays(entries, tgt, params.target_top_p, params.target_top_k,
+                                   target_table_depth, params.target_probs_dtype == "i8")) {
+                return 1;
+            }
+        }
+
         auto npz = make_npz(entries);
 
         int32_t attempts_used = 1;
 
-        if (!write_file(fpath, npz, params.dump_verify_writes, params.dump_verify_retries, &attempts_used)) {
+        // when replacing an incomplete document, the new bytes go to <name>.part
+        // and only take the real name after they verify, so a verified file is
+        // never destroyed by a write that fails
+        const std::string wpath = overwrite ? (fpath + ".part") : fpath;
+
+        if (!write_file(wpath, npz, params.dump_verify_writes, params.dump_verify_retries, &attempts_used)) {
             if (params.dump_verify_writes) {
                 // a file that did not verify must not be left behind for
                 // --skip-existing to trust: remove it so that a re-run dumps it
                 std::error_code ec;
-                fs::remove(fpath, ec);
+                fs::remove(wpath, ec);
                 LOG_ERR("%s: doc %zu: %s did not verify after %d attempt(s); removed so that a "
                         "re-run dumps it again\n",
-                        __func__, doc_idx, fpath.c_str(), attempts_used);
+                        __func__, doc_idx, wpath.c_str(), attempts_used);
                 ++n_failed;
                 continue;
             }
-            LOG_ERR("%s: doc %zu: failed to write %s\n", __func__, doc_idx, fpath.c_str());
+            LOG_ERR("%s: doc %zu: failed to write %s\n", __func__, doc_idx, wpath.c_str());
             return 1;
+        }
+
+        if (overwrite) {
+            std::error_code ec;
+            fs::rename(wpath, fpath, ec);
+            if (ec) {
+                LOG_ERR("%s: doc %zu: could not move %s over %s: %s\n",
+                        __func__, doc_idx, wpath.c_str(), fpath.c_str(), ec.message().c_str());
+                return 1;
+            }
         }
 
         if (params.dump_verify_writes) {
