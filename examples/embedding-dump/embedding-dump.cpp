@@ -1316,7 +1316,13 @@ int main(int argc, char ** argv) {
             target_table_depth = std::stoi(params.target_table_depth);
         }
 
-        const int32_t target_batch_max = std::min<int32_t>(params.n_batch > 0 ? params.n_batch : 512, 512);
+        // Every position keeps a full logits row on both the device and the
+        // host, so the batch is bounded by memory rather than by the graph: at a
+        // 167k vocabulary 2048 tokens is 1.37 GiB each side. 512 was a
+        // conservative default and it costs real throughput - measured on a 31B
+        // Q6_K at 66k context, 663 positions/s at 512 against 830 at 2048. 4096
+        // trips the CUDA backend on a 32 GB device, so 2048 is the cap.
+        const int32_t target_batch_max = std::min<int32_t>(params.n_batch > 0 ? params.n_batch : 512, 2048);
         if (params.n_outputs_max == 0 || params.n_outputs_max > target_batch_max) {
             if (params.n_batch > target_batch_max) {
                 LOG_INF("%s: --dump-targets keeps logits for every token; capping the output batch "
