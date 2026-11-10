@@ -7,6 +7,10 @@
 #include "ggml.h"
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn
 
+#include "target-probs-codec.h" // target_probs stream codec (no llama dependency)
+#include "target-select.h"      // how many ids to keep (nucleus, min-p, min-ids, extra)
+#include "target-tail.h"        // log-log polynomial shape beyond the last kept id
+
 #include <algorithm>
 #include <cmath>
 #include <clocale>
@@ -107,8 +111,12 @@ static std::vector<uint8_t> make_npy(
 
     out.insert(out.end(), header.begin(), header.end());
 
-    const uint8_t * src = (const uint8_t *) data;
-    out.insert(out.end(), src, src + nbytes);
+    // an empty array (no kept ids, no flagged positions) still has to produce a
+    // valid .npy header; skip the copy so a null data pointer is never advanced
+    if (nbytes > 0) {
+        const uint8_t * src = (const uint8_t *) data;
+        out.insert(out.end(), src, src + nbytes);
+    }
 
     return out;
 }
@@ -616,7 +624,14 @@ static constexpr int32_t TARGET_TIER1 = 128;
 static constexpr int32_t TARGET_TIER2 = 1152;   // 128 + 1024
 static constexpr int32_t TARGET_TIER3 = 9344;   // 1152 + 8192
 static constexpr int32_t TARGET_TAIL_PAYLOAD_BITS = 21;
-static constexpr int32_t TARGET_CODEC_VERSION = 1;
+// Version 2 added target_prob_meta, which names the probability layout
+// explicitly; a reader must consult it (or the version) before touching
+// target_probs, because the stick stream is <u1 with the same shape as the
+// version-1 i8 stream but a completely different meaning.
+// Version 3 added target_sel_meta (the selection rules that produced counts)
+// and, when enabled, target_tail_meta/target_tail_poly (the shape of the tail
+// beyond the last kept id).
+static constexpr int32_t TARGET_CODEC_VERSION = 3;
 
 // per-document accumulation across chunks
 struct target_doc {
@@ -624,31 +639,27 @@ struct target_doc {
     std::vector<float>    probs;  // parallel to ids
     std::vector<uint16_t> counts; // kept ids per position
     std::vector<float>    lse;    // logsumexp of the full vocabulary, per position
+    std::vector<float>    tail_poly; // 5 per position when the tail is on: c0..c3, band mass
+    std::vector<uint8_t>  ce_flag;   // 1 per position: the gold token fell outside the kept set
+    std::vector<float>    ce;        // cross-entropy of the gold token, for flagged positions only
+    int32_t               n_vocab = 0;
 };
 
-struct bit_writer {
-    std::vector<uint8_t> buf;
-    uint64_t acc   = 0;
-    int      nbits = 0;
+using bit_writer = targetprob::bit_writer;
 
-    void put(uint32_t value, int bits) {
-        acc = (acc << bits) | (uint64_t) (value & ((bits == 32) ? 0xFFFFFFFFu : ((1u << bits) - 1u)));
-        nbits += bits;
-        while (nbits >= 8) {
-            nbits -= 8;
-            buf.push_back((uint8_t) ((acc >> nbits) & 0xFFu));
-        }
-        acc &= (nbits > 0) ? ((1ull << nbits) - 1ull) : 0ull;
+// --target-probs-dtype -> targetprob::mode, or -1 for an unknown name.
+static int32_t target_probs_mode(const std::string & name) {
+    if (name == "f16") {
+        return targetprob::MODE_F16;
     }
-
-    void flush() {
-        if (nbits > 0) {
-            buf.push_back((uint8_t) ((acc << (8 - nbits)) & 0xFFu));
-            acc   = 0;
-            nbits = 0;
-        }
+    if (name == "i8") {
+        return targetprob::MODE_I8;
     }
-};
+    if (name == "log") {
+        return targetprob::MODE_STICK;
+    }
+    return -1;
+}
 
 // Orders the heap so that its top (front) is the *worst* candidate kept so far.
 // Equal logits break on the lower id, so a re-dump of the same document produces
@@ -680,9 +691,12 @@ static inline void target_push(
     }
 }
 
-// The kept ids, descending by logit, from the heap.
+// The ranked candidates of one position, descending by logit. Everything the
+// heap holds is materialised, because the selection rules read past the nucleus
+// and the tail fit reads past the kept set; which of them are kept is decided by
+// the caller (targetsel::select_count).
 static inline void target_finish(
-        std::vector<std::pair<float, int32_t>> & heap, float top_p,
+        std::vector<std::pair<float, int32_t>> & heap,
         uint32_t * out_ids, float * out_probs, int32_t & out_k, float lse) {
     std::sort(heap.begin(), heap.end(), [](const auto & a, const auto & b) {
         if (a.first != b.first) {
@@ -692,16 +706,10 @@ static inline void target_finish(
     });
 
     int32_t k = 0;
-    double cum = 0.0;
     for (const auto & c : heap) {
-        const double p = std::exp((double) c.first - (double) lse);
         out_ids[k]   = (uint32_t) c.second;
-        out_probs[k] = (float) p;
-        cum += p;
+        out_probs[k] = (float) std::exp((double) c.first - (double) lse);
         ++k;
-        if (cum >= (double) top_p) {
-            break;
-        }
     }
     out_k = k;
 }
@@ -783,11 +791,11 @@ static inline TARGET_AVX2_ATTR float target_hmax8(__m256 v) {
 // fails for all but a handful of groups, so the heap costs one compare per eight
 // logits and the arithmetic stays in vector registers.
 static TARGET_AVX2_ATTR void target_row_avx2(
-        const float * logits, int32_t n_vocab, float top_p, int32_t top_k,
+        const float * logits, int32_t n_vocab, int32_t heap_k,
         std::vector<std::pair<float, int32_t>> & heap,
         uint32_t * out_ids, float * out_probs, int32_t & out_k, float & out_lse) {
     heap.clear();
-    heap.reserve(top_k);
+    heap.reserve(heap_k);
 
     double s    = 0.0;
     float  m    = -FLT_MAX;
@@ -832,11 +840,11 @@ static TARGET_AVX2_ATTR void target_row_avx2(
             a0 = _mm256_add_pd(a0, _mm256_cvtps_pd(_mm256_castps256_ps128(p)));
             a1 = _mm256_add_pd(a1, _mm256_cvtps_pd(_mm256_extractf128_ps(p, 1)));
 
-            if ((int32_t) heap.size() < top_k || target_hmax8(v) >= pmin) {
+            if ((int32_t) heap.size() < heap_k || target_hmax8(v) >= pmin) {
                 for (int32_t k = 0; k < 8; ++k) {
-                    target_push(heap, z[i + k], base + i + k, top_k);
+                    target_push(heap, z[i + k], base + i + k, heap_k);
                 }
-                pmin = (int32_t) heap.size() < top_k ? -FLT_MAX : heap.front().first;
+                pmin = (int32_t) heap.size() < heap_k ? -FLT_MAX : heap.front().first;
             }
         }
 
@@ -849,13 +857,13 @@ static TARGET_AVX2_ATTR void target_row_avx2(
             if (d > TARGET_TAIL_CUT) {
                 s += (double) target_exp_neg(d);
             }
-            target_push(heap, z[i], base + i, top_k);
-            pmin = (int32_t) heap.size() < top_k ? -FLT_MAX : heap.front().first;
+            target_push(heap, z[i], base + i, heap_k);
+            pmin = (int32_t) heap.size() < heap_k ? -FLT_MAX : heap.front().first;
         }
     }
 
     out_lse = m + (float) std::log(s > 0.0 ? s : 1.0);
-    target_finish(heap, top_p, out_ids, out_probs, out_k, out_lse);
+    target_finish(heap, out_ids, out_probs, out_k, out_lse);
 }
 #endif
 
@@ -864,11 +872,11 @@ static TARGET_AVX2_ATTR void target_row_avx2(
 // the group test keeps the heap off the hot path. This is what non-x86 builds
 // and builds without AVX2 use.
 static void target_row_scalar(
-        const float * logits, int32_t n_vocab, float top_p, int32_t top_k,
+        const float * logits, int32_t n_vocab, int32_t heap_k,
         std::vector<std::pair<float, int32_t>> & heap,
         uint32_t * out_ids, float * out_probs, int32_t & out_k, float & out_lse) {
     heap.clear();
-    heap.reserve(top_k);
+    heap.reserve(heap_k);
 
     double s    = 0.0;
     float  m    = -FLT_MAX;
@@ -906,11 +914,11 @@ static void target_row_scalar(
 
             const float g = std::max(std::max(std::max(q[0], q[1]), std::max(q[2], q[3])),
                                      std::max(std::max(q[4], q[5]), std::max(q[6], q[7])));
-            if ((int32_t) heap.size() < top_k || g >= pmin) {
+            if ((int32_t) heap.size() < heap_k || g >= pmin) {
                 for (int32_t k = 0; k < 8; ++k) {
-                    target_push(heap, q[k], base + i + k, top_k);
+                    target_push(heap, q[k], base + i + k, heap_k);
                 }
-                pmin = (int32_t) heap.size() < top_k ? -FLT_MAX : heap.front().first;
+                pmin = (int32_t) heap.size() < heap_k ? -FLT_MAX : heap.front().first;
             }
         }
 
@@ -919,13 +927,13 @@ static void target_row_scalar(
             if (d > TARGET_TAIL_CUT) {
                 s += (double) target_exp_neg(d);
             }
-            target_push(heap, z[i], base + i, top_k);
-            pmin = (int32_t) heap.size() < top_k ? -FLT_MAX : heap.front().first;
+            target_push(heap, z[i], base + i, heap_k);
+            pmin = (int32_t) heap.size() < heap_k ? -FLT_MAX : heap.front().first;
         }
     }
 
     out_lse = m + (float) std::log(s > 0.0 ? s : 1.0);
-    target_finish(heap, top_p, out_ids, out_probs, out_k, out_lse);
+    target_finish(heap, out_ids, out_probs, out_k, out_lse);
 }
 
 // The next-token distribution of one position, truncated and capped.
@@ -959,31 +967,45 @@ static bool target_uses_avx2() {
 }
 
 static void target_row(
-        const float * logits, int32_t n_vocab, float top_p, int32_t top_k,
+        const float * logits, int32_t n_vocab, int32_t heap_k,
         std::vector<std::pair<float, int32_t>> & heap,
         uint32_t * out_ids, float * out_probs, int32_t & out_k, float & out_lse) {
 #if defined(TARGET_HAVE_AVX2)
     if (target_uses_avx2()) {
-        target_row_avx2(logits, n_vocab, top_p, top_k, heap, out_ids, out_probs, out_k, out_lse);
+        target_row_avx2(logits, n_vocab, heap_k, heap, out_ids, out_probs, out_k, out_lse);
         return;
     }
 #endif
-    target_row_scalar(logits, n_vocab, top_p, top_k, heap, out_ids, out_probs, out_k, out_lse);
+    target_row_scalar(logits, n_vocab, heap_k, heap, out_ids, out_probs, out_k, out_lse);
 }
 
 // Collect the targets of one chunk. Rows are independent, so they split across
 // threads; each thread keeps its own heap.
+//
+// The heap holds heap_k candidates: the selection rules can reach past top_k
+// (min-ids), and the tail fit reaches tail_n ranks past the kept count, so the
+// row pass has to rank that many. Everything the rows produce is kept here and
+// the rules are applied once, on the main thread, so the per-row hot path stays
+// a plain scan.
 static void extract_targets(
         struct llama_context * ctx, int32_t n_chunk, int32_t n_vocab,
-        float top_p, int32_t top_k, int32_t n_threads, target_doc & out) {
+        const targetsel::rules & rules, int32_t heap_k,
+        int32_t tail_n, int32_t tail_degree,
+        const int32_t * gold, bool want_ce, int32_t n_threads, target_doc & out) {
     if (n_chunk <= 0) {
         return;
     }
 
-    std::vector<uint32_t> ids((size_t) n_chunk * (size_t) top_k);
-    std::vector<float>    prb((size_t) n_chunk * (size_t) top_k);
+    std::vector<uint32_t> ids((size_t) n_chunk * (size_t) heap_k);
+    std::vector<float>    prb((size_t) n_chunk * (size_t) heap_k);
     std::vector<int32_t>  cnt(n_chunk, 0);
     std::vector<float>    lse(n_chunk, 0.0f);
+    std::vector<float>    poly;
+    std::vector<float>    ce(n_chunk, -1.0f); // < 0 means "do not store for this position"
+
+    if (tail_n > 0) {
+        poly.assign((size_t) n_chunk * 5u, 0.0f);
+    }
 
     const auto run = [&](int32_t lo, int32_t hi) {
         std::vector<std::pair<float, int32_t>> heap;
@@ -994,10 +1016,20 @@ static void extract_targets(
                 lse[r] = 0.0f;
                 continue;
             }
-            target_row(z, n_vocab, top_p, top_k, heap,
-                       ids.data() + (size_t) r * (size_t) top_k,
-                       prb.data() + (size_t) r * (size_t) top_k,
+            target_row(z, n_vocab, heap_k, heap,
+                       ids.data() + (size_t) r * (size_t) heap_k,
+                       prb.data() + (size_t) r * (size_t) heap_k,
                        cnt[r], lse[r]);
+
+            // the gold token's cross-entropy: lse - logit_gold, one array read.
+            // cheap enough to do on every position, and only stored when the
+            // gold ends up outside the kept set (below).
+            if (want_ce && gold != nullptr) {
+                const int32_t g = gold[r];
+                if (g >= 0 && g < n_vocab) {
+                    ce[r] = (float) ((double) lse[r] - (double) z[g]);
+                }
+            }
         }
     };
 
@@ -1022,12 +1054,51 @@ static void extract_targets(
     }
 
     for (int32_t r = 0; r < n_chunk; ++r) {
-        out.counts.push_back((uint16_t) cnt[r]);
-        out.lse.push_back(lse[r]);
-        for (int32_t j = 0; j < cnt[r]; ++j) {
-            out.ids.push_back(ids[(size_t) r * (size_t) top_k + j]);
-            out.probs.push_back(prb[(size_t) r * (size_t) top_k + j]);
+        const float * pr   = prb.data() + (size_t) r * (size_t) heap_k;
+        const int32_t cand = cnt[r];
+        const int32_t k    = targetsel::select_count(pr, cand, rules);
+
+        if (tail_n > 0) {
+            float * slot = poly.data() + (size_t) r * 5u;
+            const int32_t m = std::max(0, std::min(tail_n, cand - k));
+            const targettail::fit_result f = targettail::fit(pr + k, m, k + 1, tail_degree);
+            if (f.ok) {
+                for (int j = 0; j < 4; ++j) {
+                    slot[j] = (float) f.c[j];
+                }
+                slot[4] = (float) f.band_mass;
+            }
         }
+
+        out.counts.push_back((uint16_t) k);
+        out.lse.push_back(lse[r]);
+        for (int32_t j = 0; j < k; ++j) {
+            out.ids.push_back(ids[(size_t) r * (size_t) heap_k + j]);
+            out.probs.push_back(pr[j]);
+        }
+
+        // CE is only stored where it is *not* already recoverable: when the gold
+        // token is among the kept ids its probability is in target_probs, so a
+        // consumer reads it there instead (labels carries the id either way).
+        if (want_ce && gold != nullptr) {
+            bool outside = ce[r] >= 0.0f;
+            if (outside) {
+                for (int32_t j = 0; j < k; ++j) {
+                    if ((int32_t) ids[(size_t) r * (size_t) heap_k + j] == gold[r]) {
+                        outside = false;
+                        break;
+                    }
+                }
+            }
+            out.ce_flag.push_back(outside ? 1 : 0);
+            if (outside) {
+                out.ce.push_back(ce[r]);
+            }
+        }
+    }
+
+    if (tail_n > 0) {
+        out.tail_poly.insert(out.tail_poly.end(), poly.begin(), poly.end());
     }
 }
 
@@ -1100,7 +1171,8 @@ static void target_put_code(bit_writer & w, uint32_t id, uint32_t rank, size_t d
 static bool add_target_arrays(
         std::vector<std::pair<std::string, std::vector<uint8_t>>> & entries,
         const target_doc & d,
-        float top_p, int32_t top_k, int32_t table_depth, bool probs_i8) {
+        const targetsel::rules & rules, int32_t table_depth,
+        int32_t probs_mode, int32_t prob_bits, int32_t tail_n, int32_t tail_degree) {
     if (d.counts.empty()) {
         return true;
     }
@@ -1148,17 +1220,50 @@ static bool add_target_arrays(
     // store only the part of the table the codes can actually reference
     const size_t n_tbl = std::min(depth, tbl.size());
 
+    // flags: bit 0 is the version-1 absolute-log i8 mode, bit 1 is the stick
+    // layout (which target_prob_meta describes in full). They are mutually
+    // exclusive so that a reader which predates version 2 cannot mistake a
+    // packed stick stream for one value per id: it sees bit 0 clear with a <u1
+    // dtype and fails loudly on the mass instead of decoding plausible garbage.
+    const int32_t prob_flags = (probs_mode == targetprob::MODE_I8    ? 1 : 0) |
+                               (probs_mode == targetprob::MODE_STICK ? 2 : 0);
+
     std::vector<int32_t> meta = {
         TARGET_CODEC_VERSION,
-        (int32_t) std::lround((double) top_p * 1000.0),
-        top_k,
+        (int32_t) std::lround((double) rules.top_p * 1000.0),
+        rules.top_k,
         (int32_t) depth,
         (int32_t) d.ids.size(),
-        probs_i8 ? 1 : 0,
+        prob_flags,
     };
 
     entries.push_back({ "target_meta",
             make_npy("<i4", { (int64_t) meta.size() }, meta.data(), meta.size() * sizeof(int32_t)) });
+
+    // the rules that produced target_counts, so a reader can tell a nucleus cut
+    // from a floor and can reproduce either. min_p is in millionths.
+    const std::vector<int32_t> smeta = {
+        rules.min_ids,
+        (int32_t) std::llround((double) rules.min_p * 1000000.0),
+        rules.extra_ids,
+        rules.extra_min,
+        rules.extra_max,
+        (tail_n > 0 && !d.tail_poly.empty()) ? 1 : 0,
+    };
+    entries.push_back({ "target_sel_meta",
+            make_npy("<i4", { (int64_t) smeta.size() }, smeta.data(), smeta.size() * sizeof(int32_t)) });
+
+    if (tail_n > 0 && !d.tail_poly.empty()) {
+        const std::vector<int32_t> tmeta = { tail_n, tail_degree, d.n_vocab };
+        std::vector<ggml_fp16_t>    half(d.tail_poly.size());
+        ggml_fp32_to_fp16_row(d.tail_poly.data(), half.data(), (int64_t) d.tail_poly.size());
+
+        entries.push_back({ "target_tail_meta",
+                make_npy("<i4", { (int64_t) tmeta.size() }, tmeta.data(), tmeta.size() * sizeof(int32_t)) });
+        entries.push_back({ "target_tail_poly",
+                make_npy("<f2", { (int64_t) d.counts.size(), 5 },
+                         half.data(), half.size() * sizeof(ggml_fp16_t)) });
+    }
     entries.push_back({ "target_counts",
             make_npy("<u2", { (int64_t) d.counts.size() }, d.counts.data(), d.counts.size() * sizeof(uint16_t)) });
     entries.push_back({ "target_lse",
@@ -1168,13 +1273,25 @@ static bool add_target_arrays(
     entries.push_back({ "target_table",
             make_npy("<u4", { (int64_t) n_tbl }, tbl.data(), n_tbl * sizeof(uint32_t)) });
 
-    if (probs_i8) {
-        std::vector<uint8_t> q(d.probs.size());
-        for (size_t i = 0; i < d.probs.size(); ++i) {
-            const double p = std::max((double) d.probs[i], 1e-300);
-            long v = std::lround(-16.0 * std::log(p));
-            q[i] = (uint8_t) std::min<long>(255, std::max<long>(0, v));
-        }
+    // target_prob_meta names the layout so that a reader never has to infer it
+    // from dtype and shape, which collide between the version-1 i8 stream and
+    // the version-2 stick stream.
+    std::vector<int32_t> pmeta = { probs_mode, 0, 0, 0 };
+
+    if (probs_mode == targetprob::MODE_STICK) {
+        const double range = targetprob::stick_range_for(d.probs, d.counts);
+        const targetprob::stick_params sp{ prob_bits, targetprob::HEAD_BITS, range };
+        const std::vector<uint8_t> q = targetprob::stick_encode(d.probs, d.counts, sp);
+
+        pmeta[1] = prob_bits;
+        pmeta[2] = (int32_t) std::llround(range * 1000.0);
+        pmeta[3] = targetprob::HEAD_BITS;
+
+        entries.push_back({ "target_probs",
+                make_npy("<u1", { (int64_t) q.size() }, q.data(), q.size()) });
+    } else if (probs_mode == targetprob::MODE_I8) {
+        const std::vector<uint8_t> q = targetprob::i8_encode(d.probs);
+
         entries.push_back({ "target_probs",
                 make_npy("<u1", { (int64_t) q.size() }, q.data(), q.size()) });
     } else {
@@ -1182,6 +1299,33 @@ static bool add_target_arrays(
         ggml_fp32_to_fp16_row(d.probs.data(), half.data(), (int64_t) d.probs.size());
         entries.push_back({ "target_probs",
                 make_npy("<f2", { (int64_t) half.size() }, half.data(), half.size() * sizeof(ggml_fp16_t)) });
+    }
+
+    entries.push_back({ "target_prob_meta",
+            make_npy("<i4", { (int64_t) pmeta.size() }, pmeta.data(), pmeta.size() * sizeof(int32_t)) });
+
+    // Cross-entropy of the gold token, stored only for the positions where the
+    // gold is not among the kept ids: everywhere else it is already recoverable
+    // as -ln(p_gold) from target_probs, with the id in labels. The mask is one
+    // bit per position (MSB first), so it costs 1/8 byte per position whether or
+    // not any position is flagged; the values are f16 because the -16*ln(p) code
+    // saturates at 15.9 nats, which is exactly where a lost teacher lives.
+    if (!d.ce_flag.empty()) {
+        std::vector<uint8_t> mask((d.ce_flag.size() + 7) / 8, 0);
+        for (size_t i = 0; i < d.ce_flag.size(); ++i) {
+            if (d.ce_flag[i]) {
+                mask[i >> 3] = (uint8_t) (mask[i >> 3] | (0x80u >> (i & 7)));
+            }
+        }
+        std::vector<ggml_fp16_t> ce_half(d.ce.size());
+        if (!ce_half.empty()) {
+            ggml_fp32_to_fp16_row(d.ce.data(), ce_half.data(), (int64_t) d.ce.size());
+        }
+        entries.push_back({ "target_ce_mask",
+                make_npy("<u1", { (int64_t) mask.size() }, mask.data(), mask.size()) });
+        entries.push_back({ "target_ce",
+                make_npy("<f2", { (int64_t) ce_half.size() }, ce_half.data(),
+                         ce_half.size() * sizeof(ggml_fp16_t)) });
     }
 
     return true;
@@ -1307,9 +1451,46 @@ int main(int argc, char ** argv) {
                     __func__, params.target_table_depth.c_str());
             return 1;
         }
-        if (params.target_probs_dtype != "f16" && params.target_probs_dtype != "i8") {
-            LOG_ERR("%s: invalid --target-probs-dtype '%s' (expected f16 or i8)\n",
+        if (target_probs_mode(params.target_probs_dtype) < 0) {
+            LOG_ERR("%s: invalid --target-probs-dtype '%s' (expected f16, i8 or log)\n",
                     __func__, params.target_probs_dtype.c_str());
+            return 1;
+        }
+        if (params.target_prob_bits < targetprob::MIN_BITS || params.target_prob_bits > targetprob::MAX_BITS) {
+            LOG_ERR("%s: --target-prob-bits must be in [%d, %d] (one code per id, bit-packed), got %d\n",
+                    __func__, (int) targetprob::MIN_BITS, (int) targetprob::MAX_BITS, params.target_prob_bits);
+            return 1;
+        }
+        if (!(params.target_min_p >= 0.0f && params.target_min_p <= 1.0f)) {
+            LOG_ERR("%s: --target-min-p must be in [0, 1], got %g\n", __func__, (double) params.target_min_p);
+            return 1;
+        }
+        if (params.target_min_ids < 0) {
+            LOG_ERR("%s: --target-min-ids must be >= 0, got %d\n", __func__, params.target_min_ids);
+            return 1;
+        }
+        if (params.target_min_ids > params.target_top_k) {
+            LOG_WRN("%s: --target-min-ids %d exceeds --target-top-k %d; clamping\n",
+                    __func__, params.target_min_ids, params.target_top_k);
+            params.target_min_ids = params.target_top_k;
+        }
+        if (params.target_extra_ids < 0) {
+            LOG_ERR("%s: --target-extra-ids must be >= 0, got %d\n", __func__, params.target_extra_ids);
+            return 1;
+        }
+        if (params.target_extra_ids > 0 &&
+            (params.target_extra_min < 1 || params.target_extra_max < params.target_extra_min)) {
+            LOG_ERR("%s: --target-extra-min/max must satisfy 1 <= min <= max, got %d/%d\n",
+                    __func__, params.target_extra_min, params.target_extra_max);
+            return 1;
+        }
+        if (params.target_tail_n < 0 || params.target_tail_n > 4096) {
+            LOG_ERR("%s: --target-tail-n must be in [0, 4096], got %d\n", __func__, params.target_tail_n);
+            return 1;
+        }
+        if (params.target_tail_degree < 1 || params.target_tail_degree > targettail::MAX_DEG) {
+            LOG_ERR("%s: --target-tail-degree must be in [1, %d], got %d\n",
+                    __func__, targettail::MAX_DEG, params.target_tail_degree);
             return 1;
         }
         if (params.target_table_depth != "auto") {
@@ -1366,6 +1547,21 @@ int main(int argc, char ** argv) {
     const int32_t n_embd_out  = llama_model_n_embd_out(model);
     const int32_t n_vocab     = (int32_t) llama_vocab_n_tokens(vocab);
 
+    // the selection rules, resolved against this vocabulary. heap_k is how many
+    // candidates a row has to rank: top_k for the kept set, plus the tail window
+    // the shape fit reads past it.
+    targetsel::rules target_rules;
+    target_rules.top_p     = params.target_top_p;
+    target_rules.top_k     = params.target_top_k;
+    target_rules.min_ids   = params.target_min_ids;
+    target_rules.min_p     = params.target_min_p;
+    target_rules.extra_ids = params.target_extra_ids;
+    target_rules.extra_min = params.target_extra_min;
+    target_rules.extra_max = params.target_extra_max;
+
+    const int32_t target_tail_n = params.target_tail_n;
+    const int32_t target_heap_k = std::min<int32_t>(n_vocab, params.target_top_k + target_tail_n);
+
     // a targets chunk requests logits for every one of its tokens, so it cannot
     // exceed the rows the output buffer was sized for
     const int32_t n_chunk_max = params.dump_targets
@@ -1380,6 +1576,20 @@ int main(int argc, char ** argv) {
                 __func__, (double) params.target_top_p, params.target_top_k,
                 params.target_table_depth == "auto" ? "auto" : params.target_table_depth.c_str(),
                 params.target_probs_dtype.c_str());
+        if (target_probs_mode(params.target_probs_dtype) == targetprob::MODE_STICK) {
+            LOG_INF("%s: stick code at %d bits/id, per-document scale in target_prob_meta\n",
+                    __func__, params.target_prob_bits);
+        }
+        LOG_INF("%s: selection: min-ids %d, min-p %g, extra %+d in [%d, %d]\n", __func__,
+                params.target_min_ids, (double) params.target_min_p, params.target_extra_ids,
+                params.target_extra_min, params.target_extra_max);
+        if (params.target_ce) {
+            LOG_INF("%s: gold cross-entropy recorded where the gold is outside the kept set\n", __func__);
+        }
+        if (target_tail_n > 0) {
+            LOG_INF("%s: tail shape: degree %d over %d ranks after the kept set (%.1f B/position)\n",
+                    __func__, params.target_tail_degree, target_tail_n, 5.0 * sizeof(ggml_fp16_t));
+        }
         LOG_INF("%s: target selection uses the %s inner loop\n", __func__,
                 target_uses_avx2() ? "avx2" : "portable");
     }
@@ -1499,8 +1709,17 @@ int main(int argc, char ** argv) {
     }
     if (params.dump_targets) {
         for (const char * name : { "target_meta", "target_counts", "target_lse",
-                                   "target_ids", "target_probs", "target_table" }) {
+                                   "target_ids", "target_probs", "target_table",
+                                   "target_prob_meta", "target_sel_meta" }) {
             required_entries.push_back(name);
+        }
+        if (params.target_ce) {
+            required_entries.push_back("target_ce_mask");
+            required_entries.push_back("target_ce");
+        }
+        if (target_tail_n > 0) {
+            required_entries.push_back("target_tail_meta");
+            required_entries.push_back("target_tail_poly");
         }
     }
 
@@ -1581,6 +1800,7 @@ int main(int argc, char ** argv) {
 
         // distillation targets, accumulated across chunks
         target_doc tgt;
+        tgt.n_vocab = n_vocab;
 
         // per selected layer, the K/V rows accumulated across chunks as
         // [n_total, n_embd_k/v]. a layer that does not produce a tensor (it
@@ -1589,6 +1809,15 @@ int main(int argc, char ** argv) {
 
         std::vector<std::vector<float>> kv_k(n_kv);
         std::vector<std::vector<float>> kv_v(n_kv);
+
+        // build aligned labels: label[i] = next token id
+        std::vector<int32_t> labels(tokens.size());
+        for (size_t i = 0; i + 1 < tokens.size(); ++i) {
+            labels[i] = tokens[i + 1];
+        }
+        if (!tokens.empty()) {
+            labels[tokens.size() - 1] = eos_token;
+        }
 
         const int64_t n_total = (int64_t) tokens.size();
         int64_t offset = 0;
@@ -1663,8 +1892,9 @@ int main(int argc, char ** argv) {
             // reads the logits the context already copied to the host, so it does
             // not touch the backend.
             if (params.dump_targets) {
-                extract_targets(ctx, (int32_t) n_chunk, n_vocab,
-                                params.target_top_p, params.target_top_k,
+                extract_targets(ctx, (int32_t) n_chunk, n_vocab, target_rules, target_heap_k,
+                                target_tail_n, params.target_tail_degree,
+                                labels.data() + offset, params.target_ce,
                                 params.cpuparams.n_threads, tgt);
             }
 
@@ -1674,15 +1904,6 @@ int main(int argc, char ** argv) {
         // sanity check: post-final-norm hidden-state norms
         if (params.dump_hidden) {
             log_norm_stats(hidden, n_total, n_embd_out, "dump");
-        }
-
-        // build aligned labels: label[i] = next token id
-        std::vector<int32_t> labels(tokens.size());
-        for (size_t i = 0; i + 1 < tokens.size(); ++i) {
-            labels[i] = tokens[i + 1];
-        }
-        if (!tokens.empty()) {
-            labels[tokens.size() - 1] = eos_token;
         }
 
         std::vector<int32_t> input_ids(tokens.begin(), tokens.end());
@@ -1763,8 +1984,9 @@ int main(int argc, char ** argv) {
         // distillation targets: the truncated next-token distributions, the
         // per-position logsumexp, and the per-document id table the codes index
         if (params.dump_targets) {
-            if (!add_target_arrays(entries, tgt, params.target_top_p, params.target_top_k,
-                                   target_table_depth, params.target_probs_dtype == "i8")) {
+            if (!add_target_arrays(entries, tgt, target_rules, target_table_depth,
+                                   target_probs_mode(params.target_probs_dtype),
+                                   params.target_prob_bits, target_tail_n, params.target_tail_degree)) {
                 return 1;
             }
         }

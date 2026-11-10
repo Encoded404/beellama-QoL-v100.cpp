@@ -5563,9 +5563,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "  --target-top-p and capped at --target-top-k (default: %s)\n"
             "  this is a distillation target, not a hidden state: it needs logits only, so it\n"
             "  works for any architecture (unlike --dump-hidden, which needs t_h_nextn). each\n"
-            "  document gains target_counts, target_lse, target_ids, target_probs, target_table\n"
-            "  and target_meta; with --no-dump-hidden and no K/V layers the whole file is about\n"
-            "  45 to 70 bytes per token instead of 24 KB, depending on --target-top-p\n"
+            "  document gains target_counts, target_lse, target_ids, target_probs, target_table,\n"
+            "  target_meta and target_prob_meta; with --no-dump-hidden and no K/V layers the whole\n"
+            "  file is about 45 to 70 bytes per token instead of 24 KB, depending on --target-top-p\n"
             "  target_lse is the full-vocabulary logsumexp, so a reader can see exactly how much\n"
             "  mass the truncation dropped and renormalize deliberately. dropping it would let a\n"
             "  small top-p masquerade as a near-greedy teacher",
@@ -5609,16 +5609,116 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_TARGET_TABLE_DEPTH"));
     add_opt(common_arg(
-        {"--target-probs-dtype"}, "{f16,i8}",
-        string_format("on-disk dtype of target_probs for --dump-targets (default: %s)\n"
+        {"--target-probs-dtype"}, "{f16,i8,log}",
+        string_format("on-disk layout of target_probs for --dump-targets (default: %s)\n"
             "  f16 stores the probability directly (2 bytes per id). i8 stores a log-probability\n"
             "  as q = clamp(round(-16*ln(p)), 0, 255), i.e. p = exp(-q/16): 1 byte per id, 15.9\n"
-            "  nats of range and at most 3.2%% relative error, with no per-position scale needed",
+            "  nats of range and at most 3.2%% relative error, with no per-position scale needed\n"
+            "  log stores a bit-packed stick-breaking code: s_i = p_i / (mass left before id i),\n"
+            "  coded as -log2(s) over a per-document range that target_prob_meta records. the\n"
+            "  reconstruction is a sub-probability by construction, relative error is uniform\n"
+            "  across ranks, and 8 bits per id lands near 1.3%% relative error (i8 is 3.2%%)\n"
+            "  for the same byte count; use --target-prob-bits to trade size for precision",
             params.target_probs_dtype.c_str()),
         [](common_params & params, const std::string & value) {
             params.target_probs_dtype = value;
         }
     ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_TARGET_PROBS_DTYPE"));
+    add_opt(common_arg(
+        {"--target-prob-bits"}, "N",
+        string_format("bits per id for --target-probs-dtype log (default: %d, range 6..12)\n"
+            "  one code per id, packed without per-id padding. 8 bits matches the byte cost of\n"
+            "  i8 at roughly a third of its relative error; 10-12 bits approaches f16 precision\n"
+            "  at half the bytes. the scale is per document, so it costs a few bytes per file\n"
+            "  rather than a byte per position",
+            params.target_prob_bits),
+        [](common_params & params, const std::string & value) {
+            params.target_prob_bits = std::stoi(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_TARGET_PROB_BITS"));
+    add_opt(common_arg(
+        {"--target-min-ids"}, "N",
+        string_format("minimum ids kept per position for --dump-targets (default: %d, 0 = off)\n"
+            "  a nucleus cut at one id hides the rest of the distribution; this keeps the head of\n"
+            "  the tail on the positions that would otherwise stop immediately. applied before\n"
+            "  --target-extra-ids, so a position forced to N is widened again if N is in range",
+            params.target_min_ids),
+        [](common_params & params, const std::string & value) {
+            params.target_min_ids = std::stoi(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_TARGET_MIN_IDS"));
+    add_opt(common_arg(
+        {"--target-min-p"}, "FLOAT",
+        string_format("keep ids whose own probability is at least this (default: %.3f, 0 = off)\n"
+            "  absolute, not relative to the top id: a relative floor raises the bar on exactly the\n"
+            "  peaked positions that already keep few ids. an absolute floor also bounds the cost,\n"
+            "  since at most 1/min-p ids can clear it",
+            (double) params.target_min_p),
+        [](common_params & params, const std::string & value) {
+            params.target_min_p = std::stof(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_TARGET_MIN_P"));
+    add_opt(common_arg(
+        {"--target-extra-ids"}, "N",
+        string_format("ids added to a position whose count lands in [--target-extra-min, --target-extra-max]\n"
+            "  (default: %d). the marginal id falls off roughly like 1/rank, so one more id is worth\n"
+            "  several percent of a position's mass at rank 5 and a fraction of that at rank 50;\n"
+            "  --target-extra-max is where that stops paying",
+            params.target_extra_ids),
+        [](common_params & params, const std::string & value) {
+            params.target_extra_ids = std::stoi(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_TARGET_EXTRA_IDS"));
+    add_opt(common_arg(
+        {"--target-extra-min"}, "N",
+        string_format("lower bound of the --target-extra-ids range (default: %d)", params.target_extra_min),
+        [](common_params & params, const std::string & value) {
+            params.target_extra_min = std::stoi(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_TARGET_EXTRA_MIN"));
+    add_opt(common_arg(
+        {"--target-extra-max"}, "N",
+        string_format("upper bound of the --target-extra-ids range (default: %d)", params.target_extra_max),
+        [](common_params & params, const std::string & value) {
+            params.target_extra_max = std::stoi(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_TARGET_EXTRA_MAX"));
+    add_opt(common_arg(
+        {"--target-ce"},
+        {"--no-target-ce"},
+        string_format("record the gold token's cross-entropy where it falls outside the kept ids (default: %s)\n"
+            "  CE = lse - logit_gold, one array read per position, no extra pass. a position whose\n"
+            "  gold *is* kept already carries -ln(p_gold) in target_probs with the id in labels, so\n"
+            "  only the rest are stored: one bit mask per position plus f16 values. f16 rather than\n"
+            "  the -16*ln(p) code, which saturates at 15.9 nats - exactly the range where a teacher\n"
+            "  is lost and a CE filter is most useful",
+            params.target_ce ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.target_ce = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_TARGET_CE"));
+    add_opt(common_arg(
+        {"--target-tail-n"}, "N",
+        string_format("ranks of tail shape to record after the last kept id (default: %d, 0 = off)\n"
+            "  the kept ids describe the head exactly; this fits ln(p) against ln(rank) over the next\n"
+            "  N ranks and stores 4 fp16 coefficients plus the window's exact mass, 10 bytes per\n"
+            "  position. it is a shape, not a token list: a loss that needs per-token probabilities\n"
+            "  cannot use it, a rank-profile or mass-budget term can",
+            params.target_tail_n),
+        [](common_params & params, const std::string & value) {
+            params.target_tail_n = std::stoi(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_TARGET_TAIL_N"));
+    add_opt(common_arg(
+        {"--target-tail-degree"}, "N",
+        string_format("polynomial degree of the tail shape, 1..3 (default: %d)\n"
+            "  a cubic that comes out non-monotone inside its own window is refitted as a power\n"
+            "  law (degree 1); the reader evaluates one expression either way",
+            params.target_tail_degree),
+        [](common_params & params, const std::string & value) {
+            params.target_tail_degree = std::stoi(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING}).set_env("LLAMA_ARG_TARGET_TAIL_DEGREE"));
 
     return ctx_arg;
 }

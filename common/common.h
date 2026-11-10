@@ -751,7 +751,18 @@ struct common_params {
     float       target_top_p       = 0.85f;  // nucleus threshold: keep the smallest id set covering this mass
     int32_t     target_top_k       = 256;    // hard cap on the kept ids per position
     std::string target_table_depth = "auto"; // per-document id table depth: "auto", "128", "1152" or "9344"
-    std::string target_probs_dtype = "f16";  // "f16" (probabilities) or "i8" (log-probabilities)
+    std::string target_probs_dtype = "f16";  // target_probs layout: "f16" (p), "i8" (-16*ln p) or "log" (bit-packed stick code)
+    int32_t     target_prob_bits   = 8;      // bits per id for "log": [6, 12]
+
+    // how many ids a position keeps, and what is kept beyond them
+    int32_t     target_min_ids     = 4;      // keep at least this many ids (0 = off)
+    float       target_min_p       = 0.005f; // keep ids whose own probability is at least this (0 = off)
+    int32_t     target_extra_ids   = 1;      // ids added when the count lands in [extra_min, extra_max]
+    int32_t     target_extra_min   = 4;
+    int32_t     target_extra_max   = 48;
+    bool        target_ce          = true;   // record the gold token's cross-entropy where it is outside the kept set
+    int32_t     target_tail_n      = 1024;   // ranks of log-log tail shape to fit after the kept set (0 = off)
+    int32_t     target_tail_degree = 3;      // polynomial degree for the tail shape, 1..3
 
     // server params
     int32_t port                = 8080;          // server listens on this network port

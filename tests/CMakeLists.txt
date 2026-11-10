@@ -815,3 +815,11 @@ target_include_directories(test-ggml-op-coverage PRIVATE ${PROJECT_SOURCE_DIR}/g
 target_link_libraries(test-ggml-op-coverage PRIVATE ggml)
 add_test(NAME test-ggml-op-coverage COMMAND $<TARGET_FILE:test-ggml-op-coverage>)
 set_property(TEST test-ggml-op-coverage PROPERTY LABELS main)
+
+# Unit test for the distillation-target probability codec. Synthetic rows only:
+# no model, no llama context, so it runs on any build and is labelled main.
+llama_build_and_test(test-target-probs-codec.cpp)
+
+# Unit test for the version-3 target selection rules and the log-log tail fit.
+# Synthetic rows only, so it runs on any build and is labelled main.
+llama_build_and_test(test-target-dump-rules.cpp)
