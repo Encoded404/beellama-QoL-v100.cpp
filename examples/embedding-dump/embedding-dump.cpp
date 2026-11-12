@@ -831,7 +831,6 @@ static TARGET_AVX2_ATTR void target_row_avx2(
         for (; i < n; ++i) {
             mb = z[i] > mb ? z[i] : mb;
         }
-
         // a new block maximum rescales what is already summed; rare enough that
         // the accurate libm exp is fine here
         if (mb > m) {
@@ -996,6 +995,146 @@ static void target_row(
     target_row_scalar(logits, n_vocab, heap_k, heap, out_ids, out_probs, out_k, out_lse);
 }
 
+// The candidates ranked strictly below the head's worst, best first.
+//
+// The tail fit needs ranks cnt+1 .. k+tail_n. Ranking top_k+tail_n candidates in
+// one heap makes every row pay for the deepest ranks: the heap cutoff drops to
+// the (top_k+tail_n)-th logit, far more candidates clear the inner loop's group
+// test, and each insertion sifts a heap five times larger. Only `need` ranks are
+// actually missing on top of the head, and `need` is at most tail_n.
+//
+// The selection is exact. A buffer holds the best candidates seen so far; when
+// it grows past twice what is needed it is cut back to `need` and the gate moves
+// up to the worst survivor. Anything dropped there is worse than `need`
+// candidates that are still in hand, so it cannot belong to the answer, and
+// everything below the gate is dropped for the same reason.
+//
+// The gate is what keeps this cheap: `thr` rises to the need-th best after the
+// first few thousand elements, so the group test rejects almost every eight-lane
+// block without touching the lanes. The first pass is gated at -inf, which is
+// what lets the cutoff be established without guessing: it costs the couple of
+// thousand elements it takes to fill the buffer once.
+static void target_tail_collect_finish(
+        std::vector<std::pair<float, int32_t>> & buf, int32_t need) {
+    if ((int32_t) buf.size() > need) {
+        std::nth_element(buf.begin(), buf.begin() + need, buf.end(), target_worst_first{});
+        buf.resize((size_t) need);
+    }
+    // target_worst_first is the "ranks before" order, so this is best first
+    std::sort(buf.begin(), buf.end(), target_worst_first{});
+}
+
+static TARGET_AVX2_ATTR void target_tail_collect_avx2(
+        const float * logits, int32_t n_vocab, float lim_logit, int32_t lim_id,
+        int32_t need, std::vector<std::pair<float, int32_t>> & buf) {
+    buf.clear();
+    float thr = -FLT_MAX;
+    const size_t cap = (size_t) need * 2u + 16u;
+
+    const auto push = [&](float v, int32_t idx) {
+        if (v > lim_logit || (v == lim_logit && idx <= lim_id)) {
+            return; // belongs to the head
+        }
+        if (v < thr) {
+            return;
+        }
+        buf.emplace_back(v, idx);
+        if (buf.size() >= cap) {
+            std::nth_element(buf.begin(), buf.begin() + need, buf.end(), target_worst_first{});
+            buf.resize((size_t) need);
+            float w = FLT_MAX;
+            for (const auto & e : buf) {
+                w = e.first < w ? e.first : w;
+            }
+            thr = w;
+        }
+    };
+
+    for (int32_t base = 0; base < n_vocab; base += TARGET_BLOCK) {
+        const int32_t n = std::min<int32_t>(TARGET_BLOCK, n_vocab - base);
+        const float * z = logits + base;
+
+        int32_t i = 0;
+        for (; i + 8 <= n; i += 8) {
+            if (target_hmax8(_mm256_loadu_ps(z + i)) < thr) {
+                continue; // no lane in this group can clear the gate
+            }
+            for (int32_t k = 0; k < 8; ++k) {
+                push(z[i + k], base + i + k);
+            }
+        }
+        for (; i < n; ++i) {
+            push(z[i], base + i);
+        }
+    }
+    target_tail_collect_finish(buf, need);
+}
+
+static void target_tail_collect_scalar(
+        const float * logits, int32_t n_vocab, float lim_logit, int32_t lim_id,
+        int32_t need, std::vector<std::pair<float, int32_t>> & buf) {
+    buf.clear();
+    float thr = -FLT_MAX;
+    const size_t cap = (size_t) need * 2u + 16u;
+
+    const auto push = [&](float v, int32_t idx) {
+        if (v > lim_logit || (v == lim_logit && idx <= lim_id)) {
+            return;
+        }
+        if (v < thr) {
+            return;
+        }
+        buf.emplace_back(v, idx);
+        if (buf.size() >= cap) {
+            std::nth_element(buf.begin(), buf.begin() + need, buf.end(), target_worst_first{});
+            buf.resize((size_t) need);
+            float w = FLT_MAX;
+            for (const auto & e : buf) {
+                w = e.first < w ? e.first : w;
+            }
+            thr = w;
+        }
+    };
+
+    for (int32_t base = 0; base < n_vocab; base += TARGET_BLOCK) {
+        const int32_t n = std::min<int32_t>(TARGET_BLOCK, n_vocab - base);
+        const float * z = logits + base;
+        for (int32_t i = 0; i < n; ++i) {
+            push(z[i], base + i);
+        }
+    }
+    target_tail_collect_finish(buf, need);
+}
+
+// Fill out_ids/out_probs with the `need` candidates ranked below the head's
+// worst, best first. `lse` is the row's partition function, so the values land
+// in the same probability domain target_row produced.
+static void target_row_tail(
+        const float * logits, int32_t n_vocab, float lim_logit, int32_t lim_id,
+        int32_t need, float lse,
+        std::vector<std::pair<float, int32_t>> & buf,
+        uint32_t * out_ids, float * out_probs, int32_t & out_n) {
+    out_n = 0;
+    if (need <= 0 || logits == nullptr) {
+        return;
+    }
+
+#if defined(TARGET_HAVE_AVX2)
+    if (target_uses_avx2()) {
+        target_tail_collect_avx2(logits, n_vocab, lim_logit, lim_id, need, buf);
+    } else
+#endif
+    {
+        target_tail_collect_scalar(logits, n_vocab, lim_logit, lim_id, need, buf);
+    }
+
+    out_n = (int32_t) buf.size();
+    for (int32_t i = 0; i < out_n; ++i) {
+        out_ids[i]   = (uint32_t) buf[i].second;
+        out_probs[i] = (float) std::exp((double) buf[i].first - (double) lse);
+    }
+}
+
 // Scratch buffers for one chunk, kept across chunks so a document does not
 // allocate a few MB per chunk and throw it away again.
 struct target_scratch {
@@ -1032,7 +1171,9 @@ static void extract_targets(
     }
 
     const size_t rows   = (size_t) n_chunk;
-    const size_t stride = (size_t) heap_k;
+    // storage per row: the head candidates, then the tail ranks appended after
+    // them, so a row is one contiguous descending run as the fit expects
+    const size_t stride = (size_t) heap_k + (size_t) std::max(0, tail_n);
 
     if (sc.ids.size() < rows * stride) {
         sc.ids.resize(rows * stride);
@@ -1049,6 +1190,7 @@ static void extract_targets(
 
     const auto run = [&](int32_t lo, int32_t hi) {
         std::vector<std::pair<float, int32_t>> heap;
+        std::vector<std::pair<float, int32_t>> tail;
         for (int32_t r = lo; r < hi; ++r) {
             const float * z = llama_get_logits_ith(ctx, r);
             if (z == nullptr) {
@@ -1060,9 +1202,21 @@ static void extract_targets(
                        sc.ids.data() + (size_t) r * stride, pr,
                        sc.cnt[r], sc.lse[r]);
 
-            const int32_t cand = sc.cnt[r];
-            const int32_t k    = targetsel::select_count(pr, cand, rules);
+            // select_count only reads the first top_k values, so the head alone
+            // decides the kept count. The tail window then needs whatever ranks
+            // the head does not already cover.
+            int32_t cand = sc.cnt[r];
+            const int32_t k = targetsel::select_count(pr, cand, rules);
             sc.keep[r] = k;
+
+            if (tail_n > 0 && k + tail_n > cand && cand < n_vocab && !heap.empty()) {
+                int32_t added = 0;
+                target_row_tail(z, n_vocab, heap.back().first, heap.back().second,
+                                k + tail_n - cand, sc.lse[r], tail,
+                                sc.ids.data() + (size_t) r * stride + cand,
+                                pr + cand, added);
+                cand += added;
+            }
 
             if (tail_n > 0) {
                 float * slot = sc.poly.data() + (size_t) r * 5u;
@@ -1628,7 +1782,9 @@ int main(int argc, char ** argv) {
     target_rules.extra_max = params.target_extra_max;
 
     const int32_t target_tail_n = params.target_tail_n;
-    const int32_t target_heap_k = std::min<int32_t>(n_vocab, params.target_top_k + target_tail_n);
+    // the heap now holds only the head: top_k candidates, not top_k+tail_n. The
+    // ranks the tail window still needs past it come from a bounded second pass.
+    const int32_t target_heap_k = std::min<int32_t>(n_vocab, params.target_top_k);
 
     // a targets chunk requests logits for every one of its tokens, so it cannot
     // exceed the rows the output buffer was sized for

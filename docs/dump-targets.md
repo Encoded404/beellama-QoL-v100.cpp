@@ -225,13 +225,15 @@ The cost is fixed at 10 bytes per position whatever `tail_n` is: `tail_n` is a
 *fitting* window, not a storage knob. Turning it off with `--target-tail-n 0`
 removes the two arrays.
 
-It is not free in *time*, though, and the price is per rank rather than per
-byte: the row pass has to rank `top_k + tail_n` candidates so that ranks
-`k+1 .. k+tail_n` exist at all. That deeper heap is the dominant cost of the
-feature — roughly +30 % over a dump without it at `tail_n = 1024`, against
-+9 % at 256 — because a lower cutoff admits far more candidates through the
-inner loop's group test. Lower `--target-tail-n` if throughput matters more
-than how far the shape extrapolates.
+It is not free in *time*: covering ranks `k+1 .. k+tail_n` costs about one extra
+pass over each row, since the head heap holds only the top `top_k` and the ranks
+the window still needs are collected separately. The selection is exact — the
+same ids, probabilities and coefficients a `top_k + tail_n` heap would have
+produced — but the cost now grows with the number of ranks actually needed
+rather than with the depth of the heap. Measured over a corpus of 48 K
+positions, against the same dump with the tail off: +22 % at `tail_n = 1024` and
++61 % at 4096. Ranking `top_k + tail_n` candidates in one heap, which is what
+this replaced, cost +30 % at 1024 and +85 % at 4096.
 
 A cubic is not monotone in general. A fit that comes out non-monotone or
 negative inside its own window is refitted as a power law (degree 1, higher
