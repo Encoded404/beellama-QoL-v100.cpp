@@ -12,6 +12,7 @@
 #include "target-tail.h"        // log-log polynomial shape beyond the last kept id
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <clocale>
 #include <cfloat>
@@ -123,23 +124,46 @@ static std::vector<uint8_t> make_npy(
 
 // Returns a complete .npz archive containing the given entries.
 // Each entry is {name, array bytes}. Uses the STORE (uncompressed) zip method.
+// Table-driven CRC-32 (reflected, 0xEDB88320). The bitwise form this replaces
+// cost eight iterations per byte and was run twice per entry - once for the
+// local header and once for the central directory - which made it the single
+// largest item in the per-document packing phase.
+static uint32_t target_crc32(const std::vector<uint8_t> & payload) {
+    static const std::array<uint32_t, 256> table = [] {
+        std::array<uint32_t, 256> t{};
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; ++k) {
+                c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            }
+            t[i] = c;
+        }
+        return t;
+    }();
+
+    uint32_t crc = 0xFFFFFFFFu;
+    for (uint8_t b : payload) {
+        crc = table[(crc ^ b) & 0xFFu] ^ (crc >> 8);
+    }
+    return ~crc;
+}
+
 static std::vector<uint8_t> make_npz(
         const std::vector<std::pair<std::string, std::vector<uint8_t>>> & entries) {
     std::vector<uint8_t> out;
     std::vector<uint32_t> central_offsets;
 
-    for (const auto & [name, payload] : entries) {
+    // one CRC per entry: both headers need the same value
+    std::vector<uint32_t> crcs(entries.size());
+    for (size_t i = 0; i < entries.size(); ++i) {
+        crcs[i] = target_crc32(entries[i].second);
+    }
+
+    for (size_t ei = 0; ei < entries.size(); ++ei) {
+        const auto & [name, payload] = entries[ei];
         const std::string fname = name + ".npy";
 
-        // compute CRC32 of the payload
-        uint32_t crc32 = 0xFFFFFFFFu;
-        for (uint8_t b : payload) {
-            crc32 ^= b;
-            for (int k = 0; k < 8; ++k) {
-                crc32 = (crc32 >> 1) ^ (0xEDB88320u & -(crc32 & 1));
-            }
-        }
-        crc32 = ~crc32;
+        const uint32_t crc32 = crcs[ei];
 
         central_offsets.push_back((uint32_t) out.size());
 
@@ -165,14 +189,7 @@ static std::vector<uint8_t> make_npz(
         const auto & [name, payload] = entries[i];
         const std::string fname = name + ".npy";
 
-        uint32_t crc32 = 0xFFFFFFFFu;
-        for (uint8_t b : payload) {
-            crc32 ^= b;
-            for (int k = 0; k < 8; ++k) {
-                crc32 = (crc32 >> 1) ^ (0xEDB88320u & -(crc32 & 1));
-            }
-        }
-        crc32 = ~crc32;
+        const uint32_t crc32 = crcs[i];
 
         write_le32(out, 0x02014b50u);           // central directory signature
         write_le16(out, 20);                    // version made by
@@ -979,32 +996,55 @@ static void target_row(
     target_row_scalar(logits, n_vocab, heap_k, heap, out_ids, out_probs, out_k, out_lse);
 }
 
+// Scratch buffers for one chunk, kept across chunks so a document does not
+// allocate a few MB per chunk and throw it away again.
+struct target_scratch {
+    std::vector<uint32_t> ids;
+    std::vector<float>    prb;
+    std::vector<int32_t>  cnt;
+    std::vector<float>    lse;
+    std::vector<int32_t>  keep;      // ids kept per row, decided in the worker
+    std::vector<float>    poly;      // 5 per row: c0..c3, band mass
+    std::vector<uint8_t>  ce_out;    // 1 per row: gold outside the kept set
+    std::vector<float>    ce_val;    // 1 per row: CE, valid when ce_out is set
+};
+
 // Collect the targets of one chunk. Rows are independent, so they split across
 // threads; each thread keeps its own heap.
 //
+// Everything that is a function of a single row - which ids to keep, the tail
+// fit, the gold's cross-entropy and whether it lies outside the kept set -
+// runs in the worker that produced the row. Only the compaction into the
+// document's flat arrays is left on the calling thread, because that is where
+// row order has to be preserved; it is a handful of memcpys per row.
+//
 // The heap holds heap_k candidates: the selection rules can reach past top_k
 // (min-ids), and the tail fit reaches tail_n ranks past the kept count, so the
-// row pass has to rank that many. Everything the rows produce is kept here and
-// the rules are applied once, on the main thread, so the per-row hot path stays
-// a plain scan.
+// row pass has to rank that many.
 static void extract_targets(
         struct llama_context * ctx, int32_t n_chunk, int32_t n_vocab,
         const targetsel::rules & rules, int32_t heap_k,
         int32_t tail_n, int32_t tail_degree,
-        const int32_t * gold, bool want_ce, int32_t n_threads, target_doc & out) {
+        const int32_t * gold, bool want_ce, int32_t n_threads,
+        target_scratch & sc, target_doc & out) {
     if (n_chunk <= 0) {
         return;
     }
 
-    std::vector<uint32_t> ids((size_t) n_chunk * (size_t) heap_k);
-    std::vector<float>    prb((size_t) n_chunk * (size_t) heap_k);
-    std::vector<int32_t>  cnt(n_chunk, 0);
-    std::vector<float>    lse(n_chunk, 0.0f);
-    std::vector<float>    poly;
-    std::vector<float>    ce(n_chunk, -1.0f); // < 0 means "do not store for this position"
+    const size_t rows   = (size_t) n_chunk;
+    const size_t stride = (size_t) heap_k;
 
+    if (sc.ids.size() < rows * stride) {
+        sc.ids.resize(rows * stride);
+        sc.prb.resize(rows * stride);
+    }
+    sc.cnt.assign(rows, 0);
+    sc.lse.assign(rows, 0.0f);
+    sc.keep.assign(rows, 0);
+    sc.ce_out.assign(rows, 0);
+    sc.ce_val.assign(rows, -1.0f);
     if (tail_n > 0) {
-        poly.assign((size_t) n_chunk * 5u, 0.0f);
+        sc.poly.assign(rows * 5u, 0.0f);
     }
 
     const auto run = [&](int32_t lo, int32_t hi) {
@@ -1012,22 +1052,51 @@ static void extract_targets(
         for (int32_t r = lo; r < hi; ++r) {
             const float * z = llama_get_logits_ith(ctx, r);
             if (z == nullptr) {
-                cnt[r] = 0;
-                lse[r] = 0.0f;
                 continue;
             }
-            target_row(z, n_vocab, heap_k, heap,
-                       ids.data() + (size_t) r * (size_t) heap_k,
-                       prb.data() + (size_t) r * (size_t) heap_k,
-                       cnt[r], lse[r]);
 
-            // the gold token's cross-entropy: lse - logit_gold, one array read.
-            // cheap enough to do on every position, and only stored when the
-            // gold ends up outside the kept set (below).
+            float * pr = sc.prb.data() + (size_t) r * stride;
+            target_row(z, n_vocab, heap_k, heap,
+                       sc.ids.data() + (size_t) r * stride, pr,
+                       sc.cnt[r], sc.lse[r]);
+
+            const int32_t cand = sc.cnt[r];
+            const int32_t k    = targetsel::select_count(pr, cand, rules);
+            sc.keep[r] = k;
+
+            if (tail_n > 0) {
+                float * slot = sc.poly.data() + (size_t) r * 5u;
+                const int32_t m = std::max(0, std::min(tail_n, cand - k));
+                const targettail::fit_result f = targettail::fit(pr + k, m, k + 1, tail_degree);
+                if (f.ok) {
+                    for (int j = 0; j < 4; ++j) {
+                        slot[j] = (float) f.c[j];
+                    }
+                    slot[4] = (float) f.band_mass;
+                }
+            }
+
+            // CE is only stored where it is *not* already recoverable: when the
+            // gold token is among the kept ids its probability is in
+            // target_probs, so a consumer reads it there instead (labels carries
+            // the id either way).
             if (want_ce && gold != nullptr) {
                 const int32_t g = gold[r];
-                if (g >= 0 && g < n_vocab) {
-                    ce[r] = (float) ((double) lse[r] - (double) z[g]);
+                if (!(g >= 0 && g < n_vocab)) {
+                    continue;
+                }
+                const double ce = (double) sc.lse[r] - (double) z[g];
+                bool outside = true;
+                const uint32_t * row_ids = sc.ids.data() + (size_t) r * stride;
+                for (int32_t j = 0; j < k; ++j) {
+                    if ((int32_t) row_ids[j] == g) {
+                        outside = false;
+                        break;
+                    }
+                }
+                sc.ce_out[r] = outside ? 1 : 0;
+                if (outside) {
+                    sc.ce_val[r] = (float) ce;
                 }
             }
         }
@@ -1053,70 +1122,69 @@ static void extract_targets(
         }
     }
 
-    for (int32_t r = 0; r < n_chunk; ++r) {
-        const float * pr   = prb.data() + (size_t) r * (size_t) heap_k;
-        const int32_t cand = cnt[r];
-        const int32_t k    = targetsel::select_count(pr, cand, rules);
+    // compaction, in row order
+    size_t n_keep = 0;
+    for (size_t r = 0; r < rows; ++r) {
+        n_keep += (size_t) sc.keep[r];
+    }
+    out.counts.reserve(out.counts.size() + rows);
+    out.lse.reserve(out.lse.size() + rows);
+    out.ids.reserve(out.ids.size() + n_keep);
+    out.probs.reserve(out.probs.size() + n_keep);
+    if (want_ce) {
+        out.ce_flag.reserve(out.ce_flag.size() + rows);
+        out.ce.reserve(out.ce.size() + rows);
+    }
+    if (tail_n > 0) {
+        out.tail_poly.reserve(out.tail_poly.size() + rows * 5u);
+    }
 
-        if (tail_n > 0) {
-            float * slot = poly.data() + (size_t) r * 5u;
-            const int32_t m = std::max(0, std::min(tail_n, cand - k));
-            const targettail::fit_result f = targettail::fit(pr + k, m, k + 1, tail_degree);
-            if (f.ok) {
-                for (int j = 0; j < 4; ++j) {
-                    slot[j] = (float) f.c[j];
-                }
-                slot[4] = (float) f.band_mass;
-            }
-        }
-
+    for (size_t r = 0; r < rows; ++r) {
+        const int32_t k = sc.keep[r];
         out.counts.push_back((uint16_t) k);
-        out.lse.push_back(lse[r]);
-        for (int32_t j = 0; j < k; ++j) {
-            out.ids.push_back(ids[(size_t) r * (size_t) heap_k + j]);
-            out.probs.push_back(pr[j]);
-        }
+        out.lse.push_back(sc.lse[r]);
 
-        // CE is only stored where it is *not* already recoverable: when the gold
-        // token is among the kept ids its probability is in target_probs, so a
-        // consumer reads it there instead (labels carries the id either way).
-        if (want_ce && gold != nullptr) {
-            bool outside = ce[r] >= 0.0f;
-            if (outside) {
-                for (int32_t j = 0; j < k; ++j) {
-                    if ((int32_t) ids[(size_t) r * (size_t) heap_k + j] == gold[r]) {
-                        outside = false;
-                        break;
-                    }
-                }
-            }
-            out.ce_flag.push_back(outside ? 1 : 0);
-            if (outside) {
-                out.ce.push_back(ce[r]);
+        const uint32_t * src_ids = sc.ids.data() + r * stride;
+        const float *    src_pr  = sc.prb.data() + r * stride;
+        out.ids.insert(out.ids.end(), src_ids, src_ids + k);
+        out.probs.insert(out.probs.end(), src_pr, src_pr + k);
+
+        if (want_ce) {
+            out.ce_flag.push_back(sc.ce_out[r]);
+            if (sc.ce_out[r]) {
+                out.ce.push_back(sc.ce_val[r]);
             }
         }
     }
 
     if (tail_n > 0) {
-        out.tail_poly.insert(out.tail_poly.end(), poly.begin(), poly.end());
+        out.tail_poly.insert(out.tail_poly.end(), sc.poly.begin(), sc.poly.begin() + rows * 5u);
     }
 }
 
 // The table for one document: its kept ids by descending frequency, ties on the
 // lower id. Every depth is a prefix of this one ordering, which is why the auto
 // depth can be evaluated without rebuilding anything.
-static std::vector<uint32_t> target_build_table(const std::vector<uint32_t> & ids, size_t max_entries) {
-    std::vector<uint32_t> sorted = ids;
-    std::sort(sorted.begin(), sorted.end());
+// Counting sort over the vocabulary rather than a sort of every occurrence:
+// the document's id stream is O(tokens * ids_per_position) and sorting it cost
+// O(n log n) per document, which dominated the packing phase on long documents.
+// The pairs produced are the same ones the sort produced - one per distinct id,
+// ascending by id - so the comparator below yields the identical table.
+static std::vector<uint32_t> target_build_table(
+        const std::vector<uint32_t> & ids, size_t max_entries, int32_t n_vocab) {
+    std::vector<uint32_t> counts((size_t) std::max(1, n_vocab), 0);
+    for (uint32_t id : ids) {
+        if ((int32_t) id < n_vocab) {
+            ++counts[id];
+        }
+    }
 
     std::vector<std::pair<uint32_t, uint32_t>> by_count; // (count, id)
-    for (size_t i = 0; i < sorted.size();) {
-        size_t j = i + 1;
-        while (j < sorted.size() && sorted[j] == sorted[i]) {
-            ++j;
+    by_count.reserve((size_t) n_vocab);
+    for (int32_t id = 0; id < n_vocab; ++id) {
+        if (counts[(size_t) id] != 0) {
+            by_count.emplace_back(counts[(size_t) id], (uint32_t) id);
         }
-        by_count.emplace_back((uint32_t) (j - i), sorted[i]);
-        i = j;
     }
 
     const auto cmp = [](const std::pair<uint32_t, uint32_t> & a, const std::pair<uint32_t, uint32_t> & b) {
@@ -1177,7 +1245,7 @@ static bool add_target_arrays(
         return true;
     }
 
-    const std::vector<uint32_t> tbl = target_build_table(d.ids, (size_t) TARGET_TIER3);
+    const std::vector<uint32_t> tbl = target_build_table(d.ids, (size_t) TARGET_TIER3, d.n_vocab);
 
     std::unordered_map<uint32_t, uint32_t> lut;
     lut.reserve(tbl.size() * 2 + 16);
@@ -1822,6 +1890,9 @@ int main(int argc, char ** argv) {
         const int64_t n_total = (int64_t) tokens.size();
         int64_t offset = 0;
 
+        // survives across this document's chunks
+        target_scratch sc;
+
         // clear the KV cache so each document starts from a fresh sequence
         llama_memory_clear(llama_get_memory(ctx), true);
 
@@ -1895,7 +1966,7 @@ int main(int argc, char ** argv) {
                 extract_targets(ctx, (int32_t) n_chunk, n_vocab, target_rules, target_heap_k,
                                 target_tail_n, params.target_tail_degree,
                                 labels.data() + offset, params.target_ce,
-                                params.cpuparams.n_threads, tgt);
+                                params.cpuparams.n_threads, sc, tgt);
             }
 
             offset += n_chunk;
